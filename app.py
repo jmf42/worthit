@@ -6,8 +6,11 @@ import logging
 from logging.handlers import RotatingFileHandler
 import time
 import random
+from random import uniform
+from time import sleep
 import requests
 import pkg_resources
+from functools import wraps
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -28,16 +31,61 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 app.logger.addHandler(console_handler)
 
-# List of common user agents
+# Enhanced list of user agents
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (iPad; CPU OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:89.0) Gecko/20100101 Firefox/89.0'
 ]
 
 def get_random_user_agent():
     """Get a random user agent from the list."""
     return random.choice(USER_AGENTS)
+
+def get_enhanced_headers():
+    """Get enhanced headers for YouTube requests."""
+    return {
+        'User-Agent': get_random_user_agent(),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Cache-Control': 'max-age=0',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1'
+    }
+
+def get_proxies():
+    """Get proxy list from environment variable or return None."""
+    proxy_str = os.environ.get('PROXY_LIST', '')
+    if proxy_str:
+        return proxy_str.split(',')
+    return None
+
+def with_exponential_backoff(max_retries=3, base_delay=1):
+    """Decorator for exponential backoff retry logic."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise e
+                    sleep_time = base_delay * (2 ** attempt) + uniform(0, 1)
+                    app.logger.warning(f'Attempt {attempt + 1} failed, retrying in {sleep_time:.2f} seconds')
+                    sleep(sleep_time)
+            return None
+        return wrapper
+    return decorator
 
 def validate_video_id(video_id):
     """Validate the video ID format."""
@@ -45,19 +93,21 @@ def validate_video_id(video_id):
         return False
     return 5 < len(video_id) < 15 and all(c.isalnum() or c in ['-', '_'] for c in video_id)
 
+@with_exponential_backoff(max_retries=3, base_delay=1)
 def check_video_availability(video_id):
     """Check if the video is available on YouTube."""
     try:
-        headers = {'User-Agent': get_random_user_agent()}
+        headers = get_enhanced_headers()
         response = requests.get(
             f'https://www.youtube.com/watch?v={video_id}',
             headers=headers,
-            timeout=10
+            timeout=10,
+            allow_redirects=True
         )
         return response.status_code == 200
     except Exception as e:
         app.logger.warning(f'Failed to check video availability: {str(e)}')
-        return True  # Assume video is available if check fails
+        return True
 
 def get_package_version(package_name):
     """Get the installed version of a package."""
@@ -65,6 +115,18 @@ def get_package_version(package_name):
         return pkg_resources.get_distribution(package_name).version
     except pkg_resources.DistributionNotFound:
         return "Unknown"
+
+@with_exponential_backoff(max_retries=3, base_delay=1)
+def get_transcript_with_retry(video_id, language_options):
+    """Get transcript with retry logic."""
+    proxies = get_proxies()
+    proxy = random.choice(proxies) if proxies else None
+    
+    return YouTubeTranscriptApi.get_transcript(
+        video_id,
+        languages=language_options,
+        proxies={'http': proxy, 'https': proxy} if proxy else None
+    )
 
 @app.route('/transcript', methods=['GET'])
 def get_transcript_endpoint():
@@ -119,11 +181,8 @@ def get_transcript_endpoint():
             try:
                 app.logger.info(f'Attempt {attempt + 1} of {max_attempts}')
 
-                # Get transcript without using proxies
-                transcript = YouTubeTranscriptApi.get_transcript(
-                    video_id,
-                    languages=language_options
-                )
+                # Get transcript with retry logic
+                transcript = get_transcript_with_retry(video_id, language_options)
 
                 # Process transcript
                 full_text = ' '.join([entry['text'] for entry in transcript])
@@ -157,8 +216,7 @@ def get_transcript_endpoint():
             except Exception as e:
                 last_error = str(e)
                 app.logger.warning(f'Attempt {attempt + 1} failed: {last_error}')
-                # Optional: Add a short delay before retrying
-                time.sleep(1)
+                sleep(1)
 
         # If all attempts failed, return error
         app.logger.error(f'All attempts failed for video {video_id}')
