@@ -66,7 +66,10 @@ def get_proxies():
     """Get proxy list from environment variable or return None."""
     proxy_str = os.environ.get('PROXY_LIST', '')
     if proxy_str:
-        return proxy_str.split(',')
+        proxies = proxy_str.split(',')
+        # Filter out empty or invalid proxies
+        valid_proxies = [p.strip() for p in proxies if p.strip() and not p.endswith('example.com')]
+        return valid_proxies if valid_proxies else None
     return None
 
 def with_exponential_backoff(max_retries=3, base_delay=1):
@@ -98,7 +101,10 @@ def check_video_availability(video_id):
     """Check if the video is available on YouTube."""
     try:
         headers = get_enhanced_headers()
-        response = requests.get(
+        # Add timeout and retry configuration
+        session = requests.Session()
+        session.mount('https://', requests.adapters.HTTPAdapter(max_retries=3))
+        response = session.get(
             f'https://www.youtube.com/watch?v={video_id}',
             headers=headers,
             timeout=10,
@@ -107,6 +113,7 @@ def check_video_availability(video_id):
         return response.status_code == 200
     except Exception as e:
         app.logger.warning(f'Failed to check video availability: {str(e)}')
+        # Return True to allow the transcript attempt anyway
         return True
 
 def get_package_version(package_name):
@@ -119,13 +126,23 @@ def get_package_version(package_name):
 @with_exponential_backoff(max_retries=3, base_delay=1)
 def get_transcript_with_retry(video_id, language_options):
     """Get transcript with retry logic."""
-    proxies = get_proxies()
-    proxy = random.choice(proxies) if proxies else None
+    try:
+        # First try with proxy
+        proxies = get_proxies()
+        if proxies:
+            proxy = random.choice(proxies)
+            return YouTubeTranscriptApi.get_transcript(
+                video_id,
+                languages=language_options,
+                proxies={'http': proxy, 'https': proxy}
+            )
+    except Exception as e:
+        app.logger.warning(f'Proxy attempt failed: {str(e)}. Trying without proxy...')
     
+    # Fallback: try without proxy
     return YouTubeTranscriptApi.get_transcript(
         video_id,
-        languages=language_options,
-        proxies={'http': proxy, 'https': proxy} if proxy else None
+        languages=language_options
     )
 
 @app.route('/transcript', methods=['GET'])
