@@ -11,9 +11,16 @@ from time import sleep
 import requests
 import pkg_resources
 from functools import wraps
+import threading
+from datetime import datetime, timedelta
+from cachetools import TTLCache
+import hashlib
 
 # Initialize Flask app
 app = Flask(__name__)
+
+# Initialize cache with 1-hour TTL
+transcript_cache = TTLCache(maxsize=100, ttl=3600)
 
 # Configure logging
 if not os.path.exists('logs'):
@@ -42,6 +49,28 @@ USER_AGENTS = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:89.0) Gecko/20100101 Firefox/89.0'
 ]
 
+class RequestThrottler:
+    def __init__(self, requests_per_minute=30):
+        self.requests_per_minute = requests_per_minute
+        self.requests = []
+        self.lock = threading.Lock()
+
+    def can_make_request(self):
+        now = datetime.now()
+        minute_ago = now - timedelta(minutes=1)
+        
+        with self.lock:
+            # Remove requests older than 1 minute
+            self.requests = [req_time for req_time in self.requests if req_time > minute_ago]
+            
+            if len(self.requests) < self.requests_per_minute:
+                self.requests.append(now)
+                return True
+            return False
+
+# Initialize the throttler
+throttler = RequestThrottler()
+
 def get_random_user_agent():
     """Get a random user agent from the list."""
     return random.choice(USER_AGENTS)
@@ -54,23 +83,49 @@ def get_enhanced_headers():
         'Accept-Language': 'en-US,en;q=0.5',
         'Accept-Encoding': 'gzip, deflate, br',
         'Connection': 'keep-alive',
+        'DNT': '1',  # Do Not Track
         'Upgrade-Insecure-Requests': '1',
-        'Cache-Control': 'max-age=0',
         'Sec-Fetch-Dest': 'document',
         'Sec-Fetch-Mode': 'navigate',
         'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1'
+        'Sec-Fetch-User': '?1',
+        'X-Forwarded-For': f'192.168.{random.randint(1, 254)}.{random.randint(1, 254)}'  # Randomize IP
     }
 
-def get_proxies():
-    """Get proxy list from environment variable or return None."""
-    proxy_str = os.environ.get('PROXY_LIST', '')
-    if proxy_str:
-        proxies = proxy_str.split(',')
-        # Filter out empty or invalid proxies
-        valid_proxies = [p.strip() for p in proxies if p.strip() and not p.endswith('example.com')]
-        return valid_proxies if valid_proxies else None
-    return None
+def get_cache_key(video_id, language):
+    """Generate a cache key for the video and language combination."""
+    return hashlib.md5(f"{video_id}:{language}".encode()).hexdigest()
+
+def validate_video_id(video_id):
+    """Validate the video ID format."""
+    if not video_id or not isinstance(video_id, str):
+        return False
+    return 5 < len(video_id) < 15 and all(c.isalnum() or c in ['-', '_'] for c in video_id)
+
+@with_exponential_backoff(max_retries=3, base_delay=1)
+def check_video_availability(video_id):
+    """Check if the video is available on YouTube."""
+    try:
+        headers = get_enhanced_headers()
+        session = requests.Session()
+        session.mount('https://', requests.adapters.HTTPAdapter(max_retries=3))
+        response = session.get(
+            f'https://www.youtube.com/watch?v={video_id}',
+            headers=headers,
+            timeout=10,
+            allow_redirects=True
+        )
+        return response.status_code == 200
+    except Exception as e:
+        app.logger.warning(f'Failed to check video availability: {str(e)}')
+        return True
+
+def get_package_version(package_name):
+    """Get the installed version of a package."""
+    try:
+        return pkg_resources.get_distribution(package_name).version
+    except pkg_resources.DistributionNotFound:
+        return "Unknown"
 
 def with_exponential_backoff(max_retries=3, base_delay=1):
     """Decorator for exponential backoff retry logic."""
@@ -90,67 +145,43 @@ def with_exponential_backoff(max_retries=3, base_delay=1):
         return wrapper
     return decorator
 
-def validate_video_id(video_id):
-    """Validate the video ID format."""
-    if not video_id or not isinstance(video_id, str):
-        return False
-    return 5 < len(video_id) < 15 and all(c.isalnum() or c in ['-', '_'] for c in video_id)
-
-@with_exponential_backoff(max_retries=3, base_delay=1)
-def check_video_availability(video_id):
-    """Check if the video is available on YouTube."""
-    try:
-        headers = get_enhanced_headers()
-        # Add timeout and retry configuration
-        session = requests.Session()
-        session.mount('https://', requests.adapters.HTTPAdapter(max_retries=3))
-        response = session.get(
-            f'https://www.youtube.com/watch?v={video_id}',
-            headers=headers,
-            timeout=10,
-            allow_redirects=True
-        )
-        return response.status_code == 200
-    except Exception as e:
-        app.logger.warning(f'Failed to check video availability: {str(e)}')
-        # Return True to allow the transcript attempt anyway
-        return True
-
-def get_package_version(package_name):
-    """Get the installed version of a package."""
-    try:
-        return pkg_resources.get_distribution(package_name).version
-    except pkg_resources.DistributionNotFound:
-        return "Unknown"
-
 @with_exponential_backoff(max_retries=3, base_delay=1)
 def get_transcript_with_retry(video_id, language_options):
-    """Get transcript with retry logic."""
+    """Get transcript with enhanced retry logic."""
     try:
-        # First try with proxy
-        proxies = get_proxies()
-        if proxies:
-            proxy = random.choice(proxies)
-            return YouTubeTranscriptApi.get_transcript(
-                video_id,
-                languages=language_options,
-                proxies={'http': proxy, 'https': proxy}
-            )
+        # Configure the YouTube Transcript API with custom cookies and headers
+        custom_headers = get_enhanced_headers()
+        
+        # Add these parameters to the YouTubeTranscriptApi call
+        return YouTubeTranscriptApi.get_transcript(
+            video_id,
+            languages=language_options,
+            headers=custom_headers,
+            cookies={'CONSENT': 'YES+cb.20210328-17-p0.en+FX+{}'.format(random.randint(100, 999))}
+        )
     except Exception as e:
-        app.logger.warning(f'Proxy attempt failed: {str(e)}. Trying without proxy...')
-    
-    # Fallback: try without proxy
-    return YouTubeTranscriptApi.get_transcript(
-        video_id,
-        languages=language_options
-    )
+        app.logger.warning(f'Transcript fetch failed: {str(e)}')
+        raise
 
 @app.route('/transcript', methods=['GET'])
 def get_transcript_endpoint():
     """Main endpoint to retrieve YouTube video transcripts."""
+    # Check rate limit
+    if not throttler.can_make_request():
+        return jsonify({
+            'error': 'Rate limit exceeded. Please try again in a minute.',
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+        }), 429
+
     start_time = time.time()
     video_id = request.args.get('videoId')
     language = request.args.get('language', 'en')
+
+    # Check cache first
+    cache_key = get_cache_key(video_id, language)
+    cached_result = transcript_cache.get(cache_key)
+    if cached_result:
+        return jsonify(cached_result), 200
 
     # Enhanced request logging
     app.logger.info(f'Transcript request received from IP: {request.remote_addr}')
@@ -190,71 +221,42 @@ def get_transcript_endpoint():
         ]
         language_options = list(dict.fromkeys(language_options))
 
-        # Multiple attempts with different settings
-        max_attempts = 3
-        last_error = None
+        # Get transcript with retry logic
+        transcript = get_transcript_with_retry(video_id, language_options)
 
-        for attempt in range(max_attempts):
-            try:
-                app.logger.info(f'Attempt {attempt + 1} of {max_attempts}')
+        # Process transcript
+        full_text = ' '.join([entry['text'] for entry in transcript])
+        response_time = time.time() - start_time
 
-                # Get transcript with retry logic
-                transcript = get_transcript_with_retry(video_id, language_options)
-
-                # Process transcript
-                full_text = ' '.join([entry['text'] for entry in transcript])
-                response_time = time.time() - start_time
-
-                return jsonify({
-                    'status': 'success',
-                    'video_id': video_id,
-                    'transcript': full_text,
-                    'transcript_length': len(full_text),
-                    'language': language,
-                    'response_time': f'{response_time:.2f}s',
-                    'attempt': attempt + 1,
-                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
-                }), 200
-
-            except TranscriptsDisabled:
-                app.logger.error(f'Subtitles are disabled for video {video_id}')
-                return jsonify({
-                    'error': 'Subtitles are disabled for this video',
-                    'video_id': video_id,
-                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
-                }), 404
-            except NoTranscriptFound:
-                app.logger.error(f'No transcript found for video {video_id}')
-                return jsonify({
-                    'error': 'No transcript found for this video',
-                    'video_id': video_id,
-                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
-                }), 404
-            except Exception as e:
-                last_error = str(e)
-                app.logger.warning(f'Attempt {attempt + 1} failed: {last_error}')
-                sleep(1)
-
-        # If all attempts failed, return error
-        app.logger.error(f'All attempts failed for video {video_id}')
-        error_response = {
-            'error': 'Failed to retrieve transcript',
+        response_data = {
+            'status': 'success',
             'video_id': video_id,
-            'details': last_error,
-            'response_time': f'{(time.time() - start_time):.2f}s',
+            'transcript': full_text,
+            'transcript_length': len(full_text),
+            'language': language,
+            'response_time': f'{response_time:.2f}s',
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
         }
 
-        if 'subtitles are disabled' in last_error.lower():
-            error_response['error_type'] = 'SUBTITLES_DISABLED'
-            return jsonify(error_response), 404
-        elif 'no transcript' in last_error.lower():
-            error_response['error_type'] = 'NO_TRANSCRIPT'
-            return jsonify(error_response), 404
-        else:
-            error_response['error_type'] = 'UNKNOWN_ERROR'
-            return jsonify(error_response), 500
+        # Cache the successful response
+        transcript_cache[cache_key] = response_data
 
+        return jsonify(response_data), 200
+
+    except TranscriptsDisabled:
+        app.logger.error(f'Subtitles are disabled for video {video_id}')
+        return jsonify({
+            'error': 'Subtitles are disabled for this video',
+            'video_id': video_id,
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+        }), 404
+    except NoTranscriptFound:
+        app.logger.error(f'No transcript found for video {video_id}')
+        return jsonify({
+            'error': 'No transcript found for this video',
+            'video_id': video_id,
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+        }), 404
     except Exception as e:
         app.logger.exception('Unexpected error occurred:')
         return jsonify({
