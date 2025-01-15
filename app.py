@@ -16,6 +16,24 @@ from datetime import datetime, timedelta
 from cachetools import TTLCache
 import hashlib
 
+def with_exponential_backoff(max_retries=3, base_delay=1):
+    """Decorator for exponential backoff retry logic."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise e
+                    sleep_time = base_delay * (2 ** attempt) + uniform(0, 1)
+                    app.logger.warning(f'Attempt {attempt + 1} failed, retrying in {sleep_time:.2f} seconds')
+                    sleep(sleep_time)
+            return None
+        return wrapper
+    return decorator
+
 # Initialize Flask app
 app = Flask(__name__)
 
@@ -126,24 +144,6 @@ def get_package_version(package_name):
         return pkg_resources.get_distribution(package_name).version
     except pkg_resources.DistributionNotFound:
         return "Unknown"
-
-def with_exponential_backoff(max_retries=3, base_delay=1):
-    """Decorator for exponential backoff retry logic."""
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            for attempt in range(max_retries):
-                try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    if attempt == max_retries - 1:
-                        raise e
-                    sleep_time = base_delay * (2 ** attempt) + uniform(0, 1)
-                    app.logger.warning(f'Attempt {attempt + 1} failed, retrying in {sleep_time:.2f} seconds')
-                    sleep(sleep_time)
-            return None
-        return wrapper
-    return decorator
 
 @with_exponential_backoff(max_retries=3, base_delay=1)
 def get_transcript_with_retry(video_id, language_options):
