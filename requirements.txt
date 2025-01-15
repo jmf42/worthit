@@ -1,3 +1,3 @@
-flask
-youtube-transcript-api
-gunicorn
+Flask==2.0.1
+gunicorn==20.1.0
+youtube_transcript_api==0.6.0 
