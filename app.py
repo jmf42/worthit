@@ -1,10 +1,10 @@
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, jsonify
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 import os
 import logging
 from logging.handlers import RotatingFileHandler
 import time
-import json
 import random
 import requests
 
@@ -57,7 +57,9 @@ def get_proxy_settings():
     
     # If no proxies are configured, try to get a free proxy
     try:
-        proxy_response = requests.get('https://proxylist.geonode.com/api/proxy-list?limit=1&page=1&sort_by=speed&sort_type=asc&filterUpTime=90&protocols=http%2Chttps&anonymityLevel=elite')
+        proxy_response = requests.get(
+            'https://proxylist.geonode.com/api/proxy-list?limit=1&page=1&sort_by=speed&sort_type=asc&filterUpTime=90&protocols=http%2Chttps&anonymityLevel=elite'
+        )
         if proxy_response.status_code == 200:
             proxy_data = proxy_response.json()
             if proxy_data['data']:
@@ -87,7 +89,7 @@ def check_video_availability(video_id):
         return True  # Assume video is available if check fails
 
 @app.route('/transcript', methods=['GET'])
-def get_transcript():
+def get_transcript_endpoint():
     """Main endpoint to retrieve YouTube video transcripts."""
     start_time = time.time()
     video_id = request.args.get('videoId')
@@ -132,13 +134,6 @@ def get_transcript():
         ]
         language_options = list(dict.fromkeys(language_options))
         
-        # Custom headers for the request
-        headers = {
-            'User-Agent': get_random_user_agent(),
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        }
-        
         # Multiple attempts with different settings
         max_attempts = 3
         last_error = None
@@ -147,11 +142,11 @@ def get_transcript():
             try:
                 app.logger.info(f'Attempt {attempt + 1} of {max_attempts}')
                 
+                # Removed headers parameter to avoid compatibility issues
                 transcript = YouTubeTranscriptApi.get_transcript(
                     video_id,
                     languages=language_options,
-                    proxies=proxies,
-                    headers=headers
+                    proxies=proxies
                 )
                 
                 # Process transcript
@@ -169,13 +164,26 @@ def get_transcript():
                     'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
                 }), 200
                 
+            except TranscriptsDisabled:
+                app.logger.error(f'Subtitles are disabled for video {video_id}')
+                return jsonify({
+                    'error': 'Subtitles are disabled for this video',
+                    'video_id': video_id,
+                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+                }), 404
+            except NoTranscriptFound:
+                app.logger.error(f'No transcript found for video {video_id}')
+                return jsonify({
+                    'error': 'No transcript found for this video',
+                    'video_id': video_id,
+                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+                }), 404
             except Exception as e:
                 last_error = str(e)
                 app.logger.warning(f'Attempt {attempt + 1} failed: {last_error}')
                 if proxies:
                     # Try different proxy for next attempt
                     proxies = get_proxy_settings()
-                headers['User-Agent'] = get_random_user_agent()
         
         # If all attempts failed, return error
         app.logger.error(f'All attempts failed for video {video_id}')
@@ -207,7 +215,7 @@ def get_transcript():
         }), 500
 
 @app.route('/test', methods=['GET'])
-def test():
+def test_endpoint():
     """Test endpoint to verify service is running."""
     return jsonify({
         'status': 'ok',
