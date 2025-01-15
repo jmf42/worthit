@@ -44,36 +44,6 @@ def validate_video_id(video_id):
         return False
     return 5 < len(video_id) < 15 and all(c.isalnum() or c in ['-', '_'] for c in video_id)
 
-def get_proxy_settings():
-    """Get proxy settings from environment variables with fallback to free proxy."""
-    http_proxy = os.environ.get('HTTP_PROXY')
-    https_proxy = os.environ.get('HTTPS_PROXY')
-    
-    if http_proxy or https_proxy:
-        return {
-            'http': http_proxy,
-            'https': https_proxy
-        }
-    
-    # If no proxies are configured, try to get a free proxy
-    try:
-        proxy_response = requests.get(
-            'https://proxylist.geonode.com/api/proxy-list?limit=1&page=1&sort_by=speed&sort_type=asc&filterUpTime=90&protocols=http%2Chttps&anonymityLevel=elite'
-        )
-        if proxy_response.status_code == 200:
-            proxy_data = proxy_response.json()
-            if proxy_data['data']:
-                proxy = proxy_data['data'][0]
-                proxy_url = f"http://{proxy['ip']}:{proxy['port']}"
-                return {
-                    'http': proxy_url,
-                    'https': proxy_url
-                }
-    except Exception as e:
-        app.logger.warning(f'Failed to fetch free proxy: {str(e)}')
-    
-    return None
-
 def check_video_availability(video_id):
     """Check if the video is available on YouTube."""
     try:
@@ -117,10 +87,8 @@ def get_transcript_endpoint():
         }), 404
     
     try:
-        # Get proxy settings
-        proxies = get_proxy_settings()
-        if proxies:
-            app.logger.info(f'Using proxies: {proxies}')
+        # Log youtube_transcript_api version
+        app.logger.info(f'youtube_transcript_api version: {YouTubeTranscriptApi.__version__}')
         
         # Define language options with fallbacks
         language_options = [
@@ -142,11 +110,10 @@ def get_transcript_endpoint():
             try:
                 app.logger.info(f'Attempt {attempt + 1} of {max_attempts}')
                 
-                # Removed headers parameter to avoid compatibility issues
+                # Removed proxies and headers to avoid connection issues
                 transcript = YouTubeTranscriptApi.get_transcript(
                     video_id,
-                    languages=language_options,
-                    proxies=proxies
+                    languages=language_options
                 )
                 
                 # Process transcript
@@ -181,9 +148,8 @@ def get_transcript_endpoint():
             except Exception as e:
                 last_error = str(e)
                 app.logger.warning(f'Attempt {attempt + 1} failed: {last_error}')
-                if proxies:
-                    # Try different proxy for next attempt
-                    proxies = get_proxy_settings()
+                # Optional: Add a short delay before retrying
+                time.sleep(1)
         
         # If all attempts failed, return error
         app.logger.error(f'All attempts failed for video {video_id}')
@@ -217,10 +183,17 @@ def get_transcript_endpoint():
 @app.route('/test', methods=['GET'])
 def test_endpoint():
     """Test endpoint to verify service is running."""
+    try:
+        # Log youtube_transcript_api version
+        yt_version = YouTubeTranscriptApi.__version__
+    except Exception as e:
+        yt_version = 'Unknown'
+    
     return jsonify({
         'status': 'ok',
         'message': 'Service is running',
         'environment': os.environ.get('FLASK_ENV', 'production'),
+        'youtube_transcript_api_version': yt_version,
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
     }), 200
 
