@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask imfrom flask import Flask, request, jsonify
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 import os
@@ -7,6 +7,7 @@ from logging.handlers import RotatingFileHandler
 import time
 import random
 import requests
+import pkg_resources
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -29,8 +30,8 @@ app.logger.addHandler(console_handler)
 
 # List of common user agents
 USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0',
 ]
 
@@ -57,6 +58,13 @@ def check_video_availability(video_id):
     except Exception as e:
         app.logger.warning(f'Failed to check video availability: {str(e)}')
         return True  # Assume video is available if check fails
+
+def get_package_version(package_name):
+    """Get the installed version of a package."""
+    try:
+        return pkg_resources.get_distribution(package_name).version
+    except pkg_resources.DistributionNotFound:
+        return "Unknown"
 
 @app.route('/transcript', methods=['GET'])
 def get_transcript_endpoint():
@@ -87,8 +95,9 @@ def get_transcript_endpoint():
         }), 404
     
     try:
-        # Log youtube_transcript_api version
-        app.logger.info(f'youtube_transcript_api version: {YouTubeTranscriptApi.__version__}')
+        # Get youtube_transcript_api version
+        yt_version = get_package_version("youtube_transcript_api")
+        app.logger.info(f'youtube_transcript_api version: {yt_version}')
         
         # Define language options with fallbacks
         language_options = [
@@ -110,7 +119,7 @@ def get_transcript_endpoint():
             try:
                 app.logger.info(f'Attempt {attempt + 1} of {max_attempts}')
                 
-                # Removed proxies and headers to avoid connection issues
+                # Get transcript without using proxies
                 transcript = YouTubeTranscriptApi.get_transcript(
                     video_id,
                     languages=language_options
@@ -184,8 +193,8 @@ def get_transcript_endpoint():
 def test_endpoint():
     """Test endpoint to verify service is running."""
     try:
-        # Log youtube_transcript_api version
-        yt_version = YouTubeTranscriptApi.__version__
+        # Get youtube_transcript_api version
+        yt_version = get_package_version("youtube_transcript_api")
     except Exception as e:
         yt_version = 'Unknown'
     
