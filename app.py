@@ -1,4 +1,4 @@
-from flask imfrom flask import Flask, request, jsonify
+from flask import Flask, request, jsonify
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 import os
@@ -72,12 +72,12 @@ def get_transcript_endpoint():
     start_time = time.time()
     video_id = request.args.get('videoId')
     language = request.args.get('language', 'en')
-    
+
     # Enhanced request logging
     app.logger.info(f'Transcript request received from IP: {request.remote_addr}')
     app.logger.info(f'Headers: {dict(request.headers)}')
     app.logger.info(f'Video ID: {video_id}, Language: {language}')
-    
+
     # Validate video ID
     if not validate_video_id(video_id):
         return jsonify({
@@ -85,7 +85,7 @@ def get_transcript_endpoint():
             'video_id': video_id,
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
         }), 400
-    
+
     # Check video availability
     if not check_video_availability(video_id):
         return jsonify({
@@ -93,12 +93,12 @@ def get_transcript_endpoint():
             'video_id': video_id,
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
         }), 404
-    
+
     try:
         # Get youtube_transcript_api version
         yt_version = get_package_version("youtube_transcript_api")
         app.logger.info(f'youtube_transcript_api version: {yt_version}')
-        
+
         # Define language options with fallbacks
         language_options = [
             language,
@@ -110,25 +110,25 @@ def get_transcript_endpoint():
             'a.en'
         ]
         language_options = list(dict.fromkeys(language_options))
-        
+
         # Multiple attempts with different settings
         max_attempts = 3
         last_error = None
-        
+
         for attempt in range(max_attempts):
             try:
                 app.logger.info(f'Attempt {attempt + 1} of {max_attempts}')
-                
+
                 # Get transcript without using proxies
                 transcript = YouTubeTranscriptApi.get_transcript(
                     video_id,
                     languages=language_options
                 )
-                
+
                 # Process transcript
                 full_text = ' '.join([entry['text'] for entry in transcript])
                 response_time = time.time() - start_time
-                
+
                 return jsonify({
                     'status': 'success',
                     'video_id': video_id,
@@ -139,7 +139,7 @@ def get_transcript_endpoint():
                     'attempt': attempt + 1,
                     'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
                 }), 200
-                
+
             except TranscriptsDisabled:
                 app.logger.error(f'Subtitles are disabled for video {video_id}')
                 return jsonify({
@@ -159,7 +159,7 @@ def get_transcript_endpoint():
                 app.logger.warning(f'Attempt {attempt + 1} failed: {last_error}')
                 # Optional: Add a short delay before retrying
                 time.sleep(1)
-        
+
         # If all attempts failed, return error
         app.logger.error(f'All attempts failed for video {video_id}')
         error_response = {
@@ -169,7 +169,7 @@ def get_transcript_endpoint():
             'response_time': f'{(time.time() - start_time):.2f}s',
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
         }
-        
+
         if 'subtitles are disabled' in last_error.lower():
             error_response['error_type'] = 'SUBTITLES_DISABLED'
             return jsonify(error_response), 404
@@ -179,7 +179,7 @@ def get_transcript_endpoint():
         else:
             error_response['error_type'] = 'UNKNOWN_ERROR'
             return jsonify(error_response), 500
-            
+
     except Exception as e:
         app.logger.exception('Unexpected error occurred:')
         return jsonify({
@@ -197,7 +197,7 @@ def test_endpoint():
         yt_version = get_package_version("youtube_transcript_api")
     except Exception as e:
         yt_version = 'Unknown'
-    
+
     return jsonify({
         'status': 'ok',
         'message': 'Service is running',
