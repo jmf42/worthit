@@ -149,15 +149,11 @@ def get_package_version(package_name):
 def get_transcript_with_retry(video_id, language_options):
     """Get transcript with enhanced retry logic."""
     try:
-        # Configure the YouTube Transcript API with custom cookies and headers
-        custom_headers = get_enhanced_headers()
-        
-        # Add these parameters to the YouTubeTranscriptApi call
+        # Removed custom headers and cookies
         return YouTubeTranscriptApi.get_transcript(
             video_id,
-            languages=language_options,
-            headers=custom_headers,
-            cookies={'CONSENT': 'YES+cb.20210328-17-p0.en+FX+{}'.format(random.randint(100, 999))}
+            languages=language_options
+            # headers and cookies removed
         )
     except Exception as e:
         app.logger.warning(f'Transcript fetch failed: {str(e)}')
