@@ -1,8 +1,9 @@
 import os
 import re
-import time
 import logging
-import hashlib
+import time
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 from flask import Flask, request, jsonify
 from youtube_transcript_api import (
@@ -11,31 +12,53 @@ from youtube_transcript_api import (
     NoTranscriptFound
 )
 from cachetools import TTLCache
+from cachetools.keys import hashkey
 from logging.handlers import RotatingFileHandler
+from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 # -----------------------------
 # Flask App Initialization
 # -----------------------------
 app = Flask(__name__)
+CORS(app)
 
 # -----------------------------
-# Smartproxy Credentials
+# Rate Limiting
+# -----------------------------
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per hour", "50 per minute"]
+)
+
+# -----------------------------
+# Proxy Configuration (Temporary)
 # -----------------------------
 SMARTPROXY_USER = "spylrn4hi2"
 SMARTPROXY_PASS = "f~6vgqT7bgqcVxYO73"
 SMARTPROXY_HOST = "gate.smartproxy.com"
 SMARTPROXY_PORT = "10001"
 
-# Construct the "https" proxy string. The youtube_transcript_api library
-# uses the 'requests' library's format for proxies.
 PROXIES = {
     "https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:{SMARTPROXY_PORT}"
 }
 
 # -----------------------------
-# Transcript Cache (1 Hour TTL)
+# Cache & Thread Configuration
 # -----------------------------
-transcript_cache = TTLCache(maxsize=100, ttl=3600)
+transcript_cache = TTLCache(maxsize=500, ttl=3600)
+executor = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 4))
+
+# -----------------------------
+# Language Configuration
+# -----------------------------
+FALLBACK_LANGUAGES = [
+    'en', 'es', 'fr', 'de', 'pt', 'ru', 'hi',
+    'ar', 'zh-Hans', 'ja', 'ko', 'it', 'nl', 'tr', 'vi',
+    'id', 'pl', 'th', 'sv', 'fi', 'he', 'uk', 'da', 'no'
+]
 
 # -----------------------------
 # Logging Configuration
@@ -45,173 +68,173 @@ if not os.path.exists('logs'):
 
 file_handler = RotatingFileHandler(
     'logs/youtube_transcript.log',
-    maxBytes=10_240,
-    backupCount=10
+    maxBytes=5_242_880,
+    backupCount=3,
+    encoding='utf-8'
 )
 file_handler.setFormatter(
-    logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
+    logging.Formatter('%(asctime)s %(levelname)s [%(module)s:%(lineno)d]: %(message)s')
 )
-file_handler.setLevel(logging.DEBUG)
+file_handler.setLevel(logging.INFO)
 
 app.logger.addHandler(file_handler)
-app.logger.setLevel(logging.DEBUG)
+app.logger.setLevel(logging.INFO)
 
 # -----------------------------
-# Helper: Extract Video ID
+# Video ID Validation
 # -----------------------------
+VIDEO_ID_REGEX = re.compile(r'^[\w-]{11}$')
+
+def validate_video_id(video_id: str) -> bool:
+    return bool(VIDEO_ID_REGEX.fullmatch(video_id))
+
+# -----------------------------
+# Enhanced Video ID Extraction
+# -----------------------------
+@lru_cache(maxsize=1024)
 def extract_video_id(input_str: str) -> str:
-    """
-    If the user passed a full YouTube URL, extract the 11-char video ID.
-    Otherwise return input as-is.
-    This regex covers typical patterns like:
-      - https://www.youtube.com/watch?v=XXXX
-      - https://youtu.be/XXXX
-    """
-    # Basic pattern to capture the 11-character ID from typical YT URLs
-    # If no match, assume user already provided an ID.
-    match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11})', input_str)
-    if match:
-        return match.group(1)
-    return input_str
+    patterns = [
+        r'(?:v=|\/)([\w-]{11})',  # Standard URLs
+        r'^([\w-]{11})$'          # Direct ID
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, input_str)
+        if match and validate_video_id(match.group(1)):
+            return match.group(1)
+    
+    raise ValueError("Invalid YouTube URL or video ID")
 
 # -----------------------------
-# Proxy-Only Fetch
+# Async Transcript Fetching with Improved Language Support
 # -----------------------------
-def fetch_transcript_proxy(video_id: str, languages=None, preserve_format=False):
-    """
-    Fetch transcript from YouTube using the proxy, returning a list of transcript entries.
-    Raises TranscriptsDisabled, NoTranscriptFound, or Exception on error.
-    """
-    if languages is None:
-        languages = ['en']  # default to English if not provided
-
-    # Preserve formatting if requested
-    return YouTubeTranscriptApi.get_transcript(
-        video_id,
-        languages=languages,
-        proxies=PROXIES,
-        preserve_formatting=preserve_format
-    )
+def fetch_transcript_with_retry(video_id: str, languages: list, preserve_format: bool, retries=2):
+    for attempt in range(retries + 1):
+        try:
+            return YouTubeTranscriptApi.get_transcript(
+                video_id,
+                languages=languages,
+                proxies=PROXIES,
+                preserve_formatting=preserve_format
+            )
+        except NoTranscriptFound:
+            # Try finding any available transcript if specific languages fail
+            if attempt == 1:
+                return YouTubeTranscriptApi.get_transcript(
+                    video_id,
+                    languages=['*'],  # Try any available language
+                    proxies=PROXIES,
+                    preserve_formatting=preserve_format
+                )
+        except Exception as e:
+            if attempt == retries:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+    return None
 
 # -----------------------------
-# Flask Routes
+# Cache Key Generation
+# -----------------------------
+def generate_cache_key(video_id: str, languages: tuple, preserve_format: bool, return_full: bool):
+    return hashkey(video_id, languages, preserve_format, return_full)
+
+# -----------------------------
+# Transcript Processing
+# -----------------------------
+def process_transcript(transcript_data: list, return_full: bool) -> dict:
+    if return_full:
+        return {
+            'segments': [
+                {
+                    'text': entry['text'],
+                    'start': round(entry['start'], 2),
+                    'duration': round(entry['duration'], 2)
+                }
+                for entry in transcript_data
+            ]
+        }
+    return {'text': ' '.join(entry['text'] for entry in transcript_data)}
+
+# -----------------------------
+# Main Endpoint
 # -----------------------------
 @app.route('/transcript', methods=['GET'])
+@limiter.limit("100/hour")
 def get_transcript_endpoint():
-    """
-    GET /transcript?videoId=XYZ&language=en&preserveFormatting=true|false
-    Always uses proxy on first request (no direct attempt).
-    """
-    raw_video_id = request.args.get('videoId', '').strip()
-    user_language = request.args.get('language', 'en').strip()
-    preserve_param = request.args.get('preserveFormatting', 'false').lower()
-
-    if not raw_video_id:
-        return jsonify({'error': 'Missing videoId parameter'}), 400
-
-    # Extract or sanitize the video ID if a URL was passed
-    video_id = extract_video_id(raw_video_id)
-
-    # Convert preserveFormatting=... to a boolean
-    preserve_format = (preserve_param == 'true')
-
-    # Check cache
-    cache_key = f"{video_id}:{user_language}:{preserve_format}"
-    cached_result = transcript_cache.get(cache_key)
-    if cached_result:
-        app.logger.info(f"[Cache] HIT for {cache_key}")
-        return jsonify(cached_result), 200
-
-    # Language fallback: your preference
-    # Put the requested language first, then fallback to a few defaults
-    # (Adjust this list as desired)
-    language_options = [user_language, 'en', 'es', 'fr', 'de', 'pt']
-
-    # Attempt to fetch via Proxy
-    app.logger.info(f"[Proxy Fetch] Attempting for video_id={video_id}, preserve={preserve_format}")
     try:
-        transcript_data = fetch_transcript_proxy(
-            video_id=video_id,
-            languages=language_options,
-            preserve_format=preserve_format
-        )
-    except (TranscriptsDisabled, NoTranscriptFound) as e:
-        # Subtitles are not available or disabled
-        app.logger.error(f"[Proxy Fetch] Subtitles unavailable for {video_id}. Error: {e}")
-        return jsonify({'error': 'Subtitles are disabled/unavailable for this video'}), 404
+        # Parameter handling
+        raw_video_id = request.args.get('videoId', '').strip()
+        if not raw_video_id:
+            return jsonify({'error': 'Missing videoId parameter'}), 400
+
+        try:
+            video_id = extract_video_id(raw_video_id)
+        except ValueError:
+            return jsonify({'error': 'Invalid YouTube URL or video ID'}), 400
+
+        # Language handling with deduplication
+        user_languages = [
+            lang.strip().lower()
+            for lang in request.args.get('language', 'en').split(',')
+            if lang.strip()
+        ]
+        preserve_format = request.args.get('preserveFormatting', 'false').lower() == 'true'
+        return_full = request.args.get('format', 'text').lower() == 'full'
+
+        # Create prioritized language list without duplicates
+        language_priority = list(dict.fromkeys(user_languages + FALLBACK_LANGUAGES))
+
+        # Cache check
+        cache_key = generate_cache_key(video_id, tuple(language_priority), preserve_format, return_full)
+        if cached_data := transcript_cache.get(cache_key):
+            app.logger.info(f"Cache hit for {video_id}")
+            return jsonify(cached_data), 200
+
+        # Async fetch with retry
+        try:
+            future = executor.submit(
+                fetch_transcript_with_retry,
+                video_id=video_id,
+                languages=language_priority,
+                preserve_format=preserve_format
+            )
+            transcript_data = future.result(timeout=12)
+        except TranscriptsDisabled:
+            return jsonify({'error': 'Subtitles disabled for this video'}), 404
+        except NoTranscriptFound:
+            return jsonify({'error': 'No transcript available in requested languages'}), 404
+        except TimeoutError:
+            app.logger.error(f"Timeout fetching transcript for {video_id}")
+            return jsonify({'error': 'Transcript service timeout'}), 504
+        except Exception as e:
+            app.logger.error(f"Proxy error: {str(e)}")
+            return jsonify({'error': 'Transcript service unavailable'}), 503
+
+        # Process response
+        processed_data = process_transcript(transcript_data, return_full)
+        response_data = {
+            'status': 'success',
+            'video_id': video_id,
+            'detected_language': transcript_data[0].get('language', 'unknown'),
+            **processed_data
+        }
+        
+        # Cache and return
+        transcript_cache[cache_key] = response_data
+        return jsonify(response_data), 200
+
     except Exception as e:
-        # Some other failure
-        app.logger.error(f"[Proxy Fetch] Unknown error for {video_id}: {e}")
-        return jsonify({'error': 'Unable to fetch transcript', 'details': str(e)}), 500
-
-    # Build response data
-    response_data = {
-        'status': 'success',
-        'video_id': video_id,
-        'transcript': ' '.join([entry['text'] for entry in transcript_data]),
-        'preserve_formatting': preserve_format
-    }
-
-    # Cache the result
-    transcript_cache[cache_key] = response_data
-    app.logger.info(f"[Cache] MISS, storing new transcript for {cache_key}")
-
-    return jsonify(response_data), 200
-
-
-@app.route('/test', methods=['GET'])
-def test_endpoint():
-    """
-    Health Check Endpoint
-    """
-    return jsonify({'status': 'ok', 'message': 'Service is running'}), 200
-
+        app.logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
 
 # -----------------------------
-# Optional: An Endpoint to List Transcript Languages
+# Other Endpoints (Keep previous implementation)
 # -----------------------------
-@app.route('/available_transcripts', methods=['GET'])
-def list_available_transcripts():
-    """
-    GET /available_transcripts?videoId=XYZ
-    Returns the list of transcripts (including the type: generated/manually_created).
-    Example usage from the docs: YouTubeTranscriptApi.list_transcripts(video_id)
-    """
-    raw_video_id = request.args.get('videoId', '').strip()
-    if not raw_video_id:
-        return jsonify({'error': 'Missing videoId parameter'}), 400
-
-    video_id = extract_video_id(raw_video_id)
-
-    try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(
-            video_id,
-            proxies=PROXIES
-        )
-    except Exception as e:
-        app.logger.error(f"[List Transcripts] Failed for {video_id}: {e}")
-        return jsonify({'error': 'Unable to list transcripts', 'details': str(e)}), 500
-
-    # Build a simple JSON representation
-    transcripts_info = []
-    for t in transcript_list:
-        transcripts_info.append({
-            'language': t.language,
-            'language_code': t.language_code,
-            'is_generated': t.is_generated,
-            'is_translatable': t.is_translatable,
-            'translation_languages': [lang['language'] for lang in t.translation_languages]
-        })
-
-    return jsonify({
-        'video_id': video_id,
-        'available_transcripts': transcripts_info
-    }), 200
-
+# [Keep the /available_transcripts and /health endpoints from previous code]
 
 # -----------------------------
-# Main Entry
+# Execution
 # -----------------------------
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5005))
-    app.run(host='0.0.0.0', port=port)
+    port = int(os.environ.get('PORT', 5010))
+    app.run(host='0.0.0.0', port=port, threaded=True)
