@@ -1,11 +1,10 @@
+
 import os
 import re
 import logging
-import asyncio
 import time
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-
 
 from flask import Flask, request, jsonify
 from youtube_transcript_api import (
@@ -178,40 +177,52 @@ def process_transcript(transcript_data: list, return_full: bool) -> dict:
 # Main Endpoint
 # -----------------------------
 @app.route('/transcript', methods=['GET'])
-async def get_transcript_endpoint():
+@limiter.limit("100/hour")
+def get_transcript_endpoint():
     try:
         raw_video_id = request.args.get('videoId', '').strip()
         if not raw_video_id:
-            lang = request.headers.get('Accept-Language', 'en').split(',')[0]
-            localized_error = {
-                'en': 'Missing videoId parameter',
-                'es': 'Falta el parámetro videoId'
-            }.get(lang, 'Missing videoId parameter')
-            return jsonify({'error': localized_error}), 400
+            return jsonify({'error': 'Missing videoId parameter'}), 400
 
         try:
             video_id = extract_video_id(raw_video_id)
         except ValueError:
             return jsonify({'error': 'Invalid YouTube URL or video ID'}), 400
 
-        user_languages = [lang.strip().lower() for lang in request.args.get('language', 'en').split(',') if lang.strip()]
+        user_languages = [
+            lang.strip().lower()
+            for lang in request.args.get('language', 'en').split(',')
+            if lang.strip()
+        ]
         preserve_format = request.args.get('preserveFormatting', 'false').lower() == 'true'
         return_full = request.args.get('format', 'text').lower() == 'full'
         language_priority = list(dict.fromkeys(user_languages + FALLBACK_LANGUAGES))
+
         cache_key = generate_cache_key(video_id, tuple(language_priority), preserve_format, return_full)
-        
         if cached_data := transcript_cache.get(cache_key):
             app.logger.info(f"Cache hit for {video_id}")
             return jsonify(cached_data), 200
 
-        loop = asyncio.get_running_loop()
-        transcript_data = await loop.run_in_executor(
-            executor,
-            fetch_transcript_with_retry,
-            video_id,
-            language_priority,
-            preserve_format
-        )
+        # Reduced timeout from 12 to 5 seconds
+        try:
+            future = executor.submit(
+                fetch_transcript_with_retry,
+                video_id=video_id,
+                languages=language_priority,
+                preserve_format=preserve_format
+            )
+            transcript_data = future.result(timeout=5)
+        except TranscriptsDisabled:
+            return jsonify({'error': 'Subtitles disabled for this video'}), 404
+        except NoTranscriptFound:
+            return jsonify({'error': 'No transcript available in requested languages'}), 404
+        except TimeoutError:
+            app.logger.error(f"Timeout fetching transcript for {video_id}")
+            return jsonify({'error': 'Transcript service timeout'}), 504
+        except Exception as e:
+            app.logger.error(f"Proxy error: {str(e)}")
+            return jsonify({'error': 'Transcript service unavailable'}), 503
+
         processed_data = process_transcript(transcript_data, return_full)
         response_data = {
             'status': 'success',
@@ -219,12 +230,13 @@ async def get_transcript_endpoint():
             'detected_language': transcript_data[0].get('language', 'unknown'),
             **processed_data
         }
+        
         transcript_cache[cache_key] = response_data
         return jsonify(response_data), 200
+
     except Exception as e:
         app.logger.error(f"Unexpected error: {str(e)}", exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
-
 
 # -----------------------------
 # Other Endpoints (if any)
@@ -237,3 +249,4 @@ async def get_transcript_endpoint():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5010))
     app.run(host='0.0.0.0', port=port, threaded=True)
+
