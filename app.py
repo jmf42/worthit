@@ -49,6 +49,7 @@ PROXIES = {
 # Cache & Thread Configuration
 # -----------------------------
 transcript_cache = TTLCache(maxsize=500, ttl=3600)
+# Use up to min(32, CPU_count * 4) workers.
 executor = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 4))
 
 # -----------------------------
@@ -106,6 +107,22 @@ def extract_video_id(input_str: str) -> str:
     raise ValueError("Invalid YouTube URL or video ID")
 
 # -----------------------------
+# Precompile Regex for Transcript Extraction
+# -----------------------------
+TEXT_EXTRACTION_REGEX = re.compile(r"<text[^>]*>(.*?)</text>", re.DOTALL)
+
+def extractTextFromXML(rawXML: str) -> list:
+    matches = TEXT_EXTRACTION_REGEX.findall(rawXML)
+    lines = []
+    for snippet in matches:
+        snippet = snippet.replace("&#39;", "'")\
+                         .replace("&quot;", "\"")\
+                         .replace("&amp;", "&")\
+                         .replace("&#34;", "\"")
+        lines.append(snippet)
+    return lines
+
+# -----------------------------
 # Async Transcript Fetching with Improved Language Support
 # -----------------------------
 def fetch_transcript_with_retry(video_id: str, languages: list, preserve_format: bool, retries=2):
@@ -118,11 +135,11 @@ def fetch_transcript_with_retry(video_id: str, languages: list, preserve_format:
                 preserve_formatting=preserve_format
             )
         except NoTranscriptFound:
-            # Try finding any available transcript if specific languages fail
+            # Try any language on second attempt
             if attempt == 1:
                 return YouTubeTranscriptApi.get_transcript(
                     video_id,
-                    languages=['*'],  # Try any available language
+                    languages=['*'],
                     proxies=PROXIES,
                     preserve_formatting=preserve_format
                 )
@@ -162,7 +179,6 @@ def process_transcript(transcript_data: list, return_full: bool) -> dict:
 @limiter.limit("100/hour")
 def get_transcript_endpoint():
     try:
-        # Parameter handling
         raw_video_id = request.args.get('videoId', '').strip()
         if not raw_video_id:
             return jsonify({'error': 'Missing videoId parameter'}), 400
@@ -172,7 +188,6 @@ def get_transcript_endpoint():
         except ValueError:
             return jsonify({'error': 'Invalid YouTube URL or video ID'}), 400
 
-        # Language handling with deduplication
         user_languages = [
             lang.strip().lower()
             for lang in request.args.get('language', 'en').split(',')
@@ -180,17 +195,14 @@ def get_transcript_endpoint():
         ]
         preserve_format = request.args.get('preserveFormatting', 'false').lower() == 'true'
         return_full = request.args.get('format', 'text').lower() == 'full'
-
-        # Create prioritized language list without duplicates
         language_priority = list(dict.fromkeys(user_languages + FALLBACK_LANGUAGES))
 
-        # Cache check
         cache_key = generate_cache_key(video_id, tuple(language_priority), preserve_format, return_full)
         if cached_data := transcript_cache.get(cache_key):
             app.logger.info(f"Cache hit for {video_id}")
             return jsonify(cached_data), 200
 
-        # Async fetch with retry
+        # Reduced timeout from 12 to 5 seconds
         try:
             future = executor.submit(
                 fetch_transcript_with_retry,
@@ -198,7 +210,7 @@ def get_transcript_endpoint():
                 languages=language_priority,
                 preserve_format=preserve_format
             )
-            transcript_data = future.result(timeout=12)
+            transcript_data = future.result(timeout=5)
         except TranscriptsDisabled:
             return jsonify({'error': 'Subtitles disabled for this video'}), 404
         except NoTranscriptFound:
@@ -210,7 +222,6 @@ def get_transcript_endpoint():
             app.logger.error(f"Proxy error: {str(e)}")
             return jsonify({'error': 'Transcript service unavailable'}), 503
 
-        # Process response
         processed_data = process_transcript(transcript_data, return_full)
         response_data = {
             'status': 'success',
@@ -219,7 +230,6 @@ def get_transcript_endpoint():
             **processed_data
         }
         
-        # Cache and return
         transcript_cache[cache_key] = response_data
         return jsonify(response_data), 200
 
@@ -228,9 +238,9 @@ def get_transcript_endpoint():
         return jsonify({'error': 'Internal server error'}), 500
 
 # -----------------------------
-# Other Endpoints (Keep previous implementation)
+# Other Endpoints (if any)
 # -----------------------------
-# [Keep the /available_transcripts and /health endpoints from previous code]
+# (For example, /available_transcripts, /health, etc.)
 
 # -----------------------------
 # Execution
