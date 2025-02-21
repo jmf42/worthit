@@ -1,4 +1,3 @@
-
 import os
 import re
 import logging
@@ -18,53 +17,59 @@ from logging.handlers import RotatingFileHandler
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+import requests
 
-# -----------------------------
+# --------------------------------------------------
+# Hard-coded Smartproxy & API configuration
+# --------------------------------------------------
+# (Replace these values with your actual keys)
+SMARTPROXY_USER = "spylrn4hi2"
+SMARTPROXY_PASS = "f~6vgqT7bgqcVxYO73"
+SMARTPROXY_HOST = "gate.smartproxy.com"
+# Use port 10000 for rotating proxies (10001 is for sticky sessions)
+SMARTPROXY_PORT = "10000"
+SMARTPROXY_API_TOKEN = "0eafbfc36f0e67f185c82ea4409d986a50a180d85e15bc4c84869f791ae43501f088d2647e31bcb7e6bd9b240ae3c3d34d069bb928403c32f0e0ccaa60452fa056216979c7a591ea062710276ae661ca2a646d3a8a0d"
+
+# Define PROXIES for Smartproxy usage
+PROXIES = {
+    "https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:{SMARTPROXY_PORT}"
+}
+
+# --------------------------------------------------
 # Flask App Initialization
-# -----------------------------
+# --------------------------------------------------
 app = Flask(__name__)
 CORS(app)
 
-# -----------------------------
+# --------------------------------------------------
 # Rate Limiting
-# -----------------------------
+# --------------------------------------------------
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
     default_limits=["200 per hour", "50 per minute"]
 )
 
-# -----------------------------
-# Proxy Configuration (Temporary)
-# -----------------------------
-SMARTPROXY_USER = "spylrn4hi2"
-SMARTPROXY_PASS = "f~6vgqT7bgqcVxYO73"
-SMARTPROXY_HOST = "gate.smartproxy.com"
-SMARTPROXY_PORT = "10001"
-
-PROXIES = {
-    "https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:{SMARTPROXY_PORT}"
-}
-
-# -----------------------------
+# --------------------------------------------------
 # Cache & Thread Configuration
-# -----------------------------
-transcript_cache = TTLCache(maxsize=500, ttl=3600)
+# --------------------------------------------------
+# Cache transcripts for 10 minutes (600 seconds) for freshness
+transcript_cache = TTLCache(maxsize=500, ttl=600)
 # Use up to min(32, CPU_count * 4) workers.
 executor = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 4))
 
-# -----------------------------
+# --------------------------------------------------
 # Language Configuration
-# -----------------------------
+# --------------------------------------------------
 FALLBACK_LANGUAGES = [
     'en', 'es', 'fr', 'de', 'pt', 'ru', 'hi',
     'ar', 'zh-Hans', 'ja', 'ko', 'it', 'nl', 'tr', 'vi',
     'id', 'pl', 'th', 'sv', 'fi', 'he', 'uk', 'da', 'no'
 ]
 
-# -----------------------------
+# --------------------------------------------------
 # Logging Configuration
-# -----------------------------
+# --------------------------------------------------
 if not os.path.exists('logs'):
     os.mkdir('logs')
 
@@ -82,17 +87,17 @@ file_handler.setLevel(logging.INFO)
 app.logger.addHandler(file_handler)
 app.logger.setLevel(logging.INFO)
 
-# -----------------------------
+# --------------------------------------------------
 # Video ID Validation
-# -----------------------------
+# --------------------------------------------------
 VIDEO_ID_REGEX = re.compile(r'^[\w-]{11}$')
 
 def validate_video_id(video_id: str) -> bool:
     return bool(VIDEO_ID_REGEX.fullmatch(video_id))
 
-# -----------------------------
+# --------------------------------------------------
 # Enhanced Video ID Extraction
-# -----------------------------
+# --------------------------------------------------
 @lru_cache(maxsize=1024)
 def extract_video_id(input_str: str) -> str:
     patterns = [
@@ -107,28 +112,20 @@ def extract_video_id(input_str: str) -> str:
     
     raise ValueError("Invalid YouTube URL or video ID")
 
-# -----------------------------
-# Precompile Regex for Transcript Extraction
-# -----------------------------
-TEXT_EXTRACTION_REGEX = re.compile(r"<text[^>]*>(.*?)</text>", re.DOTALL)
-
-def extractTextFromXML(rawXML: str) -> list:
-    matches = TEXT_EXTRACTION_REGEX.findall(rawXML)
-    lines = []
-    for snippet in matches:
-        snippet = snippet.replace("&#39;", "'")\
-                         .replace("&quot;", "\"")\
-                         .replace("&amp;", "&")\
-                         .replace("&#34;", "\"")
-        lines.append(snippet)
-    return lines
-
-# -----------------------------
-# Async Transcript Fetching with Improved Language Support
-# -----------------------------
+# --------------------------------------------------
+# Async Transcript Fetching with Retry and Fallback
+# --------------------------------------------------
 def fetch_transcript_with_retry(video_id: str, languages: list, preserve_format: bool, retries=2):
     for attempt in range(retries + 1):
         try:
+            # On first attempt, try fetching directly (to save proxy usage)
+            if attempt == 0:
+                return YouTubeTranscriptApi.get_transcript(
+                    video_id,
+                    languages=languages,
+                    preserve_formatting=preserve_format
+                )
+            # Fallback: use Smartproxy
             return YouTubeTranscriptApi.get_transcript(
                 video_id,
                 languages=languages,
@@ -136,7 +133,7 @@ def fetch_transcript_with_retry(video_id: str, languages: list, preserve_format:
                 preserve_formatting=preserve_format
             )
         except NoTranscriptFound:
-            # Try any language on second attempt
+            # On second attempt, try using any available language
             if attempt == 1:
                 return YouTubeTranscriptApi.get_transcript(
                     video_id,
@@ -145,20 +142,21 @@ def fetch_transcript_with_retry(video_id: str, languages: list, preserve_format:
                     preserve_formatting=preserve_format
                 )
         except Exception as e:
+            app.logger.error(f"Error fetching transcript for {video_id} (attempt {attempt+1}): {e}")
             if attempt == retries:
                 raise
             time.sleep(0.5 * (attempt + 1))
     return None
 
-# -----------------------------
+# --------------------------------------------------
 # Cache Key Generation
-# -----------------------------
+# --------------------------------------------------
 def generate_cache_key(video_id: str, languages: tuple, preserve_format: bool, return_full: bool):
     return hashkey(video_id, languages, preserve_format, return_full)
 
-# -----------------------------
+# --------------------------------------------------
 # Transcript Processing
-# -----------------------------
+# --------------------------------------------------
 def process_transcript(transcript_data: list, return_full: bool) -> dict:
     if return_full:
         return {
@@ -173,9 +171,9 @@ def process_transcript(transcript_data: list, return_full: bool) -> dict:
         }
     return {'text': ' '.join(entry['text'] for entry in transcript_data)}
 
-# -----------------------------
-# Main Endpoint
-# -----------------------------
+# --------------------------------------------------
+# Main Endpoint: /transcript
+# --------------------------------------------------
 @app.route('/transcript', methods=['GET'])
 @limiter.limit("100/hour")
 def get_transcript_endpoint():
@@ -199,11 +197,11 @@ def get_transcript_endpoint():
         language_priority = list(dict.fromkeys(user_languages + FALLBACK_LANGUAGES))
 
         cache_key = generate_cache_key(video_id, tuple(language_priority), preserve_format, return_full)
-        if cached_data := transcript_cache.get(cache_key):
+        if (cached_data := transcript_cache.get(cache_key)) is not None:
             app.logger.info(f"Cache hit for {video_id}")
             return jsonify(cached_data), 200
 
-        # Reduced timeout from 12 to 5 seconds
+        start_time = time.time()
         try:
             future = executor.submit(
                 fetch_transcript_with_retry,
@@ -211,16 +209,17 @@ def get_transcript_endpoint():
                 languages=language_priority,
                 preserve_format=preserve_format
             )
-            transcript_data = future.result(timeout=5)
+            transcript_data = future.result(timeout=15)  # Increased timeout to 15 seconds
         except TranscriptsDisabled:
             return jsonify({'error': 'Subtitles disabled for this video'}), 404
         except NoTranscriptFound:
             return jsonify({'error': 'No transcript available in requested languages'}), 404
         except TimeoutError:
-            app.logger.error(f"Timeout fetching transcript for {video_id}")
+            duration = time.time() - start_time
+            app.logger.error(f"Timeout fetching transcript for {video_id} after {duration:.2f} seconds")
             return jsonify({'error': 'Transcript service timeout'}), 504
         except Exception as e:
-            app.logger.error(f"Proxy error: {str(e)}")
+            app.logger.error(f"Proxy error for video {video_id}: {e}")
             return jsonify({'error': 'Transcript service unavailable'}), 503
 
         processed_data = process_transcript(transcript_data, return_full)
@@ -235,18 +234,57 @@ def get_transcript_endpoint():
         return jsonify(response_data), 200
 
     except Exception as e:
-        app.logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+        app.logger.error(f"Unexpected error: {e}", exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
 
-# -----------------------------
-# Other Endpoints (if any)
-# -----------------------------
-# (For example, /available_transcripts, /health, etc.)
+# --------------------------------------------------
+# Additional Endpoint: /proxy_stats
+# --------------------------------------------------
+@app.route('/proxy_stats', methods=['GET'])
+def get_proxy_stats():
+    url = "https://dashboard.smartproxy.com/subscription-api/v1/api/public/statistics/traffic"
+    payload = {
+        "proxyType": "residential_proxies",
+        "startDate": "2024-09-01 00:00:00",
+        "endDate": "2024-10-01 00:00:00",
+        "groupBy": "target",
+        "limit": 500,
+        "page": 1,
+        "sortBy": "grouping_key",
+        "sortOrder": "asc"
+    }
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "Authorization": f"Token {SMARTPROXY_API_TOKEN}"
+    }
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        return jsonify(data), 200
+    except Exception as e:
+        app.logger.error(f"Error fetching proxy stats: {e}")
+        return jsonify({'error': 'Could not retrieve proxy stats'}), 503
 
-# -----------------------------
-# Execution
-# -----------------------------
+# --------------------------------------------------
+# Application Execution
+# --------------------------------------------------
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5010))
     app.run(host='0.0.0.0', port=port, threaded=True)
 
+# --------------------------------------------------
+# Example: Testing Smartproxy Stats Separately (for debug purposes)
+# --------------------------------------------------
+if __name__ == '__main__' and False:
+    import json
+    url = "https://dashboard.smartproxy.com/subscription-api/v1/api/public/statistics/traffic"
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "Authorization": f"Token {SMARTPROXY_API_TOKEN}"
+    }
+    response = requests.post(url, json=payload, headers=headers)
+    response.raise_for_status()
+    print(json.dumps(response.json(), indent=2))
