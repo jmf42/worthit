@@ -19,6 +19,9 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import requests
 
+
+
+
 # --------------------------------------------------
 # Hard-coded Smartproxy & API configuration
 # --------------------------------------------------
@@ -34,6 +37,16 @@ SMARTPROXY_API_TOKEN = "0eafbfc36f0e67f185c82ea4409d986a50a180d85e15bc4c84869f79
 PROXIES = {
     "https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:{SMARTPROXY_PORT}"
 }
+
+
+# Create a persistent session for Smartproxy requests.
+session = requests.Session()
+session.headers.update({
+    "accept": "application/json",
+    "content-type": "application/json",
+    "Authorization": f"Token {SMARTPROXY_API_TOKEN}"
+})
+
 
 # --------------------------------------------------
 # Flask App Initialization
@@ -253,19 +266,15 @@ def get_proxy_stats():
         "sortBy": "grouping_key",
         "sortOrder": "asc"
     }
-    headers = {
-        "accept": "application/json",
-        "content-type": "application/json",
-        "Authorization": f"Token {SMARTPROXY_API_TOKEN}"
-    }
     try:
-        response = requests.post(url, json=payload, headers=headers)
+        response = session.post(url, json=payload, timeout=10)
         response.raise_for_status()
         data = response.json()
         return jsonify(data), 200
     except Exception as e:
         app.logger.error(f"Error fetching proxy stats: {e}")
         return jsonify({'error': 'Could not retrieve proxy stats'}), 503
+
 
 # --------------------------------------------------
 # Application Execution
