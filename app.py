@@ -38,6 +38,16 @@ PROXIES = {
     "https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:{SMARTPROXY_PORT}"
 }
 
+# Define alternative proxy configurations for rotation
+PROXY_CONFIGS = [
+    {
+        "https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:10000"
+    },
+    {
+        "https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:10001"
+    }
+]
+
 
 # Create a persistent session for Smartproxy requests.
 session = requests.Session()
@@ -126,34 +136,29 @@ def extract_video_id(input_str: str) -> str:
     raise ValueError("Invalid YouTube URL or video ID")
 
 # --------------------------------------------------
-# Async Transcript Fetching with Retry and Fallback
+# Enhanced Async Transcript Fetching with Retry and Fallback
 # --------------------------------------------------
 def fetch_transcript_with_retry(video_id: str, languages: list, preserve_format: bool, retries=2):
     for attempt in range(retries + 1):
+        proxy_config = PROXY_CONFIGS[attempt % len(PROXY_CONFIGS)]
         try:
-            # On first attempt, try fetching directly (to save proxy usage)
-            if attempt == 0:
-                return YouTubeTranscriptApi.get_transcript(
-                    video_id,
-                    languages=languages,
-                    preserve_formatting=preserve_format
-                )
-            # Fallback: use Smartproxy
-            return YouTubeTranscriptApi.get_transcript(
+            # Always use proxy from the first attempt
+            transcript = YouTubeTranscriptApi.get_transcript(
                 video_id,
-                languages=languages,
-                proxies=PROXIES,
+                languages=languages if attempt == 0 else ['*'],
+                proxies=proxy_config,
                 preserve_formatting=preserve_format
             )
-        except NoTranscriptFound:
-            # On second attempt, try using any available language
-            if attempt == 1:
-                return YouTubeTranscriptApi.get_transcript(
-                    video_id,
-                    languages=['*'],
-                    proxies=PROXIES,
-                    preserve_formatting=preserve_format
-                )
+            app.logger.info(f"Successfully fetched transcript for {video_id} on attempt {attempt+1} with language: {transcript[0].get('language', 'unknown')}")
+            return transcript
+        except TranscriptsDisabled as e:
+            app.logger.error(f"Transcripts disabled for video {video_id}: {e}")
+            if attempt == retries:
+                raise
+        except NoTranscriptFound as e:
+            app.logger.error(f"No transcript found for video {video_id} in languages {languages if attempt == 0 else ['*']}: {e}")
+            if attempt == retries:
+                raise
         except Exception as e:
             app.logger.error(f"Error fetching transcript for {video_id} (attempt {attempt+1}): {e}")
             if attempt == retries:
