@@ -18,7 +18,9 @@ from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import requests
-
+import shutil
+# Record when the app started, so we can report uptime
+app_start_time = time.time()
 
 
 
@@ -411,6 +413,95 @@ def proxy_youtube_metadata():
     except Exception as e:
         app.logger.error(f"YouTube metadata error: {e}")
         return jsonify({'error':'YouTube metadata service unavailable'}), 503
+
+# --------------------------------------------------
+# Health Check Endpoint
+# --------------------------------------------------
+@app.route('/health', methods=['GET'])
+def health_check():
+    # 1) ENV VARS
+    env = {
+        'OPENAI_KEY':     bool(OPENAI_API_KEY),
+        'YOUTUBE_KEY':    bool(YOUTUBE_DATA_API_KEY),
+        'SMARTPROXY_TOKEN': bool(SMARTPROXY_API_TOKEN)
+    }
+    missing = [k for k,v in env.items() if not v]
+    if missing:
+        return jsonify({
+            'status': 'fail',
+            'reason': f'Missing API keys: {", ".join(missing)}',
+            'checks': {'env': env}
+        }), 500
+
+    # 2) EXTERNAL CONNECTIVITY
+    external = {}
+    try:
+        r = session.get('https://api.openai.com/v1/models', timeout=5)
+        external['openai_api'] = (r.status_code == 200)
+    except:
+        external['openai_api'] = False
+
+    try:
+        r = session.get(
+            'https://www.googleapis.com/youtube/v3/videos',
+            params={'id':'dQw4w9WgXcQ','part':'id','key':YOUTUBE_DATA_API_KEY},
+            timeout=5
+        )
+        external['youtube_api'] = (r.status_code == 200)
+    except:
+        external['youtube_api'] = False
+
+    try:
+        payload = {
+            "proxyType":"residential_proxies",
+            "startDate":"2025-04-01 00:00:00",
+            "endDate":"2025-04-02 00:00:00",
+            "limit":1
+        }
+        r = session.post(
+            'https://dashboard.smartproxy.com/subscription-api/v1/api/public/statistics/traffic',
+            json=payload, timeout=5
+        )
+        external['smartproxy_api'] = (r.status_code == 200)
+    except:
+        external['smartproxy_api'] = False
+
+    # 3) DISK USAGE
+    total, used, free = shutil.disk_usage('/')
+    disk_ok = (free/total) > 0.1   # at least 10% free
+    disk = {
+        'free_ratio': round(free/total, 2),
+        'disk_ok': disk_ok
+    }
+
+    # 4) LOAD AVERAGE
+    try:
+        load1, _, _ = os.getloadavg()
+        load_ok = load1 < ((os.cpu_count() or 1)*2)
+        load = {'load1': round(load1,2), 'load_ok': load_ok}
+    except:
+        load = {'error': 'getloadavg unavailable'}
+
+    # 5) AGGREGATE
+    all_ok = (
+        all(env.values()) and
+        all(external.values()) and
+        disk_ok and
+        load.get('load_ok', True)
+    )
+    status = 'ok' if all_ok else 'fail'
+    return jsonify({
+        'status': status,
+        'checks': {
+            'env':      env,
+            'external': external,
+            'disk':     disk,
+            'load':     load
+        },
+        'uptime_seconds': round(time.time() - app_start_time, 2)
+    }), (200 if all_ok else 500)
+        
+        
 # --------------------------------------------------
 # Application Execution
 # --------------------------------------------------
