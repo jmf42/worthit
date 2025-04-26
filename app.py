@@ -32,6 +32,8 @@ SMARTPROXY_HOST = "gate.smartproxy.com"
 # Use port 10000 for rotating proxies (10001 is for sticky sessions)
 SMARTPROXY_PORT = "10000"
 SMARTPROXY_API_TOKEN = os.getenv("SMARTPROXY_API_TOKEN")
+OPENAI_API_KEY        = os.getenv("OPENAI_API_KEY")
+YOUTUBE_DATA_API_KEY  = os.getenv("YOUTUBE_API_KEY")
 
 # Define PROXIES for Smartproxy usage
 PROXIES = {
@@ -280,7 +282,60 @@ def get_proxy_stats():
         app.logger.error(f"Error fetching proxy stats: {e}")
         return jsonify({'error': 'Could not retrieve proxy stats'}), 503
 
+@app.route('/openai/chat', methods=['POST'])
+def openai_chat():
+    if not OPENAI_API_KEY:
+        return jsonify({'error': 'OpenAI API key not configured'}), 500
+    payload = request.get_json()
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type":  "application/json"
+    }
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        return (resp.content, resp.status_code, resp.headers.items())
+    except Exception as e:
+        app.logger.error(f"Error calling OpenAI: {e}")
+        return jsonify({'error': 'OpenAI service unavailable'}), 503
 
+@app.route('/youtube/comments', methods=['GET'])
+def proxy_youtube_comments():
+    video_id = request.args.get('videoId')
+    if not video_id:
+        return jsonify({'error': 'Missing videoId parameter'}), 400
+    if not YOUTUBE_DATA_API_KEY:
+        return jsonify({'error': 'YouTube API key not configured'}), 500
+
+    params = {
+        'part':       'snippet',
+        'videoId':    video_id,
+        'maxResults': 30,
+        'order':      'relevance',
+        'key':        YOUTUBE_DATA_API_KEY
+    }
+    try:
+        yt_resp = session.get(
+            "https://www.googleapis.com/youtube/v3/commentThreads",
+            params=params,
+            timeout=10
+        )
+        yt_resp.raise_for_status()
+        data = yt_resp.json()
+        comments = [
+            item['snippet']['topLevelComment']['snippet']['textOriginal']
+            for item in data.get('items', [])
+        ]
+        return jsonify({'comments': comments}), 200
+    except Exception as e:
+        app.logger.error(f"Error fetching comments: {e}")
+        return jsonify({'error': 'YouTube comments service unavailable'}), 503
+        
+        
 # --------------------------------------------------
 # Application Execution
 # --------------------------------------------------
