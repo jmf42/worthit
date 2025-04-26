@@ -293,7 +293,7 @@ def openai_chat():
     }
     try:
         resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
+            "https://api.openai.com/v1/responses",
             headers=headers,
             json=payload,
             timeout=30
