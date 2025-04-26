@@ -337,18 +337,20 @@ def proxy_youtube_comments():
         
         
         
+# --------------------------------------------------
+# /youtube/metadata Endpoint
+# --------------------------------------------------
 @app.route('/youtube/metadata', methods=['GET'])
 def proxy_youtube_metadata():
     video_id = request.args.get('videoId')
     if not video_id:
-        return jsonify({'error': 'Missing videoId parameter'}), 400
+        return jsonify({'error':'Missing videoId parameter'}), 400
     if not YOUTUBE_DATA_API_KEY:
-        return jsonify({'error': 'YouTube API key not configured'}), 500
+        return jsonify({'error':'YouTube API key not configured'}), 500
 
     params = {
-        'part':    'snippet,contentDetails,statistics',
-        'id':      video_id,
-        'key':     YOUTUBE_DATA_API_KEY
+        'part':'snippet,contentDetails,statistics',
+        'id':video_id,'key':YOUTUBE_DATA_API_KEY
     }
     try:
         resp = session.get(
@@ -357,12 +359,24 @@ def proxy_youtube_metadata():
             timeout=10
         )
         resp.raise_for_status()
-        # Stream the raw YouTube response back to the client
-        return (resp.content, resp.status_code, resp.headers.items())
+
+        # Build a Flask response without forwarding encoding headers
+        excluded_headers = {
+            'content-encoding', 'transfer-encoding', 'connection',
+            'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+            'te', 'trailers', 'upgrade'
+        }
+        flask_resp = make_response(resp.content, resp.status_code)
+        for name, value in resp.headers.items():
+            if name.lower() not in excluded_headers:
+                flask_resp.headers[name] = value
+        flask_resp.headers['Content-Type'] = 'application/json'
+        return flask_resp
+
     except Exception as e:
         app.logger.error(f"Error fetching YouTube metadata: {e}")
-        return jsonify({'error': 'YouTube metadata service unavailable'}), 503
-        
+        return jsonify({'error':'YouTube metadata service unavailable'}), 503
+
         
 # --------------------------------------------------
 # Application Execution
