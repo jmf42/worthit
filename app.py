@@ -26,12 +26,12 @@ import requests
 # Hard-coded Smartproxy & API configuration
 # --------------------------------------------------
 # (Replace these values with your actual keys)
-SMARTPROXY_USER = "spylrn4hi2"
-SMARTPROXY_PASS = "f~6vgqT7bgqcVxYO73"
+SMARTPROXY_USER = os.getenv("SMARTPROXY_USER")
+SMARTPROXY_PASS = os.getenv("SMARTPROXY_PASS")
 SMARTPROXY_HOST = "gate.smartproxy.com"
 # Use port 10000 for rotating proxies (10001 is for sticky sessions)
 SMARTPROXY_PORT = "10000"
-SMARTPROXY_API_TOKEN = "0eafbfc36f0e67f185c82ea4409d986a50a180d85e15bc4c84869f791ae43501f088d2647e31bcb7e6bd9b240ae3c3d34d069bb928403c32f0e0ccaa60452fa056216979c7a591ea062710276ae661ca2a646d3a8a0d"
+SMARTPROXY_API_TOKEN = os.getenv("SMARTPROXY_API_TOKEN")
 
 # Define PROXIES for Smartproxy usage
 PROXIES = {
