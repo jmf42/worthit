@@ -5,7 +5,7 @@ import time
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
     TranscriptsDisabled,
@@ -51,13 +51,15 @@ PROXY_CONFIGS = [
 ]
 
 
-# Create a persistent session for Smartproxy requests.
+# Create session and route through Smartproxy by default
 session = requests.Session()
 session.headers.update({
     "accept": "application/json",
     "content-type": "application/json",
     "Authorization": f"Token {SMARTPROXY_API_TOKEN}"
 })
+session.proxies.update(PROXIES)
+
 
 
 # --------------------------------------------------
@@ -282,15 +284,18 @@ def get_proxy_stats():
         app.logger.error(f"Error fetching proxy stats: {e}")
         return jsonify({'error': 'Could not retrieve proxy stats'}), 503
 
-@app.route('/openai/chat', methods=['POST'])
-def openai_chat():
+# ——— Create (generate) a new response ———
+@app.route('/openai/responses', methods=['POST'])
+def create_response():
     if not OPENAI_API_KEY:
         return jsonify({'error': 'OpenAI API key not configured'}), 500
+
     payload = request.get_json()
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type":  "application/json"
+        "Content-Type": "application/json"
     }
+
     try:
         resp = requests.post(
             "https://api.openai.com/v1/responses",
@@ -298,86 +303,114 @@ def openai_chat():
             json=payload,
             timeout=30
         )
-        return (resp.content, resp.status_code, resp.headers.items())
+        resp.raise_for_status()
+        return jsonify(resp.json()), resp.status_code
+
+    except requests.HTTPError as http_err:
+        app.logger.error(f"OpenAI HTTP error: {http_err} – {resp.text}")
+        return jsonify({'error': 'OpenAI API error', 'details': resp.text}), resp.status_code
+
     except Exception as e:
-        app.logger.error(f"Error calling OpenAI: {e}")
+        app.logger.error(f"Error calling OpenAI Responses API: {e}")
         return jsonify({'error': 'OpenAI service unavailable'}), 503
 
+
+# ——— Retrieve an existing response by ID ———
+@app.route('/openai/responses/<response_id>', methods=['GET'])
+def get_response(response_id):
+    if not OPENAI_API_KEY:
+        return jsonify({'error': 'OpenAI API key not configured'}), 500
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}"
+    }
+
+    try:
+        resp = requests.get(
+            f"https://api.openai.com/v1/responses/{response_id}",
+            headers=headers,
+            timeout=10
+        )
+        resp.raise_for_status()
+        return jsonify(resp.json()), resp.status_code
+
+    except requests.HTTPError as http_err:
+        app.logger.error(f"OpenAI GET response error: {http_err} – {resp.text}")
+        return jsonify({'error': 'OpenAI API error', 'details': resp.text}), resp.status_code
+
+    except Exception as e:
+        app.logger.error(f"Error fetching OpenAI response: {e}")
+        return jsonify({'error': 'OpenAI service unavailable'}), 503
+
+# --------------------------------------------------
+# /youtube/comments endpoint
+# --------------------------------------------------
 @app.route('/youtube/comments', methods=['GET'])
 def proxy_youtube_comments():
-    video_id = request.args.get('videoId')
-    if not video_id:
-        return jsonify({'error': 'Missing videoId parameter'}), 400
+    vid = request.args.get('videoId')
+    if not vid:
+        return jsonify({'error':'Missing videoId parameter'}), 400
     if not YOUTUBE_DATA_API_KEY:
-        return jsonify({'error': 'YouTube API key not configured'}), 500
+        return jsonify({'error':'YouTube API key not configured'}), 500
 
     params = {
-        'part':       'snippet',
-        'videoId':    video_id,
-        'maxResults': 30,
-        'order':      'relevance',
-        'key':        YOUTUBE_DATA_API_KEY
+        'part':'snippet','videoId':vid,
+        'maxResults':30,'order':'relevance','key':YOUTUBE_DATA_API_KEY
     }
     try:
-        yt_resp = session.get(
+        r = session.get(
             "https://www.googleapis.com/youtube/v3/commentThreads",
             params=params,
             timeout=10
         )
-        yt_resp.raise_for_status()
-        data = yt_resp.json()
-        comments = [
-            item['snippet']['topLevelComment']['snippet']['textOriginal']
-            for item in data.get('items', [])
-        ]
-        return jsonify({'comments': comments}), 200
+        r.raise_for_status()
+        items = r.json().get('items',[])
+        comments = [i['snippet']['topLevelComment']['snippet']['textOriginal']
+                    for i in items if 'snippet' in i]
+        return jsonify({'comments':comments}), 200
     except Exception as e:
-        app.logger.error(f"Error fetching comments: {e}")
-        return jsonify({'error': 'YouTube comments service unavailable'}), 503
-        
-        
-        
+        app.logger.error(f"Comments fetch error: {e}")
+        return jsonify({'error':'YouTube comments service unavailable'}), 503
+
 # --------------------------------------------------
-# /youtube/metadata Endpoint
+# /youtube/metadata endpoint
 # --------------------------------------------------
 @app.route('/youtube/metadata', methods=['GET'])
 def proxy_youtube_metadata():
-    video_id = request.args.get('videoId')
-    if not video_id:
+    vid = request.args.get('videoId')
+    if not vid:
         return jsonify({'error':'Missing videoId parameter'}), 400
     if not YOUTUBE_DATA_API_KEY:
         return jsonify({'error':'YouTube API key not configured'}), 500
 
     params = {
         'part':'snippet,contentDetails,statistics',
-        'id':video_id,'key':YOUTUBE_DATA_API_KEY
+        'id':vid,'key':YOUTUBE_DATA_API_KEY
     }
     try:
-        resp = session.get(
+        r = session.get(
             "https://www.googleapis.com/youtube/v3/videos",
             params=params,
             timeout=10
         )
-        resp.raise_for_status()
+        r.raise_for_status()
 
-        # Build a Flask response without forwarding encoding headers
-        excluded_headers = {
-            'content-encoding', 'transfer-encoding', 'connection',
-            'keep-alive', 'proxy-authenticate', 'proxy-authorization',
-            'te', 'trailers', 'upgrade'
+        # Strip encoding headers so iOS doesn't double-decode
+        excluded = {
+            'content-encoding','transfer-encoding','connection',
+            'keep-alive','proxy-authenticate','proxy-authorization',
+            'te','trailers','upgrade'
         }
-        flask_resp = make_response(resp.content, resp.status_code)
-        for name, value in resp.headers.items():
-            if name.lower() not in excluded_headers:
-                flask_resp.headers[name] = value
+        flask_resp = make_response(r.content, r.status_code)
+        for h,v in r.headers.items():
+            if h.lower() not in excluded:
+                flask_resp.headers[h] = v
         flask_resp.headers['Content-Type'] = 'application/json'
         return flask_resp
 
     except Exception as e:
-        app.logger.error(f"Error fetching YouTube metadata: {e}")
+        app.logger.error(f"YouTube metadata error: {e}")
         return jsonify({'error':'YouTube metadata service unavailable'}), 503
-
-        
 # --------------------------------------------------
 # Application Execution
 # --------------------------------------------------
@@ -385,17 +418,3 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5010))
     app.run(host='0.0.0.0', port=port, threaded=True)
 
-# --------------------------------------------------
-# Example: Testing Smartproxy Stats Separately (for debug purposes)
-# --------------------------------------------------
-if __name__ == '__main__' and False:
-    import json
-    url = "https://dashboard.smartproxy.com/subscription-api/v1/api/public/statistics/traffic"
-    headers = {
-        "accept": "application/json",
-        "content-type": "application/json",
-        "Authorization": f"Token {SMARTPROXY_API_TOKEN}"
-    }
-    response = requests.post(url, json=payload, headers=headers)
-    response.raise_for_status()
-    print(json.dumps(response.json(), indent=2))
