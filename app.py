@@ -336,6 +336,34 @@ def proxy_youtube_comments():
         return jsonify({'error': 'YouTube comments service unavailable'}), 503
         
         
+        
+@app.route('/youtube/metadata', methods=['GET'])
+def proxy_youtube_metadata():
+    video_id = request.args.get('videoId')
+    if not video_id:
+        return jsonify({'error': 'Missing videoId parameter'}), 400
+    if not YOUTUBE_DATA_API_KEY:
+        return jsonify({'error': 'YouTube API key not configured'}), 500
+
+    params = {
+        'part':    'snippet,contentDetails,statistics',
+        'id':      video_id,
+        'key':     YOUTUBE_DATA_API_KEY
+    }
+    try:
+        resp = session.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params=params,
+            timeout=10
+        )
+        resp.raise_for_status()
+        # Stream the raw YouTube response back to the client
+        return (resp.content, resp.status_code, resp.headers.items())
+    except Exception as e:
+        app.logger.error(f"Error fetching YouTube metadata: {e}")
+        return jsonify({'error': 'YouTube metadata service unavailable'}), 503
+        
+        
 # --------------------------------------------------
 # Application Execution
 # --------------------------------------------------
