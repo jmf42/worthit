@@ -434,20 +434,6 @@ def analyze():
     scores = analyzer.polarity_scores(text)
     return jsonify(scores), 200
 
-# Initialize Vader sentiment analyzer
-analyzer = SentimentIntensityAnalyzer()
-
-
-# Vader Sentiment Analysis Endpoint
-@app.route('/analyze', methods=['POST'])
-def analyze():
-    data = request.json
-    text = data.get('text', '')
-    if not text:
-        return jsonify({'error': 'Text is required'}), 400
-    scores = analyzer.polarity_scores(text)
-    return jsonify(scores), 200
-
 
 
 # --------------------------------------------------
