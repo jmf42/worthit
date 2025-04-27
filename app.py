@@ -17,6 +17,7 @@ from logging.handlers import RotatingFileHandler
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import requests
 import shutil
 # Record when the app started, so we can report uptime
@@ -501,7 +502,26 @@ def health_check():
         'uptime_seconds': round(time.time() - app_start_time, 2)
     }), (200 if all_ok else 500)
         
-        
+# --------------------------------------------------
+# Vader Sentiment Analysis Endpoint
+# --------------------------------------------------
+
+# Initialize Vader sentiment analyzer
+analyzer = SentimentIntensityAnalyzer()
+
+
+# Vader Sentiment Analysis Endpoint
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    data = request.json
+    text = data.get('text', '')
+    if not text:
+        return jsonify({'error': 'Text is required'}), 400
+    scores = analyzer.polarity_scores(text)
+    return jsonify(scores), 200
+
+
+
 # --------------------------------------------------
 # Application Execution
 # --------------------------------------------------
