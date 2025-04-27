@@ -434,45 +434,39 @@ def analyze():
     scores = analyzer.polarity_scores(text)
     return jsonify(scores), 200
 
-
-
 # --------------------------------------------------
-# Health
+# Improved Health Check Endpoint
 # --------------------------------------------------
-
-
 @app.route('/health', methods=['GET'])
 def health_check():
-    env = {
-        'OPENAI_API_KEY': bool(OPENAI_API_KEY),
-        'YOUTUBE_API_KEY': bool(YOUTUBE_DATA_API_KEY),
-        'SMARTPROXY_API_TOKEN': bool(SMARTPROXY_API_TOKEN)
+    checks = {}
+
+    # 1) ENVIRONMENT VARIABLES
+    checks['env'] = {
+        'OPENAI_KEY': bool(OPENAI_API_KEY),
+        'YOUTUBE_KEY': bool(YOUTUBE_DATA_API_KEY),
+        'SMARTPROXY_TOKEN': bool(SMARTPROXY_API_TOKEN)
     }
-    missing = [k for k, v in env.items() if not v]
 
-    external = {}
+    # 2) EXTERNAL CONNECTIVITY
+    checks['external'] = {}
 
-    # Safe OpenAI check
     try:
         r = session.get('https://api.openai.com/v1/models', timeout=5)
-        external['openai_api'] = (r.status_code == 200)
-    except Exception as e:
-        app.logger.error(f"OpenAI health check failed: {e}")
-        external['openai_api'] = False
+        checks['external']['openai_api'] = (r.status_code == 200)
+    except Exception:
+        checks['external']['openai_api'] = False
 
-    # Safe YouTube API check
     try:
         r = session.get(
             'https://www.googleapis.com/youtube/v3/videos',
             params={'id': 'dQw4w9WgXcQ', 'part': 'id', 'key': YOUTUBE_DATA_API_KEY},
             timeout=5
         )
-        external['youtube_api'] = (r.status_code == 200)
-    except Exception as e:
-        app.logger.error(f"YouTube health check failed: {e}")
-        external['youtube_api'] = False
+        checks['external']['youtube_api'] = (r.status_code == 200)
+    except Exception:
+        checks['external']['youtube_api'] = False
 
-    # Safe Smartproxy API check
     try:
         payload = {
             "proxyType": "residential_proxies",
@@ -482,53 +476,45 @@ def health_check():
         }
         r = session.post(
             'https://dashboard.smartproxy.com/subscription-api/v1/api/public/statistics/traffic',
-            json=payload,
-            timeout=5
+            json=payload, timeout=5
         )
-        external['smartproxy_api'] = (r.status_code == 200)
-    except Exception as e:
-        app.logger.error(f"Smartproxy health check failed: {e}")
-        external['smartproxy_api'] = False
+        checks['external']['smartproxy_api'] = (r.status_code == 200)
+    except Exception:
+        checks['external']['smartproxy_api'] = False
 
-    # Disk usage
-    try:
-        total, used, free = shutil.disk_usage('/')
-        free_ratio = free / total
-        disk = {'free_ratio': round(free_ratio, 2), 'disk_ok': free_ratio > 0.1}
-    except Exception as e:
-        app.logger.error(f"Disk usage check failed: {e}")
-        disk = {'disk_ok': False}
+    # 3) DISK USAGE
+    total, used, free = shutil.disk_usage('/')
+    checks['disk'] = {
+        'free_ratio': round(free / total, 2),
+        'disk_ok': (free / total) > 0.1
+    }
 
-    # Load average
+    # 4) SYSTEM LOAD
     try:
         load1, _, _ = os.getloadavg()
-        load = {'load1': round(load1, 2), 'load_ok': load1 < ((os.cpu_count() or 1) * 2)}
-    except Exception as e:
-        app.logger.error(f"Load average check failed: {e}")
-        load = {'load_ok': True}
+        checks['load'] = {
+            'load1': round(load1, 2),
+            'load_ok': load1 < ((os.cpu_count() or 1) * 2)
+        }
+    except Exception:
+        checks['load'] = {'error': 'getloadavg unavailable'}
 
-    # Final health aggregation
-    all_ok = (
-        not missing and
-        all(external.values()) and
-        disk.get('disk_ok', True) and
-        load.get('load_ok', True)
-    )
+    # 5) AGGREGATE OVERALL STATUS
+    env_ok = all(checks['env'].values())
+    external_ok = all(v for v in checks['external'].values() if isinstance(v, bool))
+    disk_ok = checks['disk'].get('disk_ok', False)
+    load_ok = checks['load'].get('load_ok', True)
 
-    status = 'ok' if all_ok else 'fail'
+    if env_ok and disk_ok and load_ok:
+        overall_status = 'ok' if external_ok else 'degraded'
+    else:
+        overall_status = 'fail'
 
     return jsonify({
-        'status': status,
-        'checks': {
-            'env': env,
-            'external': external,
-            'disk': disk,
-            'load': load
-        },
+        'status': overall_status,
+        'checks': checks,
         'uptime_seconds': round(time.time() - app_start_time, 2)
-    }), (200 if all_ok else 500)
-        
-
+    }), 200
 
 
 # --------------------------------------------------
