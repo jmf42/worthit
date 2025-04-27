@@ -20,41 +20,32 @@ from flask_limiter.util import get_remote_address
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import requests
 import shutil
-# Record when the app started, so we can report uptime
+
+# ─────────────────────────────────────────────
+# App startup timestamp
+# ─────────────────────────────────────────────
 app_start_time = time.time()
 
-
-
 # --------------------------------------------------
-# Hard-coded Smartproxy & API configuration
+# Smartproxy & API configuration  (env-driven)
 # --------------------------------------------------
-# (Replace these values with your actual keys)
-SMARTPROXY_USER = os.getenv("SMARTPROXY_USER")
-SMARTPROXY_PASS = os.getenv("SMARTPROXY_PASS")
-SMARTPROXY_HOST = "gate.smartproxy.com"
-# Use port 10000 for rotating proxies (10001 is for sticky sessions)
-SMARTPROXY_PORT = "10000"
+SMARTPROXY_USER  = os.getenv("SMARTPROXY_USER")
+SMARTPROXY_PASS  = os.getenv("SMARTPROXY_PASS")
+SMARTPROXY_HOST  = "gate.smartproxy.com"
+SMARTPROXY_PORT  = "10000"
 SMARTPROXY_API_TOKEN = os.getenv("SMARTPROXY_API_TOKEN")
-OPENAI_API_KEY        = os.getenv("OPENAI_API_KEY")
-YOUTUBE_DATA_API_KEY  = os.getenv("YOUTUBE_API_KEY")
 
-# Define PROXIES for Smartproxy usage
+OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY")
+YOUTUBE_DATA_API_KEY = os.getenv("YOUTUBE_API_KEY")
+
 PROXIES = {
     "https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:{SMARTPROXY_PORT}"
 }
-
-# Define alternative proxy configurations for rotation
 PROXY_CONFIGS = [
-    {
-        "https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:10000"
-    },
-    {
-        "https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:10001"
-    }
+    {"https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:10000"},
+    {"https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:10001"}
 ]
 
-
-# Create session and route through Smartproxy by default
 session = requests.Session()
 session.headers.update({
     "accept": "application/json",
@@ -63,299 +54,189 @@ session.headers.update({
 })
 session.proxies.update(PROXIES)
 
-
-
 # --------------------------------------------------
-# Flask App Initialization
+# Flask init
 # --------------------------------------------------
 app = Flask(__name__)
 CORS(app)
 
-# --------------------------------------------------
-# Rate Limiting
-# --------------------------------------------------
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,
-    default_limits=["200 per hour", "50 per minute"]
-)
+# ── Minimal inbound access log ────────────────────
+@app.before_request
+def _log_request():
+    app.logger.info(
+        "[INBOUND] %s %s ← %s",
+        request.method,
+        request.path,
+        request.headers.get("X-Real-IP", request.remote_addr)
+    )
 
 # --------------------------------------------------
-# Cache & Thread Configuration
+# Rate limiting
 # --------------------------------------------------
-# Cache transcripts for 10 minutes (600 seconds) for freshness
-transcript_cache = TTLCache(maxsize=500, ttl=600)
-# Use up to min(32, CPU_count * 4) workers.
-executor = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 4))
+limiter = Limiter(app=app,
+                  key_func=get_remote_address,
+                  default_limits=["200 per hour", "50 per minute"])
 
 # --------------------------------------------------
-# Language Configuration
+# Worker pool / cache
+# --------------------------------------------------
+transcript_cache = TTLCache(maxsize=500, ttl=600)           # 10 min
+executor         = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 4))
+
+# --------------------------------------------------
+# Allowed fallback languages
 # --------------------------------------------------
 FALLBACK_LANGUAGES = [
-    'en', 'es', 'fr', 'de', 'pt', 'ru', 'hi',
-    'ar', 'zh-Hans', 'ja', 'ko', 'it', 'nl', 'tr', 'vi',
-    'id', 'pl', 'th', 'sv', 'fi', 'he', 'uk', 'da', 'no'
+    'en','es','fr','de','pt','ru','hi','ar','zh-Hans','ja',
+    'ko','it','nl','tr','vi','id','pl','th','sv','fi','he','uk','da','no'
 ]
 
 # --------------------------------------------------
-# Logging Configuration
+# Logging setup (console + rotating file)
 # --------------------------------------------------
-if not os.path.exists('logs'):
-    os.mkdir('logs')
-
+os.makedirs("logs", exist_ok=True)
 file_handler = RotatingFileHandler(
-    'logs/youtube_transcript.log',
-    maxBytes=5_242_880,
-    backupCount=3,
-    encoding='utf-8'
+    "logs/server.log", maxBytes=5_242_880, backupCount=3, encoding="utf-8"
 )
-file_handler.setFormatter(
-    logging.Formatter('%(asctime)s %(levelname)s [%(module)s:%(lineno)d]: %(message)s')
-)
+file_handler.setFormatter(logging.Formatter(
+    "%(asctime)s %(levelname)s [%(module)s:%(lineno)d]: %(message)s"
+))
 file_handler.setLevel(logging.INFO)
 
 app.logger.addHandler(file_handler)
 app.logger.setLevel(logging.INFO)
 
 # --------------------------------------------------
-# Video ID Validation
+# Helpers: validate / extract YT id
 # --------------------------------------------------
 VIDEO_ID_REGEX = re.compile(r'^[\w-]{11}$')
 
 def validate_video_id(video_id: str) -> bool:
     return bool(VIDEO_ID_REGEX.fullmatch(video_id))
 
-# --------------------------------------------------
-# Enhanced Video ID Extraction
-# --------------------------------------------------
 @lru_cache(maxsize=1024)
 def extract_video_id(input_str: str) -> str:
     patterns = [
-        r'(?:v=|\/)([\w-]{11})',  # Standard URLs
-        r'^([\w-]{11})$'          # Direct ID
+        r'(?:v=|\/)([\w-]{11})',
+        r'^([\w-]{11})$'
     ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, input_str)
-        if match and validate_video_id(match.group(1)):
-            return match.group(1)
-    
+    for p in patterns:
+        m = re.search(p, input_str)
+        if m and validate_video_id(m.group(1)):
+            return m.group(1)
     raise ValueError("Invalid YouTube URL or video ID")
 
 # --------------------------------------------------
-# Enhanced Async Transcript Fetching with Retry and Fallback
+# Transcript fetch helper (with retry + logging)
 # --------------------------------------------------
-def fetch_transcript_with_retry(video_id: str, languages: list, preserve_format: bool, retries=2):
+def fetch_transcript_with_retry(video_id: str,
+                                languages: list,
+                                preserve_format: bool,
+                                retries: int = 2):
+    app.logger.info("[OUT] YouTubeTranscriptAPI → %s", video_id)
     for attempt in range(retries + 1):
-        proxy_config = PROXY_CONFIGS[attempt % len(PROXY_CONFIGS)]
+        proxy_cfg = PROXY_CONFIGS[attempt % len(PROXY_CONFIGS)]
         try:
-            # Always use proxy from the first attempt
-            transcript = YouTubeTranscriptApi.get_transcript(
+            tr = YouTubeTranscriptApi.get_transcript(
                 video_id,
                 languages=languages if attempt == 0 else ['*'],
-                proxies=proxy_config,
+                proxies=proxy_cfg,
                 preserve_formatting=preserve_format
             )
-            app.logger.info(f"Successfully fetched transcript for {video_id} on attempt {attempt+1} with language: {transcript[0].get('language', 'unknown')}")
-            return transcript
-        except TranscriptsDisabled as e:
-            app.logger.error(f"Transcripts disabled for video {video_id}: {e}")
-            if attempt == retries:
-                raise
-        except NoTranscriptFound as e:
-            app.logger.error(f"No transcript found for video {video_id} in languages {languages if attempt == 0 else ['*']}: {e}")
-            if attempt == retries:
-                raise
+            app.logger.info("[OUT] YouTubeTranscriptAPI ← ok (attempt %s)", attempt + 1)
+            return tr
         except Exception as e:
-            app.logger.error(f"Error fetching transcript for {video_id} (attempt {attempt+1}): {e}")
             if attempt == retries:
+                app.logger.error("[OUT] YouTubeTranscriptAPI FAILED: %s", e)
                 raise
             time.sleep(0.5 * (attempt + 1))
-    return None
 
 # --------------------------------------------------
-# Cache Key Generation
+# Small utils
 # --------------------------------------------------
-def generate_cache_key(video_id: str, languages: tuple, preserve_format: bool, return_full: bool):
+def generate_cache_key(video_id, languages, preserve_format, return_full):
     return hashkey(video_id, languages, preserve_format, return_full)
 
-# --------------------------------------------------
-# Transcript Processing
-# --------------------------------------------------
-def process_transcript(transcript_data: list, return_full: bool) -> dict:
-    if return_full:
-        return {
-            'segments': [
-                {
-                    'text': entry['text'],
-                    'start': round(entry['start'], 2),
-                    'duration': round(entry['duration'], 2)
-                }
-                for entry in transcript_data
-            ]
-        }
-    return {'text': ' '.join(entry['text'] for entry in transcript_data)}
+def process_transcript(tr, full):
+    if full:
+        return {'segments': [
+            {'text': x['text'],
+             'start': round(x['start'], 2),
+             'duration': round(x['duration'], 2)} for x in tr]}
+    return {'text': ' '.join(x['text'] for x in tr)}
 
-# --------------------------------------------------
-# Main Endpoint: /transcript
-# --------------------------------------------------
-@app.route('/transcript', methods=['GET'])
+# ─────────────────────────────────────────────
+# Endpoints
+# ─────────────────────────────────────────────
+@app.route("/transcript", methods=["GET"])
 @limiter.limit("100/hour")
 def get_transcript_endpoint():
     try:
-        raw_video_id = request.args.get('videoId', '').strip()
-        if not raw_video_id:
+        raw_id = request.args.get("videoId", "").strip()
+        if not raw_id:
             return jsonify({'error': 'Missing videoId parameter'}), 400
-
         try:
-            video_id = extract_video_id(raw_video_id)
+            vid = extract_video_id(raw_id)
         except ValueError:
             return jsonify({'error': 'Invalid YouTube URL or video ID'}), 400
 
-        user_languages = [
-            lang.strip().lower()
-            for lang in request.args.get('language', 'en').split(',')
-            if lang.strip()
-        ]
-        preserve_format = request.args.get('preserveFormatting', 'false').lower() == 'true'
-        return_full = request.args.get('format', 'text').lower() == 'full'
-        language_priority = list(dict.fromkeys(user_languages + FALLBACK_LANGUAGES))
+        langs_in  = [l.strip().lower() for l in request.args.get('language', 'en').split(',') if l.strip()]
+        preserve  = request.args.get('preserveFormatting', 'false').lower() == 'true'
+        returnfull = request.args.get('format', 'text').lower() == 'full'
+        lang_priority = list(dict.fromkeys(langs_in + FALLBACK_LANGUAGES))
 
-        cache_key = generate_cache_key(video_id, tuple(language_priority), preserve_format, return_full)
-        if (cached_data := transcript_cache.get(cache_key)) is not None:
-            app.logger.info(f"Cache hit for {video_id}")
-            return jsonify(cached_data), 200
+        key = generate_cache_key(vid, tuple(lang_priority), preserve, returnfull)
+        if (cached := transcript_cache.get(key)):
+            app.logger.info("Cache hit for %s", vid)
+            return jsonify(cached), 200
 
-        start_time = time.time()
-        try:
-            future = executor.submit(
-                fetch_transcript_with_retry,
-                video_id=video_id,
-                languages=language_priority,
-                preserve_format=preserve_format
-            )
-            transcript_data = future.result(timeout=15)  # Increased timeout to 15 seconds
-        except TranscriptsDisabled:
-            return jsonify({'error': 'Subtitles disabled for this video'}), 404
-        except NoTranscriptFound:
-            return jsonify({'error': 'No transcript available in requested languages'}), 404
-        except TimeoutError:
-            duration = time.time() - start_time
-            app.logger.error(f"Timeout fetching transcript for {video_id} after {duration:.2f} seconds")
-            return jsonify({'error': 'Transcript service timeout'}), 504
-        except Exception as e:
-            app.logger.error(f"Proxy error for video {video_id}: {e}")
-            return jsonify({'error': 'Transcript service unavailable'}), 503
+        fut = executor.submit(fetch_transcript_with_retry, vid, lang_priority, preserve)
+        tr  = fut.result(timeout=15)
 
-        processed_data = process_transcript(transcript_data, return_full)
-        response_data = {
+        response = {
             'status': 'success',
-            'video_id': video_id,
-            'detected_language': transcript_data[0].get('language', 'unknown'),
-            **processed_data
+            'video_id': vid,
+            'detected_language': tr[0].get('language', 'unknown'),
+            **process_transcript(tr, returnfull)
         }
-        
-        transcript_cache[cache_key] = response_data
-        return jsonify(response_data), 200
-
+        transcript_cache[key] = response
+        return jsonify(response), 200
     except Exception as e:
-        app.logger.error(f"Unexpected error: {e}", exc_info=True)
+        app.logger.error("Transcript endpoint error: %s", e, exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
 
-# --------------------------------------------------
-# Additional Endpoint: /proxy_stats
-# --------------------------------------------------
-@app.route('/proxy_stats', methods=['GET'])
+# ---------------- PROXY STATS ---------------------
+@app.route("/proxy_stats", methods=["GET"])
 def get_proxy_stats():
-    url = "https://dashboard.smartproxy.com/subscription-api/v1/api/public/statistics/traffic"
     payload = {
         "proxyType": "residential_proxies",
-        "startDate": "2024-09-01 00:00:00",
-        "endDate": "2024-10-01 00:00:00",
-        "groupBy": "target",
-        "limit": 500,
-        "page": 1,
-        "sortBy": "grouping_key",
-        "sortOrder": "asc"
+        "startDate": "2025-01-01 00:00:00",
+        "endDate": "2025-01-02 00:00:00",
+        "limit": 1
     }
+    app.logger.info("[OUT] Smartproxy stats")
     try:
-        response = session.post(url, json=payload, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        return jsonify(data), 200
+        r = session.post(
+            "https://dashboard.smartproxy.com/subscription-api/v1/api/public/statistics/traffic",
+            json=payload, timeout=10
+        )
+        app.logger.info("[OUT] Smartproxy ← %s (stats)", r.status_code)
+        r.raise_for_status()
+        return jsonify(r.json()), 200
     except Exception as e:
-        app.logger.error(f"Error fetching proxy stats: {e}")
+        app.logger.error("Proxy stats error: %s", e)
         return jsonify({'error': 'Could not retrieve proxy stats'}), 503
 
-# ——— Create (generate) a new response ———
-@app.route('/openai/responses', methods=['POST'])
-def create_response():
-    if not OPENAI_API_KEY:
-        return jsonify({'error': 'OpenAI API key not configured'}), 500
-
-    payload = request.get_json()
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    try:
-        resp = requests.post(
-            "https://api.openai.com/v1/responses",
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
-        resp.raise_for_status()
-        return jsonify(resp.json()), resp.status_code
-
-    except requests.HTTPError as http_err:
-        app.logger.error(f"OpenAI HTTP error: {http_err} – {resp.text}")
-        return jsonify({'error': 'OpenAI API error', 'details': resp.text}), resp.status_code
-
-    except Exception as e:
-        app.logger.error(f"Error calling OpenAI Responses API: {e}")
-        return jsonify({'error': 'OpenAI service unavailable'}), 503
-
-
-# ——— Retrieve an existing response by ID ———
-@app.route('/openai/responses/<response_id>', methods=['GET'])
-def get_response(response_id):
-    if not OPENAI_API_KEY:
-        return jsonify({'error': 'OpenAI API key not configured'}), 500
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}"
-    }
-
-    try:
-        resp = requests.get(
-            f"https://api.openai.com/v1/responses/{response_id}",
-            headers=headers,
-            timeout=10
-        )
-        resp.raise_for_status()
-        return jsonify(resp.json()), resp.status_code
-
-    except requests.HTTPError as http_err:
-        app.logger.error(f"OpenAI GET response error: {http_err} – {resp.text}")
-        return jsonify({'error': 'OpenAI API error', 'details': resp.text}), resp.status_code
-
-    except Exception as e:
-        app.logger.error(f"Error fetching OpenAI response: {e}")
-        return jsonify({'error': 'OpenAI service unavailable'}), 503
-
-# --------------------------------------------------
-# /youtube/comments endpoint
-# --------------------------------------------------
-@app.route('/youtube/comments', methods=['GET'])
+# ---------------- YouTube COMMENTS ----------------
+@app.route("/youtube/comments", methods=["GET"])
 def proxy_youtube_comments():
-    vid = request.args.get('videoId')
+    vid = request.args.get("videoId")
     if not vid:
-        return jsonify({'error':'Missing videoId parameter'}), 400
+        return jsonify({'error': 'Missing videoId parameter'}), 400
     if not YOUTUBE_DATA_API_KEY:
-        return jsonify({'error':'YouTube API key not configured'}), 500
+        return jsonify({'error': 'YouTube API key not configured'}), 500
 
+    app.logger.info("[OUT] YouTube (comments) → %s", vid)
     params = {
         'part':'snippet','videoId':vid,
         'maxResults':30,'order':'relevance','key':YOUTUBE_DATA_API_KEY
@@ -363,164 +244,167 @@ def proxy_youtube_comments():
     try:
         r = session.get(
             "https://www.googleapis.com/youtube/v3/commentThreads",
-            params=params,
-            timeout=10
+            params=params, timeout=10
         )
+        app.logger.info("[OUT] YouTube ← %s (comments)", r.status_code)
         r.raise_for_status()
         items = r.json().get('items',[])
         comments = [i['snippet']['topLevelComment']['snippet']['textOriginal']
                     for i in items if 'snippet' in i]
         return jsonify({'comments':comments}), 200
     except Exception as e:
-        app.logger.error(f"Comments fetch error: {e}")
+        app.logger.error("Comments fetch error: %s", e)
         return jsonify({'error':'YouTube comments service unavailable'}), 503
 
-# --------------------------------------------------
-# /youtube/metadata endpoint
-# --------------------------------------------------
-@app.route('/youtube/metadata', methods=['GET'])
+# ---------------- YouTube METADATA ----------------
+@app.route("/youtube/metadata", methods=["GET"])
 def proxy_youtube_metadata():
-    vid = request.args.get('videoId')
+    vid = request.args.get("videoId")
     if not vid:
         return jsonify({'error':'Missing videoId parameter'}), 400
     if not YOUTUBE_DATA_API_KEY:
         return jsonify({'error':'YouTube API key not configured'}), 500
 
+    app.logger.info("[OUT] YouTube (metadata) → %s", vid)
     params = {
         'part':'snippet,contentDetails,statistics',
         'id':vid,'key':YOUTUBE_DATA_API_KEY
     }
     try:
-        r = session.get(
-            "https://www.googleapis.com/youtube/v3/videos",
-            params=params,
-            timeout=10
-        )
+        r = session.get("https://www.googleapis.com/youtube/v3/videos",
+                        params=params, timeout=10)
+        app.logger.info("[OUT] YouTube ← %s (metadata)", r.status_code)
         r.raise_for_status()
 
-        # Strip encoding headers so iOS doesn't double-decode
-        excluded = {
-            'content-encoding','transfer-encoding','connection',
-            'keep-alive','proxy-authenticate','proxy-authorization',
-            'te','trailers','upgrade'
-        }
-        flask_resp = make_response(r.content, r.status_code)
+        excluded = {'content-encoding','transfer-encoding','connection',
+                    'keep-alive','proxy-authenticate','proxy-authorization',
+                    'te','trailers','upgrade'}
+        resp = make_response(r.content, r.status_code)
         for h,v in r.headers.items():
             if h.lower() not in excluded:
-                flask_resp.headers[h] = v
-        flask_resp.headers['Content-Type'] = 'application/json'
-        return flask_resp
-
+                resp.headers[h] = v
+        resp.headers['Content-Type'] = 'application/json'
+        return resp
     except Exception as e:
-        app.logger.error(f"YouTube metadata error: {e}")
+        app.logger.error("YouTube metadata error: %s", e)
         return jsonify({'error':'YouTube metadata service unavailable'}), 503
 
+# ---------------- OpenAI RESPONSES POST -----------
+@app.route("/openai/responses", methods=["POST"])
+def create_response():
+    if not OPENAI_API_KEY:
+        return jsonify({'error':'OpenAI API key not configured'}), 500
+    payload = request.get_json()
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}",
+               "Content-Type": "application/json"}
 
-# --------------------------------------------------
-# Vader Sentiment Analysis Endpoint
-# --------------------------------------------------
+    app.logger.info("[OUT] OpenAI createResponse")
+    try:
+        resp = requests.post("https://api.openai.com/v1/responses",
+                             headers=headers, json=payload, timeout=30)
+        app.logger.info("[OUT] OpenAI ← %s (create)", resp.status_code)
+        resp.raise_for_status()
+        return jsonify(resp.json()), resp.status_code
+    except requests.HTTPError as he:
+        app.logger.error("OpenAI HTTP error: %s – %s", he, resp.text)
+        return jsonify({'error':'OpenAI API error','details':resp.text}), resp.status_code
+    except Exception as e:
+        app.logger.error("OpenAI create error: %s", e)
+        return jsonify({'error':'OpenAI service unavailable'}), 503
 
-# Initialize Vader sentiment analyzer
+# ---------------- OpenAI RESPONSES GET -----------
+@app.route("/openai/responses/<response_id>", methods=["GET"])
+def get_response(response_id):
+    if not OPENAI_API_KEY:
+        return jsonify({'error':'OpenAI API key not configured'}), 500
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+
+    app.logger.info("[OUT] OpenAI getResponse %s", response_id)
+    try:
+        resp = requests.get(f"https://api.openai.com/v1/responses/{response_id}",
+                            headers=headers, timeout=10)
+        app.logger.info("[OUT] OpenAI ← %s (get)", resp.status_code)
+        resp.raise_for_status()
+        return jsonify(resp.json()), resp.status_code
+    except requests.HTTPError as he:
+        app.logger.error("OpenAI GET error: %s – %s", he, resp.text)
+        return jsonify({'error':'OpenAI API error','details':resp.text}), resp.status_code
+    except Exception as e:
+        app.logger.error("OpenAI get error: %s", e)
+        return jsonify({'error':'OpenAI service unavailable'}), 503
+
+# ---------------- VADER SENTIMENT -----------------
 analyzer = SentimentIntensityAnalyzer()
 
-
-# Vader Sentiment Analysis Endpoint
-@app.route('/analyze', methods=['POST'])
+@app.route("/analyze", methods=["POST"])
 def analyze():
-    data = request.json
-    text = data.get('text', '')
+    data = request.json or {}
+    text = data.get("text", "")
     if not text:
-        return jsonify({'error': 'Text is required'}), 400
+        return jsonify({'error':'Text is required'}), 400
+    app.logger.info("[VADER] textlen=%d", len(text))
     scores = analyzer.polarity_scores(text)
+    app.logger.info("[VADER] scores=%s", scores)
     return jsonify(scores), 200
 
-# --------------------------------------------------
-# Improved Health Check Endpoint
-# --------------------------------------------------
-@app.route('/health', methods=['GET'])
+# ---------------- HEALTH --------------------------
+@app.route("/health", methods=["GET"])
 def health_check():
     checks = {}
-
-    # 1) ENVIRONMENT VARIABLES
+    # env
     checks['env'] = {
         'OPENAI_KEY': bool(OPENAI_API_KEY),
         'YOUTUBE_KEY': bool(YOUTUBE_DATA_API_KEY),
         'SMARTPROXY_TOKEN': bool(SMARTPROXY_API_TOKEN)
     }
-
-    # 2) EXTERNAL CONNECTIVITY
+    # external
     checks['external'] = {}
-
     try:
-        r = session.get('https://api.openai.com/v1/models', timeout=5)
-        checks['external']['openai_api'] = (r.status_code == 200)
+        r = session.get("https://api.openai.com/v1/models", timeout=5)
+        checks['external']['openai_api'] = r.status_code == 200
     except Exception:
         checks['external']['openai_api'] = False
-
     try:
-        r = session.get(
-            'https://www.googleapis.com/youtube/v3/videos',
-            params={'id': 'dQw4w9WgXcQ', 'part': 'id', 'key': YOUTUBE_DATA_API_KEY},
-            timeout=5
-        )
-        checks['external']['youtube_api'] = (r.status_code == 200)
+        r = session.get("https://www.googleapis.com/youtube/v3/videos",
+                        params={'id':'dQw4w9WgXcQ','part':'id','key':YOUTUBE_DATA_API_KEY},
+                        timeout=5)
+        checks['external']['youtube_api'] = r.status_code == 200
     except Exception:
         checks['external']['youtube_api'] = False
-
     try:
-        payload = {
-            "proxyType": "residential_proxies",
-            "startDate": "2025-04-01 00:00:00",
-            "endDate": "2025-04-02 00:00:00",
-            "limit": 1
-        }
-        r = session.post(
-            'https://dashboard.smartproxy.com/subscription-api/v1/api/public/statistics/traffic',
-            json=payload, timeout=5
-        )
-        checks['external']['smartproxy_api'] = (r.status_code == 200)
+        r = session.post("https://dashboard.smartproxy.com/subscription-api/v1/api/public/statistics/traffic",
+                         json={"proxyType":"residential_proxies","limit":1},
+                         timeout=5)
+        checks['external']['smartproxy_api'] = r.status_code == 200
     except Exception:
         checks['external']['smartproxy_api'] = False
-
-    # 3) DISK USAGE
+    # disk
     total, used, free = shutil.disk_usage('/')
-    checks['disk'] = {
-        'free_ratio': round(free / total, 2),
-        'disk_ok': (free / total) > 0.1
-    }
-
-    # 4) SYSTEM LOAD
+    checks['disk'] = {'free_ratio': round(free/total,2), 'disk_ok': (free/total) > 0.1}
+    # load
     try:
         load1, _, _ = os.getloadavg()
-        checks['load'] = {
-            'load1': round(load1, 2),
-            'load_ok': load1 < ((os.cpu_count() or 1) * 2)
-        }
+        checks['load'] = {'load1': round(load1,2), 'load_ok': load1 < ((os.cpu_count() or 1)*2)}
     except Exception:
-        checks['load'] = {'error': 'getloadavg unavailable'}
+        checks['load'] = {'load_ok': True}
 
-    # 5) AGGREGATE OVERALL STATUS
-    env_ok = all(checks['env'].values())
-    external_ok = all(v for v in checks['external'].values() if isinstance(v, bool))
-    disk_ok = checks['disk'].get('disk_ok', False)
-    load_ok = checks['load'].get('load_ok', True)
+    env_ok      = all(checks['env'].values())
+    external_ok = all(v for v in checks['external'].values() if isinstance(v,bool))
+    disk_ok     = checks['disk']['disk_ok']
+    load_ok     = checks['load']['load_ok']
 
-    if env_ok and disk_ok and load_ok:
-        overall_status = 'ok' if external_ok else 'degraded'
-    else:
-        overall_status = 'fail'
+    status = 'ok' if (env_ok and disk_ok and load_ok and external_ok) else \
+             ('degraded' if (env_ok and disk_ok and load_ok) else 'fail')
 
     return jsonify({
-        'status': overall_status,
+        'status': status,
         'checks': checks,
         'uptime_seconds': round(time.time() - app_start_time, 2)
     }), 200
 
-
 # --------------------------------------------------
-# Application Execution
+# Run
 # --------------------------------------------------
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5010))
-    app.run(host='0.0.0.0', port=port, threaded=True)
-
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5010))
+    app.run(host="0.0.0.0", port=port, threaded=True)
