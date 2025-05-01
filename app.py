@@ -46,31 +46,40 @@ PROXY_CONFIGS = [
     {"https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:10001"}
 ]
 
+# -# --------------------------------------------------
+# Invidious helper (host rotation + Retry-After)
 # --------------------------------------------------
-# Invidious helper
-# --------------------------------------------------
-INVIDIOUS_HOST = os.getenv("INVIDIOUS_HOST", "https://ytdetail.8848.wtf")
+INVIDIOUS_HOSTS = os.getenv(
+    "INVIDIOUS_HOSTS",
+    "https://ytdetail.8848.wtf,https://piped.video,https://vid.puffyan.us"
+).split(",")
 
-@lru_cache(maxsize=1024)
-def invidious_api(path: str):
-    url = f"{INVIDIOUS_HOST}{path}"
-    app.logger.info("[OUT] Invidious → GET %s", url)
-    try:
-        response = session.get(url, timeout=10)
-        response.raise_for_status()
-        app.logger.info("[OUT] Invidious ← OK")
-        return response.json()
-    except Exception as e:
-        app.logger.error("[OUT] Invidious FAILED: %s", e)
-        raise
+invidious_cursor = itertools.cycle(INVIDIOUS_HOSTS)
 
-session = requests.Session()
-session.headers.update({
-    "accept": "application/json",
-    "content-type": "application/json",
-    "Authorization": f"Token {SMARTPROXY_API_TOKEN}"
-})
-session.proxies.update(PROXIES)
+def _next_host() -> str:
+    return next(invidious_cursor).rstrip("/")
+
+def invidious_api(path: str, *, max_retries: int = 4):
+    delay = 0.5
+    for attempt in range(max_retries + 1):
+        host = _next_host() if attempt else _next_host()  # rotate after first failure
+        url  = f"{host}{path}"
+        app.logger.info("[OUT] Invidious → GET %s", url)
+        try:
+            resp = session.get(url, timeout=10)
+            if resp.status_code == 429:
+                wait = int(resp.headers.get("Retry-After", delay))
+                app.logger.warning("429 from %s – backing off %.1fs (try %d/%d)", host, wait, attempt+1, max_retries)
+                time.sleep(wait)
+                delay = min(delay * 2, 8)
+                continue
+            resp.raise_for_status()
+            app.logger.info("[OUT] Invidious ← OK (%s)", host)
+            return resp.json()
+        except Exception as e:
+            app.logger.error("[OUT] Invidious FAILED (%s): %s", host, e)
+            if attempt == max_retries:
+                raise
 
 # --------------------------------------------------
 # Flask init
