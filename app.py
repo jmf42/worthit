@@ -2,6 +2,7 @@ import os
 import re
 import logging
 import time
+import itertools
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
