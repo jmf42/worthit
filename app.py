@@ -46,6 +46,24 @@ PROXY_CONFIGS = [
     {"https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:10001"}
 ]
 
+# --------------------------------------------------
+# Invidious helper
+# --------------------------------------------------
+INVIDIOUS_HOST = os.getenv("INVIDIOUS_HOST", "https://ytdetail.8848.wtf")
+
+@lru_cache(maxsize=1024)
+def invidious_api(path: str):
+    url = f"{INVIDIOUS_HOST}{path}"
+    app.logger.info("[OUT] Invidious → GET %s", url)
+    try:
+        response = session.get(url, timeout=10)
+        response.raise_for_status()
+        app.logger.info("[OUT] Invidious ← OK")
+        return response.json()
+    except Exception as e:
+        app.logger.error("[OUT] Invidious FAILED: %s", e)
+        raise
+
 session = requests.Session()
 session.headers.update({
     "accept": "application/json",
