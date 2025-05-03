@@ -327,6 +327,14 @@ def create_response():
     if not OPENAI_API_KEY:
         return jsonify({'error':'OpenAI API key not configured'}), 500
     payload = request.get_json()
+    # Ensure request body uses the official parameters
+    if "input" in payload:
+        payload["prompt"] = payload.pop("input")
+    if "max_output_tokens" in payload:
+        payload["max_tokens"] = payload.pop("max_output_tokens")
+    # Remove unsupported fields
+    payload.pop("instructions", None)
+    payload.pop("text", None)
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}",
                "Content-Type": "application/json"}
 
