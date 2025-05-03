@@ -22,6 +22,10 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import requests
 import shutil
 
+# After `import requests`
+session = requests.Session()
+
+
 # ─────────────────────────────────────────────
 # App startup timestamp
 # ─────────────────────────────────────────────
@@ -375,9 +379,14 @@ def analyze():
     app.logger.info("[VADER] scores=%s", scores)
     return jsonify(scores), 200
 
-# ---------------- HEALTH --------------------------
+# ---------------- SIMPLE HEALTH CHECK ----------------
 @app.route("/health", methods=["GET"])
 def health_check():
+    return jsonify({'status': 'ok'}), 200
+
+# ---------------- FULL HEALTH CHECK ------------------
+@app.route("/health/deep", methods=["GET"])
+def deep_health_check():
     checks = {}
     # env
     checks['env'] = {
@@ -430,9 +439,13 @@ def health_check():
         'uptime_seconds': round(time.time() - app_start_time, 2)
     }), 200
 
+
 # --------------------------------------------------
 # Run
 # --------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5010))
     app.run(host="0.0.0.0", port=port, threaded=True)
+
+import atexit
+atexit.register(lambda: executor.shutdown(wait=False))
