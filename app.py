@@ -21,10 +21,22 @@ from flask_limiter.util import get_remote_address
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import requests
 import shutil
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import functools
 
-# After `import requests`
 session = requests.Session()
-
+# Configure default timeouts
+session.request = functools.partial(session.request, timeout=15)
+# Add retries with exponential backoff
+retries = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"]
+)
+session.mount("https://", HTTPAdapter(max_retries=retries))
+session.mount("http://", HTTPAdapter(max_retries=retries))
 
 # ─────────────────────────────────────────────
 # App startup timestamp
@@ -64,14 +76,27 @@ invidious_cursor = itertools.cycle(INVIDIOUS_HOSTS)
 def _next_host() -> str:
     return next(invidious_cursor).rstrip("/")
 
+# In invidious_api function:
 def invidious_api(path: str, *, max_retries: int = 4):
     delay = 0.5
+    # Use a fresh session for each host to avoid connection reuse problems
+    local_session = requests.Session()
+    local_session.request = functools.partial(local_session.request, timeout=15)
+    retries = Retry(
+        total=2,  # Fewer retries for this specific endpoint
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    local_session.mount("https://", HTTPAdapter(max_retries=retries))
+    
     for attempt in range(max_retries + 1):
         host = _next_host() if attempt else _next_host()  # rotate after first failure
         url  = f"{host}{path}"
         app.logger.info("[OUT] Invidious → GET %s", url)
         try:
-            resp = session.get(url, timeout=10)
+            # Use the local session with built-in retries
+            resp = local_session.get(url, timeout=10)
             if resp.status_code == 429:
                 wait = int(resp.headers.get("Retry-After", delay))
                 app.logger.warning("429 from %s – backing off %.1fs (try %d/%d)", host, wait, attempt+1, max_retries)
@@ -81,6 +106,11 @@ def invidious_api(path: str, *, max_retries: int = 4):
             resp.raise_for_status()
             app.logger.info("[OUT] Invidious ← OK (%s)", host)
             return resp.json()
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            app.logger.warning("[OUT] Invidious connection issue (%s): %s - will retry with next host", host, e)
+            time.sleep(delay)
+            delay = min(delay * 1.5, 4)
+            continue
         except Exception as e:
             app.logger.error("[OUT] Invidious FAILED (%s): %s", host, e)
             if attempt == max_retries:
@@ -302,24 +332,77 @@ def proxy_youtube_metadata():
         'part':'snippet,contentDetails,statistics',
         'id':vid,'key':YOUTUBE_DATA_API_KEY
     }
-    try:
-        r = session.get("https://www.googleapis.com/youtube/v3/videos",
-                        params=params, timeout=10)
-        app.logger.info("[OUT] YouTube ← %s (metadata)", r.status_code)
-        r.raise_for_status()
-
-        excluded = {'content-encoding','transfer-encoding','connection',
-                    'keep-alive','proxy-authenticate','proxy-authorization',
-                    'te','trailers','upgrade'}
-        resp = make_response(r.content, r.status_code)
-        for h,v in r.headers.items():
-            if h.lower() not in excluded:
-                resp.headers[h] = v
-        resp.headers['Content-Type'] = 'application/json'
-        return resp
-    except Exception as e:
-        app.logger.error("YouTube metadata error: %s", e)
-        return jsonify({'error':'YouTube metadata service unavailable'}), 503
+    
+    # Try YouTube API first with retries
+    max_attempts = 2
+    for attempt in range(max_attempts):
+        try:
+            r = session.get("https://www.googleapis.com/youtube/v3/videos",
+                            params=params, timeout=15)
+            app.logger.info("[OUT] YouTube ← %s (metadata) (attempt %d)", r.status_code, attempt+1)
+            
+            if r.status_code >= 500:  # Server error
+                if attempt < max_attempts-1:
+                    app.logger.warning("YouTube API server error %d, retrying...", r.status_code)
+                    time.sleep(1 * (attempt + 1))  # Simple backoff
+                    continue
+            
+            r.raise_for_status()
+            
+            excluded = {'content-encoding','transfer-encoding','connection',
+                        'keep-alive','proxy-authenticate','proxy-authorization',
+                        'te','trailers','upgrade'}
+            resp = make_response(r.content, r.status_code)
+            for h,v in r.headers.items():
+                if h.lower() not in excluded:
+                    resp.headers[h] = v
+            resp.headers['Content-Type'] = 'application/json'
+            return resp
+            
+        except requests.exceptions.RequestException as e:
+            if attempt < max_attempts-1:
+                app.logger.warning("YouTube API request failed, retrying... Error: %s", e)
+                time.sleep(1 * (attempt + 1))
+            else:
+                app.logger.error("YouTube metadata error after retries: %s", e)
+                
+                # If YouTube API fails, try to get basic metadata via Invidious as fallback
+                try:
+                    app.logger.info("Attempting Invidious fallback for video metadata: %s", vid)
+                    invidious_data = invidious_api(f"/api/v1/videos/{vid}")
+                    
+                    # Convert Invidious format to YouTube API format
+                    yt_format = {
+                        "items": [{
+                            "id": vid,
+                            "snippet": {
+                                "title": invidious_data.get("title", "Unknown Title"),
+                                "description": invidious_data.get("description", ""),
+                                "channelTitle": invidious_data.get("author", "Unknown Channel"),
+                                "thumbnails": {
+                                    "high": {
+                                        "url": invidious_data.get("videoThumbnails", [{}])[0].get("url", "")
+                                    }
+                                }
+                            },
+                            "contentDetails": {
+                                "duration": f"PT{invidious_data.get('lengthSeconds', 0)}S"
+                            },
+                            "statistics": {
+                                "viewCount": str(invidious_data.get("viewCount", 0)),
+                                "likeCount": str(invidious_data.get("likeCount", 0))
+                            }
+                        }]
+                    }
+                    app.logger.info("Successfully fetched metadata via Invidious fallback")
+                    return jsonify(yt_format), 200
+                    
+                except Exception as fallback_error:
+                    app.logger.error("Invidious fallback also failed: %s", fallback_error)
+                    return jsonify({'error':'YouTube metadata service unavailable', 'detail': str(e)}), 503
+        
+    # Should never reach here due to the else clause in the exception handling
+    return jsonify({'error':'YouTube metadata service error'}), 500
 
 # ---------------- OpenAI RESPONSES POST -----------
 @app.route("/openai/responses", methods=["POST"])
@@ -327,14 +410,6 @@ def create_response():
     if not OPENAI_API_KEY:
         return jsonify({'error':'OpenAI API key not configured'}), 500
     payload = request.get_json()
-    # Ensure request body uses the official parameters
-    if "input" in payload:
-        payload["prompt"] = payload.pop("input")
-    if "max_output_tokens" in payload:
-        payload["max_tokens"] = payload.pop("max_output_tokens")
-    # Remove unsupported fields
-    payload.pop("instructions", None)
-    payload.pop("text", None)
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}",
                "Content-Type": "application/json"}
 
