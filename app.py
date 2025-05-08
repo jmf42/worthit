@@ -382,70 +382,145 @@ def proxy_youtube_metadata():
         app.logger.error("Google fallback failed for %s: %s", vid, g_err)
         return jsonify({'error':'Metadata service unavailable'}), 503
 
-# ---------------- OpenAI RESPONSES POST -----------
+
+# ---------------- OpenAI RESPONSES POST (with Enhanced Logging) -----------
 @app.route("/openai/responses", methods=["POST"])
 def create_response():
     if not OPENAI_API_KEY:
-        return jsonify({'error':'OpenAI API key not configured'}), 500
-    payload = request.get_json()
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}",
-               "Content-Type": "application/json"}
+        app.logger.error("[OpenAI Proxy /responses] OPENAI_API_KEY is not configured.")
+        return jsonify({'error': 'OpenAI API key not configured'}), 500
 
-    app.logger.info("[OUT] OpenAI createResponse")
     try:
+        # Get the raw JSON payload sent by the iOS client
+        payload = request.get_json()
+        if not payload:
+            app.logger.error("[OpenAI Proxy /responses] Received empty or invalid JSON payload.")
+            return jsonify({'error': 'Invalid JSON payload'}), 400
+    except Exception as json_err:
+        app.logger.error(f"[OpenAI Proxy /responses] Failed to parse request JSON: {json_err}", exc_info=True)
+        return jsonify({'error': 'Bad request JSON'}), 400
+
+    # Prepare headers for the actual OpenAI API call
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    # Log the payload received from the client (excluding potentially large 'input')
+    logged_payload = {k: v for k, v in payload.items() if k != 'input'}
+    logged_payload['input_length'] = len(payload.get('input', ''))
+    app.logger.info(f"[OpenAI Proxy /responses] Received request payload (excluding input): {json.dumps(logged_payload)}")
+    app.logger.info(f"[OpenAI Proxy /responses] Calling OpenAI API (https://api.openai.com/v1/responses) -> Model: {payload.get('model', 'N/A')}")
+
+    resp = None # Initialize resp to None
+    try:
+        # Make the POST request directly to OpenAI's /v1/responses endpoint
         resp = requests.post("https://api.openai.com/v1/responses",
-                             headers=headers, json=payload, timeout=30)
-        app.logger.info("[OUT] OpenAI ← %s (create)", resp.status_code)
-        resp.raise_for_status()
-        return jsonify(resp.json()), resp.status_code
+                             headers=headers, json=payload, timeout=60) # Increased timeout
+
+        app.logger.info(f"[OpenAI Proxy /responses] OpenAI API Response Status Code: {resp.status_code}")
+
+        # Log response body especially if it's not 200 OK
+        if resp.status_code != 200:
+            response_text = resp.text[:1000] # Log first 1000 chars of error response
+            app.logger.error(f"[OpenAI Proxy /responses] OpenAI API returned error {resp.status_code}. Response body: {response_text}")
+
+        resp.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+
+        # If successful, return the JSON directly from OpenAI
+        response_data = resp.json()
+        app.logger.info(f"[OpenAI Proxy /responses] Successfully received response from OpenAI.")
+
+        # --- Log Response Structure ---
+        # Log keys to understand the structure we get back from /v1/responses
+        if isinstance(response_data, dict):
+             app.logger.debug(f"[OpenAI Proxy /responses] Response Keys: {list(response_data.keys())}")
+             # Try to log the specific fields your Swift code expects based on OpenAIProxyResponseDTO
+             resp_id = response_data.get('id', 'N/A')
+             output_text = response_data.get('output_text') # Check if SDK adds this convenience
+             output_field = response_data.get('output')
+             choices_field = response_data.get('choices')
+             text_field = response_data.get('text')
+             app.logger.debug(f"[OpenAI Proxy /responses] Response fields check: id='{resp_id}', output_text exists? {output_text is not None}, output exists? {output_field is not None}, choices exists? {choices_field is not None}, text exists? {text_field is not None}")
+             # Log preview of nested content if possible
+             content_preview = "N/A"
+             if output_text:
+                 content_preview = output_text[:200] + "..."
+             elif isinstance(output_field, list) and output_field:
+                 content_preview = str(output_field[0])[:200] + "..."
+             elif isinstance(choices_field, list) and choices_field:
+                 content_preview = str(choices_field[0])[:200] + "..."
+             elif text_field:
+                 content_preview = text_field[:200] + "..."
+             app.logger.debug(f"[OpenAI Proxy /responses] Content Preview: {content_preview}")
+
+        elif isinstance(response_data, list):
+             app.logger.debug(f"[OpenAI Proxy /responses] Response is a List (length {len(response_data)}). First item preview: {str(response_data[0])[:200] if response_data else 'Empty List'}")
+        else:
+             app.logger.debug(f"[OpenAI Proxy /responses] Response type: {type(response_data)}. Preview: {str(response_data)[:200]}")
+        # --- End Log Response Structure ---
+
+
+        return jsonify(response_data), resp.status_code
+
     except requests.HTTPError as he:
-        app.logger.error("OpenAI HTTP error: %s – %s", he, resp.text)
-        return jsonify({'error':'OpenAI API error','details':resp.text}), resp.status_code
+        # Log the specific HTTP error from OpenAI
+        err_msg = f"OpenAI API HTTP error: Status Code {he.response.status_code if he.response else 'N/A'}"
+        err_details = resp.text[:1000] if resp else "No response object"
+        app.logger.error(f"[OpenAI Proxy /responses] {err_msg}. Details: {err_details}", exc_info=True)
+        clean_details = err_details
+        try: # Try to parse standard OpenAI error format
+            error_json = json.loads(err_details)
+            if isinstance(error_json, dict) and "error" in error_json and isinstance(error_json["error"], dict) and "message" in error_json["error"]:
+                 clean_details = error_json["error"]["message"]
+        except: pass # Keep original details if parsing fails
+        return jsonify({'error': 'OpenAI API error', 'details': clean_details}), he.response.status_code if he.response is not None else 500
+    except requests.exceptions.RequestException as req_err:
+        # Handle network errors (timeout, connection error, etc.)
+        app.logger.error(f"[OpenAI Proxy /responses] Network error connecting to OpenAI: {req_err}", exc_info=True)
+        return jsonify({'error': 'Network error communicating with OpenAI service'}), 503
     except Exception as e:
-        app.logger.error("OpenAI create error: %s", e)
-        return jsonify({'error':'OpenAI service unavailable'}), 503
+        # Catch any other unexpected errors
+        app.logger.error(f"[OpenAI Proxy /responses] Unexpected error: {e}", exc_info=True)
+        return jsonify({'error': 'Internal server error during OpenAI request processing'}), 500
 
-# ---------------- OpenAI RESPONSES GET -----------
-@app.route("/openai/responses/<response_id>", methods=["GET"])
-def get_response(response_id):
-    if not OPENAI_API_KEY:
-        return jsonify({'error':'OpenAI API key not configured'}), 500
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
 
-    app.logger.info("[OUT] OpenAI getResponse %s", response_id)
-    try:
-        resp = requests.get(f"https://api.openai.com/v1/responses/{response_id}",
-                            headers=headers, timeout=10)
-        app.logger.info("[OUT] OpenAI ← %s (get)", resp.status_code)
-        resp.raise_for_status()
-        return jsonify(resp.json()), resp.status_code
-    except requests.HTTPError as he:
-        app.logger.error("OpenAI GET error: %s – %s", he, resp.text)
-        return jsonify({'error':'OpenAI API error','details':resp.text}), resp.status_code
-    except Exception as e:
-        app.logger.error("OpenAI get error: %s", e)
-        return jsonify({'error':'OpenAI service unavailable'}), 503
-
+    
 # ---------------- VADER SENTIMENT -----------------
 analyzer = SentimentIntensityAnalyzer()
-
-@app.route("/analyze", methods=["POST"])
-def analyze():
-    data = request.json or {}
-    text = data.get("text", "")
-    if not text:
-        return jsonify({'error':'Text is required'}), 400
-    app.logger.info("[VADER] textlen=%d", len(text))
-    scores = analyzer.polarity_scores(text)
-    app.logger.info("[VADER] scores=%s", scores)
-    return jsonify(scores), 200
 
 @app.route("/analyze/batch", methods=["POST"])
 @limiter.limit("50 per minute")
 def analyze_batch():
-    texts = request.get_json(force=True) or []
-    results = [analyzer.polarity_scores(t)["compound"] for t in texts]
-    return jsonify(results), 200
+    app.logger.info("[VADER_BATCH] Received request.")
+    try:
+        texts = request.get_json(force=True) or []
+        if not texts:
+            app.logger.info("[VADER_BATCH] Empty text list received.")
+            return jsonify([]), 200
+
+        num_texts = len(texts)
+        first_text_preview = texts[0][:50] if texts else "N/A"
+        app.logger.info(f"[VADER_BATCH] Processing {num_texts} texts. First text preview: '{first_text_preview}...'")
+
+        results = []
+        start_time = time.time()
+        for i, t in enumerate(texts):
+            score = analyzer.polarity_scores(t)["compound"]
+            results.append(score)
+            # Optional: Log progress if needed, e.g., every 10 texts
+            # if (i + 1) % 10 == 0:
+            #    app.logger.debug(f"[VADER_BATCH] Processed {i+1}/{num_texts}...")
+
+        end_time = time.time()
+        duration = end_time - start_time
+        app.logger.info(f"[VADER_BATCH] Successfully processed {num_texts} texts in {duration:.3f} seconds.")
+        return jsonify(results), 200
+
+    except Exception as e:
+        app.logger.error(f"[VADER_BATCH] Error during batch processing: {e}", exc_info=True)
+        return jsonify({"error": "Failed to process batch sentiment"}), 500
+    
 
 # ---------------- SIMPLE HEALTH CHECK ----------------
 @app.route("/health", methods=["GET"])
@@ -517,3 +592,4 @@ if __name__ == "__main__":
 
 import atexit
 atexit.register(lambda: executor.shutdown(wait=False))
+
