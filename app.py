@@ -25,6 +25,7 @@ import requests
 import shutil
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from yt_dlp import YoutubeDL  
 import functools
 
 session = requests.Session()
@@ -68,10 +69,19 @@ PROXY_CONFIGS = [
 # -# --------------------------------------------------
 # Invidious helper (host rotation + Retry-After)
 # --------------------------------------------------
-INVIDIOUS_HOSTS = os.getenv(
-    "INVIDIOUS_HOSTS",
-    "https://ytdetail.8848.wtf,https://piped.video,https://vid.puffyan.us"
-).split(",")
+INVIDIOUS_HOSTS = [
+     "https://ytdetail.8848.wtf",
+     "https://piped.video",
+     "https://vid.puffyan.us"
+ ]
+
+PIPED_HOSTS = [
+"https://pipedapi.kavin.rocks",
+"https://piped.video",
+"https://piped.video.lukes.host"
+]
+_pipe_bad_until: dict[str, float] = {}
+
 
 invidious_cursor = itertools.cycle(INVIDIOUS_HOSTS)
 
@@ -114,6 +124,47 @@ def invidious_api(path: str, *, max_retries: int = 4, proxy_round_robin: bool = 
             app.logger.error("[OUT] Invidious FAILED (%s): %s", host, e)
             if attempt == max_retries:
                 raise
+
+# ─────────────────────────────────────────────
+# Piped helper (round-robin, host cooldown)
+# ─────────────────────────────────────────────
+def piped_api(path: str, *, max_retries: int = 4) -> dict:
+    delay = 0.4
+    hosts = deque(PIPED_HOSTS)
+    for attempt in range(max_retries):
+        host = hosts[0]; hosts.rotate(-1)
+        if _pipe_bad_until.get(host, 0) > time.time():
+            continue
+        url = f"{host}{path}"
+        app.logger.info(f"[OUT {attempt+1}/{max_retries}] Piped → {url}")
+        try:
+            resp = session.get(url, timeout=3.1)
+            resp.raise_for_status()
+            data = resp.json()
+            app.logger.info(f"[OUT] Piped ← OK ({host})")
+            return data
+        except requests.Timeout:
+            app.logger.warning(f"[OUT] Piped timeout ({host})")
+            _pipe_bad_until[host] = time.time() + 180
+            time.sleep(delay); delay = min(delay*1.4, 3)
+        except Exception as e:
+            app.logger.error(f"[OUT] Piped FAILED ({host}): {e}")
+            _pipe_bad_until[host] = time.time() + 900
+    raise RuntimeError("All Piped hosts failed")
+
+
+# ─────────────────────────────────────────────
+# Innertube via yt-dlp (quota-free, robust)
+# ─────────────────────────────────────────────
+_YDL_OPTS = {
+    "quiet"        : True,
+    "skip_download": True,
+    # Android-TV key: stable & seldom rate-limited
+    "innertube_key": "AIzaSyA-DkzGi-tv79Q"
+}
+def fetch_innertube(video_id: str) -> dict:
+    with YoutubeDL(_YDL_OPTS) as ydl:
+        return ydl.extract_info(video_id, download=False, process=False)
 
 # --------------------------------------------------
 # Flask init
@@ -188,28 +239,6 @@ def extract_video_id(input_str: str) -> str:
     raise ValueError("Invalid YouTube URL or video ID")
 
 
-# ADD just under the helper
-def _yt_style_from_invidious(vid: str, raw: dict) -> dict:
-    """Convert Invidious /videos response to the Google Data API shape the app already parses."""
-    thumbs = raw.get("videoThumbnails", [])
-    high   = next((t for t in thumbs if t.get("quality") == "high"), thumbs[0] if thumbs else {})
-    return {
-        "items": [{
-            "id": vid,
-            "snippet": {
-                "title":         raw.get("title", ""),
-                "description":   raw.get("description", ""),
-                "channelTitle":  raw.get("author", ""),
-                "thumbnails":    { "high": { "url": high.get("url", "") } }
-            },
-            "contentDetails": { "duration": f"PT{raw.get('lengthSeconds', 0)}S" },
-            "statistics": {
-                "viewCount": str(raw.get("viewCount", 0)),
-                "likeCount": str(raw.get("likeCount", 0)),
-                "commentCount": str(raw.get("commentCount", 0)),
-            }
-        }]
-    }
 
 
 # --------------------------------------------------
@@ -323,66 +352,97 @@ def get_proxy_stats():
 # ---------------- YouTube COMMENTS ----------------
 
 @app.route("/youtube/comments", methods=["GET"])
-def proxy_youtube_comments():
-    vid = request.args.get("videoId")
-    if not vid: return jsonify({'error': 'Missing videoId parameter'}), 400
+def get_comments():
+    video_id = request.args.get("videoId")
+    if not video_id or not validate_video_id(video_id):
+        return jsonify({"error": "invalid_video_id"}), 400
 
-    # 1️⃣  Invidious first
     try:
-        data = invidious_api(f"/api/v1/comments/{vid}?sort_by=top")
-        comments = [c.get("content", "") for c in data.get("comments", [])]
-        if comments:
-            app.logger.info("Comments fetched via Invidious (%d) for %s", len(comments), vid)
-            return jsonify({'comments': comments}), 200
-        app.logger.warning("Invidious returned 0 comments for %s", vid)
-    except Exception as inv_err:
-        app.logger.error("Invidious comments failed for %s: %s", vid, inv_err)
+        if video_id in comment_cache:
+            comments = comment_cache[video_id]
+            app.logger.info(f"[CACHE] Comments hit for {video_id}")
+        else:
+            # 1️⃣ Piped
+            try:
+                pj = piped_api(f"/api/v1/comments/{video_id}?cursor=0")
+                comments = [c["comment"] for c in pj.get("comments", [])]
+            except Exception:
+                comments = []
+            # 2️⃣ yt-dlp
+            if not comments:
+                try:
+                    yt = fetch_innertube(video_id)
+                    comments = [c["content"] for c in yt.get("comments", [])][:40]
+                except Exception:
+                    comments = []
+            # 3️⃣ Invidious
+            if not comments:
+                try:
+                    iv = invidious_api(f"/api/v1/comments/{video_id}?sort_by=top")
+                    comments = [c["content"] for c in iv.get("comments", [])]
+                except Exception:
+                    comments = []
 
-    # 2️⃣  Google fallback (quota heavy)
-    if not YOUTUBE_DATA_API_KEY:
-        return jsonify({'error': 'Comments unavailable (Invidious down & Google key missing)'}), 503
-    params = { 'part':'snippet', 'videoId':vid, 'maxResults':30,
-               'order':'relevance', 'key':YOUTUBE_DATA_API_KEY }
-    try:
-        r = session.get("https://www.googleapis.com/youtube/v3/commentThreads", params=params, timeout=10)
-        r.raise_for_status()
-        items = r.json().get('items', [])
-        comments = [i['snippet']['topLevelComment']['snippet']['textOriginal']
-                    for i in items if 'snippet' in i]
-        return jsonify({'comments': comments}), 200
-    except Exception as g_err:
-        app.logger.error("Google comments fallback failed for %s: %s", vid, g_err)
-        return jsonify({'error':'Comments service unavailable'}), 503
+            comment_cache[video_id] = comments
+
+        return jsonify({
+            "comments": comments,
+            "warning": "" if comments else "comments_unavailable"
+        }), 200
+    except Exception as e:
+        app.logger.error(f"Comments fetch failed for {video_id}: {e}")
+        return jsonify({"comments": [], "warning": "comments_unavailable"}), 200
+    
+
 # ---------------- YouTube METADATA ----------------
 
-@app.route("/youtube/metadata", methods=["GET"])
-def proxy_youtube_metadata():
-    vid = request.args.get("videoId")
-    if not vid:                     return jsonify({'error':'Missing videoId parameter'}), 400
+# ─────────────────────────────────────────────
+# Video metadata   (title, uploader, duration, counts)
+# ─────────────────────────────────────────────
+@app.route("/youtube/metadata")
+def get_metadata():
+    video_id = request.args.get("videoId")
+    if not video_id or not validate_video_id(video_id):
+        return jsonify({"error": "invalid_video_id"}), 400
 
-    # 1️⃣  Invidious → primary path
+    # 1️⃣ oEmbed
     try:
-        raw = invidious_api(f"/api/v1/videos/{vid}")
-        app.logger.info("Metadata fetched via Invidious for %s", vid)
-        return jsonify(_yt_style_from_invidious(vid, raw)), 200
-    except Exception as inv_err:
-        app.logger.error("Invidious metadata failed for %s: %s", vid, inv_err)
+        meta = session.get("https://www.youtube.com/oembed",
+                           params={"url": f"https://youtu.be/{video_id}", "format": "json"},
+                           timeout=2).json()
+        result = {
+            "title"       : meta["title"],
+            "channelTitle": meta["author_name"],
+            "thumbnail"   : meta["thumbnail_url"],
+            "duration"    : None,
+            "viewCount"   : None,
+            "likeCount"   : None
+        }
+    except Exception:
+        # 2️⃣ yt-dlp Innertube
+        try:
+            yt = fetch_innertube(video_id)
+            result = {
+                "title"       : yt.get("title"),
+                "channelTitle": yt.get("uploader"),
+                "thumbnail"   : yt.get("thumbnail"),
+                "duration"    : yt.get("duration"),
+                "viewCount"   : yt.get("view_count"),
+                "likeCount"   : yt.get("like_count")
+            }
+        except Exception:
+            # 3️⃣ Piped
+            pipe = piped_api(f"/api/v1/streams/{video_id}")
+            result = {
+                "title"       : pipe.get("title"),
+                "channelTitle": pipe.get("uploader"),
+                "thumbnail"   : pipe.get("thumbnailUrl"),
+                "duration"    : pipe.get("duration"),
+                "viewCount"   : pipe.get("views"),
+                "likeCount"   : pipe.get("likes")
+            }
 
-    # 2️⃣  Google → only if key present *and* Invidious failed
-    if not YOUTUBE_DATA_API_KEY:
-        return jsonify({'error': 'Metadata unavailable (Invidious down & Google key missing)'}), 503
-
-    params = { 'part':'snippet,contentDetails,statistics', 'id':vid, 'key':YOUTUBE_DATA_API_KEY }
-    try:
-        r = session.get("https://www.googleapis.com/youtube/v3/videos", params=params, timeout=10)
-        r.raise_for_status()
-        resp = make_response(r.content, r.status_code)
-        resp.headers['Content-Type'] = 'application/json'
-        return resp
-    except Exception as g_err:
-        app.logger.error("Google fallback failed for %s: %s", vid, g_err)
-        return jsonify({'error':'Metadata service unavailable'}), 503
-
+    return jsonify(result), 200
 
 # ---------------- OpenAI RESPONSES POST (with Enhanced Logging) -----------
 @app.route("/openai/responses", methods=["POST"])
