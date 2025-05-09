@@ -222,17 +222,40 @@ def get_transcript_endpoint():
         return jsonify({"status":"unavailable"}), 204
     except Exception as e:
         app.logger.error("Transcript err: %s", e)
-        return jsonify({"error":"server"}), 500
+        app.logger.error("Transcript error: %s", e)
+        return jsonify({"status":"error"}), 500
 
-    data = (
-        {"segments":[{"text":x["text"],
-                      "start":round(x["start"],2),
-                      "duration":round(x["duration"],2)} for x in tr]}
-        if full else
-        {"text":" ".join(x["text"] for x in tr)}
-    )
-    transcript_cache[key] = data
-    return jsonify(data), 200
+    # ------------------------------------------------------------------
+    # Build a consistent response shape for both "full" and "text" modes
+    # ------------------------------------------------------------------
+    if isinstance(tr, list) and tr:
+        detected_lang = tr[0].get("language") or None
+    else:
+        detected_lang = None
+
+    if full:
+        resp = {
+            "status": "ok",
+            "detected_language": detected_lang,
+            "video_id": vid,
+            "segments": tr                       # raw timed segments
+        }
+    else:
+        # Flatten the segments into plain text for lighter clients
+        joined = " ".join(seg.get("text", "") for seg in tr) if isinstance(tr, list) else ""
+        resp = {
+            "status": "ok",
+            "detected_language": detected_lang,
+            "video_id": vid,
+            "text": joined,
+            "segments": tr                       # keep segments, some iOS clients rely on them
+        }
+
+    # Cache & return
+    transcript_cache[key] = resp
+    return jsonify(resp), 200
+
+
 
 # ---------------- PROXY STATS ---------------------
 @app.route("/proxy_stats", methods=["GET"])
