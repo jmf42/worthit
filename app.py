@@ -5,6 +5,7 @@ import logging
 import time
 import itertools
 from functools import lru_cache
+from collections import deque 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 from flask import Flask, request, jsonify, make_response
@@ -193,6 +194,7 @@ limiter = Limiter(app=app,
 # Worker pool / cache
 # --------------------------------------------------
 transcript_cache = TTLCache(maxsize=500, ttl=600)           # 10 min
+comment_cache    = TTLCache(maxsize=300, ttl=300)           # 5 min         # 10 min
 executor         = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 4))
 
 # --------------------------------------------------
@@ -442,7 +444,7 @@ def get_metadata():
                 "likeCount"   : pipe.get("likes")
             }
 
-    return jsonify(result), 200
+    return jsonify({"items": [result]}), 200
 
 # ---------------- OpenAI RESPONSES POST (with Enhanced Logging) -----------
 @app.route("/openai/responses", methods=["POST"])
