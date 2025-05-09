@@ -169,6 +169,9 @@ VIDEO_ID_REGEX = re.compile(r'^[\w-]{11}$')
 def validate_video_id(video_id: str) -> bool:
     return bool(VIDEO_ID_REGEX.fullmatch(video_id))
 
+# Alias for legacy calls
+valid_id = validate_video_id
+
 @lru_cache(maxsize=1024)
 def extract_video_id(input_str: str) -> str:
     patterns = [
