@@ -203,53 +203,75 @@ def _get_transcript(vid: str, langs, preserve):
 
 def _fetch_resilient(video_id: str) -> str:
     """
-    Try captions API first, fall back to yt-dlp automatic captions, then any yt-dlp caption track; log each failure.
+    Try captions API first (English only), fall back to yt-dlp automatic captions,
+    then a reduced language fallback, then any yt-dlp caption track; log each failure.
     """
-    # 1️⃣ official / community captions
+    # 1️⃣ English captions (official / community)
+    try:
+        segs = _get_transcript(video_id, ["en"], False)
+        text = " ".join(s["text"] for s in segs).strip()
+        if text:
+            return text
+        app.logger.warning("Official English transcript empty for video %s", video_id)
+    except Exception as e:
+        app.logger.warning("English transcript fetch failed for video %s: %s", video_id, e)
+
+    # 2️⃣ Most common languages fallback
+    try:
+        fallback_langs = ['es', 'de', 'fr', 'pt', 'ru', 'hi', 'ar', 'zh-Hans', 'ja', 'it']
+        segs = _get_transcript(video_id, fallback_langs, False)
+        text = " ".join(s["text"] for s in segs).strip()
+        if text:
+            return text
+        app.logger.warning("Top fallback transcript empty for video %s", video_id)
+    except Exception as e:
+        app.logger.warning("Top fallback transcript fetch failed for video %s: %s", video_id, e)
+
+    # 3️⃣ Full language fallback
     try:
         segs = _get_transcript(video_id, FALLBACK_LANGUAGES, False)
         text = " ".join(s["text"] for s in segs).strip()
         if text:
             return text
-        app.logger.warning("Official transcript empty for video %s", video_id)
-    except TranscriptsDisabled:
-        app.logger.warning("TranscriptsDisabled for video %s", video_id)
-    except NoTranscriptFound:
-        app.logger.warning("NoTranscriptFound for video %s", video_id)
-    except CouldNotRetrieveTranscript as e:
-        app.logger.warning("CouldNotRetrieveTranscript for video %s: %s", video_id, e)
+        app.logger.warning("Full fallback transcript empty for video %s", video_id)
     except Exception as e:
-        app.logger.error("Error fetching official transcript for %s: %s", video_id, e)
+        app.logger.warning("Full fallback transcript fetch failed for video %s: %s", video_id, e)
 
-    # 2️⃣ yt-dlp automatic captions
+    # 4️⃣+5️⃣ yt-dlp info (automatic captions and any captions, no proxy)
     try:
         info = yt_dlp_info(video_id)
-        caps = info.get("automatic_captions") or {}
-        first_track = next(iter(caps.values()), [])
-        if first_track:
-            url = first_track[0]["url"]
-            r = session.get(url, proxies=rnd_proxy(), timeout=6)
-            r.raise_for_status()
-            if r.text.strip():
-                return r.text
-        app.logger.warning("yt-dlp automatic_captions empty for video %s", video_id)
     except Exception as e:
-        app.logger.warning("yt-dlp automatic captions failed for video %s: %s", video_id, e)
+        info = None
+        app.logger.warning("yt-dlp info failed for video %s: %s", video_id, e)
 
-    # 3️⃣ yt-dlp any caption track (e.g. community captions)
-    try:
-        info = yt_dlp_info(video_id)
-        caps = info.get("captions") or {}
-        track = caps.get("en") or next(iter(caps.values()), [])
-        if track:
-            url = track[0]["url"]
-            r = session.get(url, proxies=rnd_proxy(), timeout=6)
-            r.raise_for_status()
-            if r.text.strip():
-                return r.text
-        app.logger.warning("yt-dlp captions track empty for video %s", video_id)
-    except Exception as e:
-        app.logger.warning("yt-dlp captions track failed for video %s: %s", video_id, e)
+    # 4️⃣ yt-dlp automatic captions (no proxy)
+    if info:
+        try:
+            caps = info.get("automatic_captions") or {}
+            first_track = next(iter(caps.values()), [])
+            if first_track:
+                url = first_track[0]["url"]
+                r = session.get(url, timeout=6)
+                r.raise_for_status()
+                if r.text.strip():
+                    return r.text
+            app.logger.warning("yt-dlp automatic_captions empty for video %s", video_id)
+        except Exception as e:
+            app.logger.warning("yt-dlp automatic captions failed for video %s: %s", video_id, e)
+
+        # 5️⃣ yt-dlp any caption track (no proxy)
+        try:
+            caps = info.get("captions") or {}
+            track = caps.get("en") or next(iter(caps.values()), [])
+            if track:
+                url = track[0]["url"]
+                r = session.get(url, timeout=6)
+                r.raise_for_status()
+                if r.text.strip():
+                    return r.text
+            app.logger.warning("yt-dlp captions track empty for video %s", video_id)
+        except Exception as e:
+            app.logger.warning("yt-dlp captions track failed for video %s: %s", video_id, e)
 
     app.logger.error("All transcript sources failed for video %s", video_id)
     raise RuntimeError("Transcript unavailable from all sources")
@@ -259,12 +281,16 @@ def _get_or_spawn(video_id: str, timeout: float = 25.0) -> str:
     """
     Ensure only one worker fetches a given transcript while others await it.
     """
+    if (cached := transcript_cache.get(video_id)):
+        return cached
     fut = _pending.get(video_id)
     if fut is None:
         fut = executor.submit(_fetch_resilient, video_id)
         _pending[video_id] = fut
     try:
-        return fut.result(timeout=timeout)
+        result = fut.result(timeout=timeout)
+        transcript_cache[video_id] = result
+        return result
     finally:
         if fut.done():
             _pending.pop(video_id, None)
