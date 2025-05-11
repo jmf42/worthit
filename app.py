@@ -6,7 +6,7 @@ import time
 import itertools
 from functools import lru_cache
 from collections import deque 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future
 
 from flask import Flask, request, jsonify, make_response
 from youtube_transcript_api import (
@@ -64,6 +64,11 @@ PROXY_ROTATION = (
     [{}]
 )
 
+import itertools
+_proxy_cycle = itertools.cycle(PROXY_ROTATION)
+def rnd_proxy() -> dict:       # always returns {"https": "..."} or {}
+    return next(_proxy_cycle)
+
 PIPED_HOSTS = deque([
     "https://piped.video",
     "https://piped.video.proxycache.net",
@@ -88,7 +93,7 @@ def _fetch_json(hosts: deque, path: str,
         if cooldown.get(host, 0) > time.time():
             continue
         url = f"{host}{path}"
-        proxy = PROXY_ROTATION[0] if proxy_aware else {}
+        proxy = rnd_proxy() if proxy_aware else {}
         app.logger.info("[OUT] → %s", url)
         try:
             r = session.get(url, proxies=proxy, timeout=4)
@@ -137,6 +142,7 @@ limiter = Limiter(app=app,
 transcript_cache = TTLCache(maxsize=500, ttl=600)           # 10 min
 comment_cache    = TTLCache(maxsize=300, ttl=300)           # 5 min         # 10 min
 executor         = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 4))
+_pending: dict[str, Future] = {}  
 
 # --------------------------------------------------
 # Allowed fallback languages
@@ -188,74 +194,75 @@ def extract_video_id(input_str: str) -> str:
 
 
 
-# --------------------------------------------------
-# Transcript helpers
-# --------------------------------------------------
-FALLBACK_LANGS = ['en','es','fr','de','pt','ru','hi','ar','zh-Hans','ja']
-executor = ThreadPoolExecutor(max_workers=8)
 
 def _get_transcript(vid: str, langs, preserve):
     return YouTubeTranscriptApi.get_transcript(
         vid, languages=langs, preserve_formatting=preserve,
-        proxies=PROXY_ROTATION[0])
+        proxies=rnd_proxy())
+
+
+def _fetch_resilient(video_id: str) -> str:
+    """Try captions API first, fall back to yt-dlp, raise on total failure."""
+    # 1️⃣ official / community captions
+    try:
+        segs = _get_transcript(video_id, FALLBACK_LANGUAGES, False)
+        text = " ".join(s["text"] for s in segs).strip()
+        if text:
+            return text
+    except Exception:
+        pass
+
+    # 2️⃣ yt-dlp auto-captions
+    try:
+        info = yt_dlp_info(video_id)
+        caps = info.get("automatic_captions") or {}
+        first_track = next(iter(caps.values()), [])
+        if first_track:
+            url = first_track[0]["url"]
+            r = session.get(url, proxies=rnd_proxy(), timeout=6)
+            r.raise_for_status()
+            if r.text.strip():
+                return r.text
+    except Exception:
+        pass
+
+    raise RuntimeError("Transcript unavailable from all sources")
+
+
+def _get_or_spawn(video_id: str, timeout: float = 25.0) -> str:
+    """
+    Ensure only one worker fetches a given transcript while others await it.
+    """
+    fut = _pending.get(video_id)
+    if fut is None:
+        fut = executor.submit(_fetch_resilient, video_id)
+        _pending[video_id] = fut
+    try:
+        return fut.result(timeout=timeout)
+    finally:
+        if fut.done():
+            _pending.pop(video_id, None)
 
 # ─────────────────────────────────────────────
 # Endpoints
 # ─────────────────────────────────────────────
-@app.route("/transcript", methods=["GET"])
+@app.get("/transcript")
 @limiter.limit("100/hour")
-def get_transcript_endpoint():
-    vid = request.args.get("videoId", "")
-    if not valid_id(vid):
-        return jsonify({"error":"invalid_video_id"}), 400
-
-    full = request.args.get("format","text").lower() == "full"
-    key  = (vid, full)
-    if (cached := transcript_cache.get(key)):
-        return jsonify(cached), 200
+def transcript():
+    video_id = request.args.get("videoId", "")
+    try:
+        vid = extract_video_id(video_id)
+    except Exception:
+        return jsonify({"error": "invalid id"}), 400
 
     try:
-        tr = executor.submit(_get_transcript, vid, FALLBACK_LANGS, full
-                             ).result(timeout=15)
-    except (TimeoutError, TranscriptsDisabled, NoTranscriptFound,
-            CouldNotRetrieveTranscript):
-        return jsonify({"status":"unavailable"}), 204
+        text = _get_or_spawn(vid)
+        return jsonify({"video_id": vid, "text": text}), 200
+    except TimeoutError:
+        return jsonify({"status": "pending"}), 202
     except Exception as e:
-        app.logger.error("Transcript err: %s", e)
-        app.logger.error("Transcript error: %s", e)
-        return jsonify({"status":"error"}), 500
-
-    # ------------------------------------------------------------------
-    # Build a consistent response shape for both "full" and "text" modes
-    # ------------------------------------------------------------------
-    if isinstance(tr, list) and tr:
-        detected_lang = tr[0].get("language") or None
-    else:
-        detected_lang = None
-
-    if full:
-        resp = {
-            "status": "ok",
-            "detected_language": detected_lang,
-            "video_id": vid,
-            "segments": tr                       # raw timed segments
-        }
-    else:
-        # Flatten the segments into plain text for lighter clients
-        joined = " ".join(seg.get("text", "") for seg in tr) if isinstance(tr, list) else ""
-        resp = {
-            "status": "ok",
-            "detected_language": detected_lang,
-            "video_id": vid,
-            "text": joined,
-            "segments": tr                       # keep segments, some iOS clients rely on them
-        }
-
-    # Cache & return
-    transcript_cache[key] = resp
-    return jsonify(resp), 200
-
-
+        return jsonify({"status": "unavailable", "error": str(e)}), 404
+    
 
 # ---------------- PROXY STATS ---------------------
 @app.route("/proxy_stats", methods=["GET"])
