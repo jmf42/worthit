@@ -70,11 +70,16 @@ def rnd_proxy() -> dict:       # always returns {"https": "..."} or {}
     return next(_proxy_cycle)
 
 PIPED_HOSTS = deque([
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.tokhmi.xyz",
+    "https://pipedapi.moomoo.me",
     "https://piped.video",
     "https://piped.video.proxycache.net",
     "https://piped.video.deno.dev",
 ])
 INVIDIOUS_HOSTS = deque([
+    "https://yewtu.be",
+    "https://inv.nadeko.net",
     "https://vid.puffyan.us",
     "https://ytdetail.8848.wtf",
 ])
@@ -85,7 +90,7 @@ _IV_COOLDOWN: dict[str, float] = {}
 def _fetch_json(hosts: deque, path: str,
                 cooldown: dict[str, float],
                 proxy_aware: bool = False,
-                hard_deadline: float = 8.0):
+                hard_deadline: float = 6.0):
     deadline = time.time() + hard_deadline
     for host in list(hosts):
         if time.time() >= deadline:
@@ -96,7 +101,7 @@ def _fetch_json(hosts: deque, path: str,
         proxy = rnd_proxy() if proxy_aware else {}
         app.logger.info("[OUT] → %s", url)
         try:
-            r = session.get(url, proxies=proxy, timeout=4)
+            r = session.get(url, proxies=proxy, timeout=2)
             r.raise_for_status()
             if "application/json" not in r.headers.get("Content-Type", ""):
                 raise ValueError("non-JSON body")
