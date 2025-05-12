@@ -1,4 +1,10 @@
 import os
+import shelve
+# Persistent cache files
+PERSISTENT_TRANSCRIPT_DB = os.path.join(os.getcwd(), "transcript_cache_persistent.db")
+PERSISTENT_COMMENT_DB    = os.path.join(os.getcwd(), "comment_cache_persistent.db")
+transcript_shelf = shelve.open(PERSISTENT_TRANSCRIPT_DB)
+comment_shelf    = shelve.open(PERSISTENT_COMMENT_DB)
 import re
 import json
 import logging
@@ -32,9 +38,16 @@ from youtube_comment_downloader import YoutubeCommentDownloader  # fallback comm
 
 session = requests.Session()
 session.request = functools.partial(session.request, timeout=10)
-retry_cfg = Retry(total=1, backoff_factor=0.2,
-                  status_forcelist=[429, 500, 502, 503, 504],
-                  allowed_methods=["GET", "POST"])
+retry_cfg = Retry(
+    total=3,                # retry up to 3 times for any error type
+    connect=3,
+    read=3,
+    status=3,
+    backoff_factor=0.5,     # exponential back‑off, 0.5 • 2^n
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=False,  # retry on *all* HTTP methods
+    raise_on_status=False   # don’t throw after status_forcelist — let caller decide
+)
 session.mount("https://", HTTPAdapter(max_retries=retry_cfg))
 session.mount("http://", HTTPAdapter(max_retries=retry_cfg))
 
@@ -55,6 +68,9 @@ SMARTPROXY_API_TOKEN = os.getenv("SMARTPROXY_API_TOKEN")
 OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY")
 YOUTUBE_DATA_API_KEY = os.getenv("YOUTUBE_API_KEY")
 YTDL_COOKIE_FILE     = os.getenv("YTDL_COOKIE_FILE")
+
+# Maximum comments to retrieve per video (overridable via env)
+COMMENT_LIMIT = int(os.getenv("COMMENT_LIMIT", "120"))
 
 PROXY_ROTATION = (
     [
@@ -144,7 +160,8 @@ def _access_log():
 # --------------------------------------------------
 limiter = Limiter(app=app,
                   key_func=get_remote_address,
-                  default_limits=["200 per hour", "50 per minute"])
+                  default_limits=["200 per hour", "50 per minute"],
+                  headers_enabled=True)
 
 # --------------------------------------------------
 # Worker pool / cache
@@ -216,15 +233,18 @@ def _fetch_resilient(video_id: str) -> str:
     Try captions API first (English only), fall back to yt-dlp automatic captions,
     then a reduced language fallback, then any yt-dlp caption track; log each failure.
     """
-    # 1️⃣ English captions (official / community)
-    try:
-        segs = _get_transcript(video_id, ["en"], False)
-        text = " ".join(s["text"] for s in segs).strip()
-        if text:
-            return text
-        app.logger.warning("Official English transcript empty for video %s", video_id)
-    except Exception as e:
-        app.logger.warning("English transcript fetch failed for video %s: %s", video_id, e)
+    # 1️⃣ English captions (official / community) with retry
+    for attempt in range(3):
+        try:
+            segs = _get_transcript(video_id, ["en"], False)
+            text = " ".join(s["text"] for s in segs).strip()
+            if text:
+                return text
+            app.logger.warning("Official English transcript empty for video %s (attempt %d)", video_id, attempt+1)
+        except Exception as e:
+            app.logger.warning("English transcript fetch failed for video %s (attempt %d): %s", video_id, attempt+1, e)
+        # exponential back‑off before next attempt
+        time.sleep(0.5 * (2 ** attempt))
 
     # 2️⃣ Most common languages fallback
     try:
@@ -291,6 +311,9 @@ def _get_or_spawn(video_id: str, timeout: float = 25.0) -> str:
     """
     Ensure only one worker fetches a given transcript while others await it.
     """
+    # Check persistent shelf first
+    if video_id in transcript_shelf:
+        return transcript_shelf[video_id]
     if (cached := transcript_cache.get(video_id)):
         return cached
     fut = _pending.get(video_id)
@@ -300,6 +323,8 @@ def _get_or_spawn(video_id: str, timeout: float = 25.0) -> str:
     try:
         result = fut.result(timeout=timeout)
         transcript_cache[video_id] = result
+        transcript_shelf[video_id] = result
+        transcript_shelf.sync()
         return result
     finally:
         if fut.done():
@@ -354,7 +379,7 @@ def get_proxy_stats():
 
 # ---------------- Comments ----------------
 
-def _download_comments_downloader(video_id: str, limit: int = 120) -> list[str] | None:
+def _download_comments_downloader(video_id: str, limit: int = COMMENT_LIMIT) -> list[str] | None:
     """
     Fallback comments fetch that *does not* rely on Piped/Invidious or YouTube Data API.
     Uses the `youtube-comment-downloader` library (mimics YouTube web requests).
@@ -381,35 +406,43 @@ def comments():
     vid = request.args.get("videoId", "")
     if not valid_id(vid):
         return jsonify({"error": "invalid_video_id"}), 400
+    # Persistent comment cache lookup
+    if vid in comment_shelf:
+        return jsonify({"comments": comment_shelf[vid]}), 200
     if (cached := comment_cache.get(vid)):
         return jsonify({"comments": cached}), 200
 
-    # 1) Piped
-    js = _fetch_json(PIPED_HOSTS, f"/api/v1/comments/{vid}?cursor=0",
-                     _PIPE_COOLDOWN)
+    # 1) youtube-comment-downloader (default)
+    scraped = _download_comments_downloader(vid, COMMENT_LIMIT)
+    if scraped:
+        comment_cache[vid] = scraped
+        comment_shelf[vid] = scraped
+        comment_shelf.sync()
+        app.logger.info("Comments fetched via youtube-comment-downloader for %s", vid)
+        return jsonify({"comments": scraped}), 200
+
+    # 2) Piped
+    js = _fetch_json(PIPED_HOSTS, f"/api/v1/comments/{vid}?cursor=0", _PIPE_COOLDOWN)
     if js and (lst := [c["comment"] for c in js.get("comments", [])]):
         comment_cache[vid] = lst
+        comment_shelf[vid] = lst
+        comment_shelf.sync()
         app.logger.info("Comments fetched via Piped for %s", vid)
         return jsonify({"comments": lst}), 200
 
-    # 2) yt-dlp (only if cookies)
+    # 3) yt-dlp (only if cookies)
     if YTDL_COOKIE_FILE:
         try:
             yt = yt_dlp_info(vid)
             lst = [c["content"] for c in yt.get("comments", [])][:40]
             if lst:
                 comment_cache[vid] = lst
+                comment_shelf[vid] = lst
+                comment_shelf.sync()
                 app.logger.info("Comments fetched via yt-dlp for %s", vid)
                 return jsonify({"comments": lst}), 200
         except Exception as e:
             app.logger.info("yt-dlp comments failed: %s", e)
-
-    # 3) youtube-comment-downloader (new default fallback)
-    scraped = _download_comments_downloader(vid)
-    if scraped:
-        comment_cache[vid] = scraped
-        app.logger.info("Comments fetched via youtube-comment-downloader for %s", vid)
-        return jsonify({"comments": scraped}), 200
 
     # 4) Invidious
     js = _fetch_json(INVIDIOUS_HOSTS,
@@ -417,6 +450,8 @@ def comments():
                      _IV_COOLDOWN, proxy_aware=bool(SMARTPROXY_USER))
     if js and (lst := [c["content"] for c in js.get("comments", [])]):
         comment_cache[vid] = lst
+        comment_shelf[vid] = lst
+        comment_shelf.sync()
         app.logger.info("Comments fetched via Invidious for %s", vid)
         return jsonify({"comments": lst}), 200
 
@@ -710,4 +745,6 @@ if __name__ == "__main__":
 
 import atexit
 atexit.register(lambda: executor.shutdown(wait=False))
+atexit.register(lambda: transcript_shelf.close())
+atexit.register(lambda: comment_shelf.close())
 
