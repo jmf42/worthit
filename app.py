@@ -32,7 +32,7 @@ from youtube_comment_downloader import YoutubeCommentDownloader  # fallback comm
 
 session = requests.Session()
 session.request = functools.partial(session.request, timeout=10)
-retry_cfg = Retry(total=2, backoff_factor=0.4,
+retry_cfg = Retry(total=1, backoff_factor=0.2,
                   status_forcelist=[429, 500, 502, 503, 504],
                   allowed_methods=["GET", "POST"])
 session.mount("https://", HTTPAdapter(max_retries=retry_cfg))
@@ -92,8 +92,11 @@ def _fetch_json(hosts: deque, path: str,
                 cooldown: dict[str, float],
                 proxy_aware: bool = False,
                 hard_deadline: float = 6.0):
+    # Track last successful host access time
+    host_success = getattr(_fetch_json, "_host_success", {})
+    _fetch_json._host_success = host_success
     deadline = time.time() + hard_deadline
-    for host in list(hosts):
+    for host in sorted(hosts, key=lambda h: -host_success.get(h, 0)):
         if time.time() >= deadline:
             break
         if cooldown.get(host, 0) > time.time():
@@ -102,10 +105,11 @@ def _fetch_json(hosts: deque, path: str,
         proxy = rnd_proxy() if proxy_aware else {}
         app.logger.info("[OUT] → %s", url)
         try:
-            r = session.get(url, proxies=proxy, timeout=2)
+            r = session.get(url, proxies=proxy, timeout=1)
             r.raise_for_status()
             if "application/json" not in r.headers.get("Content-Type", ""):
                 raise ValueError("non-JSON body")
+            host_success[host] = time.time()
             return r.json()
         except Exception as e:
             app.logger.warning("Host %s failed: %s", host, e)
@@ -384,6 +388,7 @@ def comments():
                      _PIPE_COOLDOWN)
     if js and (lst := [c["comment"] for c in js.get("comments", [])]):
         comment_cache[vid] = lst
+        app.logger.info("Comments fetched via Piped for %s", vid)
         return jsonify({"comments": lst}), 200
 
     # 2) yt-dlp (only if cookies)
@@ -393,6 +398,7 @@ def comments():
             lst = [c["content"] for c in yt.get("comments", [])][:40]
             if lst:
                 comment_cache[vid] = lst
+                app.logger.info("Comments fetched via yt-dlp for %s", vid)
                 return jsonify({"comments": lst}), 200
         except Exception as e:
             app.logger.info("yt-dlp comments failed: %s", e)
@@ -401,6 +407,7 @@ def comments():
     scraped = _download_comments_downloader(vid)
     if scraped:
         comment_cache[vid] = scraped
+        app.logger.info("Comments fetched via youtube-comment-downloader for %s", vid)
         return jsonify({"comments": scraped}), 200
 
     # 4) Invidious
@@ -409,6 +416,7 @@ def comments():
                      _IV_COOLDOWN, proxy_aware=bool(SMARTPROXY_USER))
     if js and (lst := [c["content"] for c in js.get("comments", [])]):
         comment_cache[vid] = lst
+        app.logger.info("Comments fetched via Invidious for %s", vid)
         return jsonify({"comments": lst}), 200
 
     app.logger.info("All comment sources failed for %s", vid)
