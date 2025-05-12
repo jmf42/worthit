@@ -323,6 +323,7 @@ def transcript():
     except TimeoutError:
         return jsonify({"status": "pending"}), 202
     except Exception as e:
+        app.logger.error("Transcript generation failed for %s: %s", vid, e)
         return jsonify({"status": "unavailable", "error": str(e)}), 404
     
 
@@ -426,6 +427,8 @@ def comments():
 @app.route("/youtube/metadata")
 def metadata():
     vid = request.args.get("videoId", "")
+    if not vid:
+        return jsonify({"error": "missing_video_id"}), 400
     if not valid_id(vid):
         return jsonify({"error": "invalid_video_id"}), 400
 
@@ -444,6 +447,8 @@ def metadata():
             "likeCount"    : None,
             "videoId"      : vid,
         }
+        if isinstance(base["title"], str):
+            base["title"] = base["title"].strip()
         return jsonify({"items":[base]}), 200
     except Exception as e:
         app.logger.info("oEmbed failed: %s", e)
@@ -461,6 +466,8 @@ def metadata():
             "likeCount"    : js.get("likes"),
             "videoId"      : vid,
         }
+        if isinstance(base["title"], str):
+            base["title"] = base["title"].strip()
         return jsonify({"items":[base]}), 200
 
     # 3) yt-dlp
@@ -476,10 +483,22 @@ def metadata():
             "likeCount"    : yt.get("like_count"),
             "videoId"      : vid,
         }
+        if isinstance(base["title"], str):
+            base["title"] = base["title"].strip()
         return jsonify({"items":[base]}), 200
     except Exception as e:
         app.logger.error("Metadata fallback failed: %s", e)
-        return jsonify({"items":[]}), 200
+        app.logger.warning("All metadata fallbacks failed for video %s — returning stub.", vid)
+        return jsonify({"items":[{
+            "title": "Unknown Title",
+            "channelTitle": "Unknown Channel",
+            "thumbnail": None,
+            "thumbnailUrl": None,
+            "duration": None,
+            "viewCount": None,
+            "likeCount": None,
+            "videoId": vid
+        }]}), 200
 
 
 # ---------------- OpenAI RESPONSES POST (with Enhanced Logging) -----------
