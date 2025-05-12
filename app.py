@@ -28,6 +28,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from yt_dlp import YoutubeDL  
 import functools
+from youtube_comment_downloader import YoutubeCommentDownloader  # fallback comments scraper
 
 session = requests.Session()
 session.request = functools.partial(session.request, timeout=10)
@@ -347,6 +348,29 @@ def get_proxy_stats():
         return jsonify({'error': 'Could not retrieve proxy stats'}), 503
 
 # ---------------- Comments ----------------
+
+def _download_comments_downloader(video_id: str, limit: int = 120) -> list[str] | None:
+    """
+    Fallback comments fetch that *does not* rely on Piped/Invidious or YouTube Data API.
+    Uses the `youtube-comment-downloader` library (mimics YouTube web requests).
+
+    Returns a list of comment strings (top-level only) or None on failure.
+    """
+    try:
+        downloader = YoutubeCommentDownloader()
+        comments: list[str] = []
+        for c in downloader.get_comments_from_url(f"https://www.youtube.com/watch?v={video_id}"):
+            txt = c.get("text")
+            if txt:
+                comments.append(txt)
+            if len(comments) >= limit:
+                break
+        return comments or None
+    except Exception as e:
+        app.logger.warning("youtube-comment-downloader failed for %s: %s", video_id, e)
+        return None
+
+
 @app.route("/youtube/comments")
 def comments():
     vid = request.args.get("videoId", "")
@@ -373,15 +397,21 @@ def comments():
         except Exception as e:
             app.logger.info("yt-dlp comments failed: %s", e)
 
-    # 3) Invidious
+    # 3) youtube-comment-downloader (new default fallback)
+    scraped = _download_comments_downloader(vid)
+    if scraped:
+        comment_cache[vid] = scraped
+        return jsonify({"comments": scraped}), 200
+
+    # 4) Invidious
     js = _fetch_json(INVIDIOUS_HOSTS,
                      f"/api/v1/comments/{vid}?sort_by=top",
                      _IV_COOLDOWN, proxy_aware=bool(SMARTPROXY_USER))
     if js and (lst := [c["content"] for c in js.get("comments", [])]):
         comment_cache[vid] = lst
+        return jsonify({"comments": lst}), 200
 
-    if not comment_cache.get(vid):
-        app.logger.info("All comment sources failed for %s", vid)
+    app.logger.info("All comment sources failed for %s", vid)
     return jsonify({"comments": comment_cache.get(vid, [])}), 200
 
 # ---------------- Metadata ---------------
