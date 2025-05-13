@@ -5,6 +5,9 @@ PERSISTENT_TRANSCRIPT_DB = os.path.join(os.getcwd(), "transcript_cache_persisten
 PERSISTENT_COMMENT_DB    = os.path.join(os.getcwd(), "comment_cache_persistent.db")
 transcript_shelf = shelve.open(PERSISTENT_TRANSCRIPT_DB)
 comment_shelf    = shelve.open(PERSISTENT_COMMENT_DB)
+# Persistent cache for analysis results
+PERSISTENT_ANALYSIS_DB = os.path.join(os.getcwd(), "analysis_cache_persistent.db")
+analysis_shelf = shelve.open(PERSISTENT_ANALYSIS_DB)
 import re
 import json
 import logging
@@ -168,6 +171,7 @@ limiter = Limiter(app=app,
 # --------------------------------------------------
 transcript_cache = TTLCache(maxsize=500, ttl=600)           # 10 min
 comment_cache    = TTLCache(maxsize=300, ttl=300)           # 5 min         # 10 min
+analysis_cache = TTLCache(maxsize=200, ttl=600)  # 10-minute in-memory cache for analysis
 executor         = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 4))
 _pending: dict[str, Future] = {}  
 
@@ -406,11 +410,14 @@ def comments():
     vid = request.args.get("videoId", "")
     if not valid_id(vid):
         return jsonify({"error": "invalid_video_id"}), 400
-    # Persistent comment cache lookup
+    # Check in-memory comments cache
+    if vid in comment_cache:
+        return jsonify({"comments": comment_cache[vid]}), 200
+    # Check persistent comments shelf
     if vid in comment_shelf:
-        return jsonify({"comments": comment_shelf[vid]}), 200
-    if (cached := comment_cache.get(vid)):
-        return jsonify({"comments": cached}), 200
+        cached_comments = comment_shelf[vid]
+        comment_cache[vid] = cached_comments
+        return jsonify({"comments": cached_comments}), 200
 
     # 1) youtube-comment-downloader (default)
     scraped = _download_comments_downloader(vid, COMMENT_LIMIT)
