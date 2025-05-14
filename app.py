@@ -175,13 +175,6 @@ analysis_cache = TTLCache(maxsize=200, ttl=600)  # 10-minute in-memory cache for
 executor         = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 4))
 _pending: dict[str, Future] = {}  
 
-# --------------------------------------------------
-# Allowed fallback languages
-# --------------------------------------------------
-FALLBACK_LANGUAGES = [
-    'en','es','fr','de','pt','ru','hi','ar','zh-Hans','ja',
-    'ko','it','nl','tr','vi','id','pl','th','sv','fi','he','uk','da','no'
-]
 
 # --------------------------------------------------
 # Logging setup (console + rotating file)
@@ -227,6 +220,7 @@ def extract_video_id(input_str: str) -> str:
 
 
 def _get_transcript(vid: str, langs, preserve):
+    # Always use a rotating proxy (Smartproxy) for YouTubeTranscriptApi
     return YouTubeTranscriptApi.get_transcript(
         vid, languages=langs, preserve_formatting=preserve,
         proxies=rnd_proxy())
@@ -234,80 +228,127 @@ def _get_transcript(vid: str, langs, preserve):
 
 def _fetch_resilient(video_id: str) -> str:
     """
-    Try captions API first (English only), fall back to yt-dlp automatic captions,
-    then a reduced language fallback, then any yt-dlp caption track; log each failure.
+    Fetch a transcript for the given video ID using multiple strategies in parallel.
+
+    The fallback brute-force of multiple languages is no longer used.
+    Instead, the process attempts the following (in parallel where possible):
+      1. Fetch transcript using YouTubeTranscriptApi for English ("en") only.
+      2. Fetch automatic or manual captions via yt-dlp.
+      3. If both fail, try to fetch captions from the Piped API.
+
+    The first successful result is returned; if all methods fail, an error is raised.
     """
-    # 1️⃣ English captions (official / community) with retry
-    for attempt in range(3):
+    import concurrent.futures
+
+    def fetch_with_ytapi_en():
         try:
             segs = _get_transcript(video_id, ["en"], False)
             text = " ".join(s["text"] for s in segs).strip()
             if text:
+                app.logger.info("[Transcript] Success: YouTubeTranscriptApi (en) for %s", video_id)
                 return text
-            app.logger.warning("Official English transcript empty for video %s (attempt %d)", video_id, attempt+1)
+            app.logger.warning("[Transcript] YouTubeTranscriptApi (en) returned empty for %s", video_id)
         except Exception as e:
-            app.logger.warning("English transcript fetch failed for video %s (attempt %d): %s", video_id, attempt+1, e)
-        # exponential back‑off before next attempt
-        time.sleep(0.5 * (2 ** attempt))
+            app.logger.warning("[Transcript] YouTubeTranscriptApi (en) failed for %s: %s", video_id, e)
+        return None
 
-    # 2️⃣ Most common languages fallback
-    try:
-        fallback_langs = ['es', 'de', 'fr', 'pt', 'ru', 'hi', 'ar', 'zh-Hans', 'ja', 'it']
-        segs = _get_transcript(video_id, fallback_langs, False)
-        text = " ".join(s["text"] for s in segs).strip()
-        if text:
-            return text
-        app.logger.warning("Top fallback transcript empty for video %s", video_id)
-    except Exception as e:
-        app.logger.warning("Top fallback transcript fetch failed for video %s: %s", video_id, e)
-
-    # 3️⃣ Full language fallback
-    try:
-        segs = _get_transcript(video_id, FALLBACK_LANGUAGES, False)
-        text = " ".join(s["text"] for s in segs).strip()
-        if text:
-            return text
-        app.logger.warning("Full fallback transcript empty for video %s", video_id)
-    except Exception as e:
-        app.logger.warning("Full fallback transcript fetch failed for video %s: %s", video_id, e)
-
-    # 4️⃣+5️⃣ yt-dlp info (automatic captions and any captions, no proxy)
-    try:
-        info = yt_dlp_info(video_id)
-    except Exception as e:
-        info = None
-        app.logger.warning("yt-dlp info failed for video %s: %s", video_id, e)
-
-    # 4️⃣ yt-dlp automatic captions (no proxy)
-    if info:
+    def fetch_with_ytdlp():
+        try:
+            info = yt_dlp_info(video_id)
+        except Exception as e:
+            app.logger.warning("[Transcript] yt-dlp info failed for %s: %s", video_id, e)
+            return None
+        # Try automatic captions
         try:
             caps = info.get("automatic_captions") or {}
             first_track = next(iter(caps.values()), [])
             if first_track:
                 url = first_track[0]["url"]
-                r = session.get(url, timeout=6)
+                r = session.get(url, timeout=8)
                 r.raise_for_status()
                 if r.text.strip():
+                    app.logger.info("[Transcript] Success: yt-dlp automatic_captions for %s", video_id)
                     return r.text
-            app.logger.warning("yt-dlp automatic_captions empty for video %s", video_id)
+            app.logger.warning("[Transcript] yt-dlp automatic_captions empty for %s", video_id)
         except Exception as e:
-            app.logger.warning("yt-dlp automatic captions failed for video %s: %s", video_id, e)
-
-        # 5️⃣ yt-dlp any caption track (no proxy)
+            app.logger.warning("[Transcript] yt-dlp automatic_captions failed for %s: %s", video_id, e)
+        # Try manual captions
         try:
             caps = info.get("captions") or {}
             track = caps.get("en") or next(iter(caps.values()), [])
             if track:
                 url = track[0]["url"]
-                r = session.get(url, timeout=6)
+                r = session.get(url, timeout=8)
                 r.raise_for_status()
                 if r.text.strip():
+                    app.logger.info("[Transcript] Success: yt-dlp captions track for %s", video_id)
                     return r.text
-            app.logger.warning("yt-dlp captions track empty for video %s", video_id)
+            app.logger.warning("[Transcript] yt-dlp captions track empty for %s", video_id)
         except Exception as e:
-            app.logger.warning("yt-dlp captions track failed for video %s: %s", video_id, e)
+            app.logger.warning("[Transcript] yt-dlp captions track failed for %s: %s", video_id, e)
+        return None
 
-    app.logger.error("All transcript sources failed for video %s", video_id)
+    def fetch_with_piped():
+        # Try each Piped host until one succeeds or all fail
+        for host in list(PIPED_HOSTS):
+            try:
+                url = f"{host}/api/v1/captions/{video_id}"
+                proxy = rnd_proxy() if SMARTPROXY_USER else {}
+                app.logger.info("[Transcript] Trying Piped captions at %s", url)
+                r = session.get(url, proxies=proxy, timeout=6)
+                r.raise_for_status()
+                js = r.json()
+                # js is a list of available captions tracks (may be empty)
+                for caption_track in js:
+                    if caption_track.get("url"):
+                        caption_url = caption_track["url"]
+                        lang_code = caption_track.get("languageCode", "")
+                        # Prioritize English if possible, else take first
+                        if lang_code == "en" or not js.index(caption_track):
+                            r2 = session.get(caption_url, timeout=8)
+                            r2.raise_for_status()
+                            if r2.text.strip():
+                                app.logger.info(f"[Transcript] Success: Piped captions ({lang_code}) for %s", video_id)
+                                return r2.text
+                app.logger.warning("[Transcript] No usable captions in Piped for %s", video_id)
+            except Exception as e:
+                app.logger.warning(f"[Transcript] Piped failed at {host} for %s: %s", video_id, e)
+                continue
+        app.logger.error("[Transcript] All Piped endpoints failed for %s", video_id)
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        future_to_method = {
+            executor.submit(fetch_with_ytapi_en): "ytapi_en",
+            executor.submit(fetch_with_ytdlp): "ytdlp"
+        }
+        done, not_done = concurrent.futures.wait(
+            future_to_method, timeout=18, return_when=concurrent.futures.FIRST_COMPLETED
+        )
+        # Try to get first success result
+        for fut in done:
+            res = fut.result()
+            if res and len(res) > 10:
+                # Cancel the other future if it's still running
+                for remaining in not_done:
+                    remaining.cancel()
+                return res
+        # If neither succeeded, wait for both to complete and see if any succeeded (edge case)
+        for fut in not_done:
+            try:
+                res = fut.result(timeout=4)
+                if res and len(res) > 10:
+                    return res
+            except Exception:
+                continue
+    app.logger.warning("[Transcript] Both primary methods failed for %s, trying Piped fallback.", video_id)
+
+    # Third fallback: Try Piped API for captions
+    piped_result = fetch_with_piped()
+    if piped_result and len(piped_result) > 10:
+        return piped_result
+
+    app.logger.error("[Transcript] All transcript sources failed for %s", video_id)
     raise RuntimeError("Transcript unavailable from all sources")
 
 
