@@ -1,3 +1,9 @@
+# yt-dlp runs direct (no proxy) unless you see repeated rate limits, in which case set up proxy use for yt-dlp.
+# YouTubeTranscriptApi always uses Smartproxy (if credentials provided) for maximum reliability.
+# Piped fallback tries direct, then proxy if necessary.
+# All transcript fetches are coordinated via a per-video_id lock to avoid race conditions.
+# The list of fallback languages is configurable via the POPULAR_LANGS environment variable (comma-separated).
+
 import os
 import shelve
 # Persistent cache files
@@ -15,6 +21,8 @@ import time
 import itertools
 from functools import lru_cache
 from collections import deque 
+from threading import Lock
+_video_fetch_locks = {}
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future
 
 from flask import Flask, request, jsonify, make_response
@@ -228,18 +236,28 @@ def _get_transcript(vid: str, langs, preserve):
 
 def _fetch_resilient(video_id: str) -> str:
     """
-    Fetch a transcript for the given video ID using multiple strategies in parallel.
-
-    The fallback brute-force of multiple languages is no longer used.
-    Instead, the process attempts the following (in parallel where possible):
-      1. Fetch transcript using YouTubeTranscriptApi for English ("en") only.
-      2. Fetch automatic or manual captions via yt-dlp.
-      3. If both fail, try to fetch captions from the Piped API.
-
-    The first successful result is returned; if all methods fail, an error is raised.
+    Robustly fetch a transcript for the given video ID using parallel and fallback strategies:
+      1. Run both yt-dlp and YouTubeTranscriptApi (English, with Smartproxy) in parallel as primary strategies.
+         - yt-dlp runs without Smartproxy unless persistent rate limits are observed (option kept in code, but not default).
+         - YouTubeTranscriptApi always uses Smartproxy.
+      2. If both fail, fallback: YouTubeTranscriptApi with top 20 most popular languages (global YouTube order), with Smartproxy.
+      3. If all above fail, fallback to Piped API, optionally with Smartproxy only if needed (i.e., if IP banned).
+      4. Exit early upon first valid transcript.
+      5. All steps are logged for observability.
     """
     import concurrent.futures
 
+    # Allow POPULAR_LANGS override by environment variable (comma-separated)
+    POPULAR_LANGS = os.getenv("POPULAR_LANGS")
+    if POPULAR_LANGS:
+        POPULAR_LANGS = [l.strip() for l in POPULAR_LANGS.split(",") if l.strip()]
+    else:
+        POPULAR_LANGS = [
+            "en", "es", "hi", "pt", "id", "ru", "ja", "ko", "de", "fr",
+            "tr", "vi", "it", "ar", "pl", "uk", "fa", "nl", "th", "ro"
+        ]
+
+    # --- Primary: YouTubeTranscriptApi (en), always with Smartproxy
     def fetch_with_ytapi_en():
         try:
             segs = _get_transcript(video_id, ["en"], False)
@@ -252,6 +270,7 @@ def _fetch_resilient(video_id: str) -> str:
             app.logger.warning("[Transcript] YouTubeTranscriptApi (en) failed for %s: %s", video_id, e)
         return None
 
+    # --- Primary: yt-dlp, without Smartproxy by default
     def fetch_with_ytdlp():
         try:
             info = yt_dlp_info(video_id)
@@ -288,35 +307,55 @@ def _fetch_resilient(video_id: str) -> str:
             app.logger.warning("[Transcript] yt-dlp captions track failed for %s: %s", video_id, e)
         return None
 
+    # --- Fallback: YouTubeTranscriptApi with popular languages (with Smartproxy)
+    def fetch_with_ytapi_popular_langs():
+        # Try each language, exit early on first valid transcript
+        for lang in POPULAR_LANGS:
+            if lang == "en":
+                continue  # already tried in primary
+            try:
+                segs = _get_transcript(video_id, [lang], False)
+                text = " ".join(s["text"] for s in segs).strip()
+                if text:
+                    app.logger.info("[Transcript] Success: YouTubeTranscriptApi (%s) for %s", lang, video_id)
+                    return text
+                app.logger.warning("[Transcript] YouTubeTranscriptApi (%s) returned empty for %s", lang, video_id)
+            except Exception as e:
+                app.logger.info("[Transcript] YouTubeTranscriptApi (%s) failed for %s: %s", lang, video_id, e)
+        return None
+
+    # --- Fallback: Piped API, only use Smartproxy if needed
     def fetch_with_piped():
-        # Try each Piped host until one succeeds or all fail
         for host in list(PIPED_HOSTS):
             try:
                 url = f"{host}/api/v1/captions/{video_id}"
-                proxy = rnd_proxy() if SMARTPROXY_USER else {}
-                app.logger.info("[Transcript] Trying Piped captions at %s", url)
-                r = session.get(url, proxies=proxy, timeout=6)
-                r.raise_for_status()
-                js = r.json()
-                # js is a list of available captions tracks (may be empty)
-                for caption_track in js:
-                    if caption_track.get("url"):
-                        caption_url = caption_track["url"]
-                        lang_code = caption_track.get("languageCode", "")
-                        # Prioritize English if possible, else take first
-                        if lang_code == "en" or not js.index(caption_track):
-                            r2 = session.get(caption_url, timeout=8)
-                            r2.raise_for_status()
-                            if r2.text.strip():
-                                app.logger.info(f"[Transcript] Success: Piped captions ({lang_code}) for %s", video_id)
-                                return r2.text
-                app.logger.warning("[Transcript] No usable captions in Piped for %s", video_id)
+                # Only use Smartproxy if needed (IP banned), try direct first
+                for try_proxy in (False, True) if SMARTPROXY_USER else (False,):
+                    proxy = rnd_proxy() if try_proxy else {}
+                    app.logger.info("[Transcript] Trying Piped captions at %s (proxy=%s)", url, try_proxy)
+                    r = session.get(url, proxies=proxy, timeout=6)
+                    r.raise_for_status()
+                    js = r.json()
+                    # js is a list of available captions tracks (may be empty)
+                    for caption_track in js:
+                        if caption_track.get("url"):
+                            caption_url = caption_track["url"]
+                            lang_code = caption_track.get("languageCode", "")
+                            # Prioritize English if possible, else take first
+                            if lang_code == "en" or not js.index(caption_track):
+                                r2 = session.get(caption_url, timeout=8)
+                                r2.raise_for_status()
+                                if r2.text.strip():
+                                    app.logger.info(f"[Transcript] Success: Piped captions ({lang_code}) for %s (proxy={try_proxy})", video_id)
+                                    return r2.text
+                    app.logger.warning("[Transcript] No usable captions in Piped for %s (proxy=%s)", video_id, try_proxy)
             except Exception as e:
                 app.logger.warning(f"[Transcript] Piped failed at {host} for %s: %s", video_id, e)
                 continue
         app.logger.error("[Transcript] All Piped endpoints failed for %s", video_id)
         return None
 
+    # --- Run primary strategies in parallel: yt-dlp and YouTubeTranscriptApi (en)
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         future_to_method = {
             executor.submit(fetch_with_ytapi_en): "ytapi_en",
@@ -341,9 +380,17 @@ def _fetch_resilient(video_id: str) -> str:
                     return res
             except Exception:
                 continue
-    app.logger.warning("[Transcript] Both primary methods failed for %s, trying Piped fallback.", video_id)
 
-    # Third fallback: Try Piped API for captions
+    app.logger.warning("[Transcript] Both primary methods failed for %s, trying YouTubeTranscriptApi fallback for popular languages.", video_id)
+
+    # --- Fallback: YouTubeTranscriptApi with top 20 most popular languages
+    ytapi_popular_result = fetch_with_ytapi_popular_langs()
+    if ytapi_popular_result and len(ytapi_popular_result) > 10:
+        return ytapi_popular_result
+
+    app.logger.warning("[Transcript] All YouTubeTranscriptApi strategies failed for %s, trying Piped fallback.", video_id)
+
+    # --- Fallback: Try Piped API for captions
     piped_result = fetch_with_piped()
     if piped_result and len(piped_result) > 10:
         return piped_result
@@ -355,25 +402,29 @@ def _fetch_resilient(video_id: str) -> str:
 def _get_or_spawn(video_id: str, timeout: float = 25.0) -> str:
     """
     Ensure only one worker fetches a given transcript while others await it.
+    Uses a lock per video_id to avoid race condition of launching the same fetch.
     """
-    # Check persistent shelf first
-    if video_id in transcript_shelf:
-        return transcript_shelf[video_id]
-    if (cached := transcript_cache.get(video_id)):
-        return cached
-    fut = _pending.get(video_id)
-    if fut is None:
-        fut = executor.submit(_fetch_resilient, video_id)
-        _pending[video_id] = fut
-    try:
-        result = fut.result(timeout=timeout)
-        transcript_cache[video_id] = result
-        transcript_shelf[video_id] = result
-        transcript_shelf.sync()
-        return result
-    finally:
-        if fut.done():
-            _pending.pop(video_id, None)
+    lock = _video_fetch_locks.setdefault(video_id, Lock())
+    with lock:
+        # Check persistent shelf first
+        if video_id in transcript_shelf:
+            return transcript_shelf[video_id]
+        if (cached := transcript_cache.get(video_id)):
+            return cached
+        fut = _pending.get(video_id)
+        if fut is None:
+            fut = executor.submit(_fetch_resilient, video_id)
+            _pending[video_id] = fut
+        try:
+            result = fut.result(timeout=timeout)
+            transcript_cache[video_id] = result
+            transcript_shelf[video_id] = result
+            transcript_shelf.sync()
+            return result
+        finally:
+            if fut.done():
+                _pending.pop(video_id, None)
+            _video_fetch_locks.pop(video_id, None)  # Clean up the lock
 
 # ─────────────────────────────────────────────
 # Endpoints
