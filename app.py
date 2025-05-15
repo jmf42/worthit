@@ -7,15 +7,15 @@
 # Additions for improved language fallback and host cooldown logic
 import os
 import random
-from sqlitedict import SqliteDict
-# Persistent cache files (WAL SQLite, concurrent-safe)
-PERSISTENT_TRANSCRIPT_DB = os.path.join(os.getcwd(), "transcript_cache_persistent.sqlite")
-PERSISTENT_COMMENT_DB    = os.path.join(os.getcwd(), "comment_cache_persistent.sqlite")
-PERSISTENT_ANALYSIS_DB   = os.path.join(os.getcwd(), "analysis_cache_persistent.sqlite")
+import shelve
+# Persistent cache files
+PERSISTENT_TRANSCRIPT_DB = os.path.join(os.getcwd(), "transcript_cache_persistent.db")
+PERSISTENT_COMMENT_DB    = os.path.join(os.getcwd(), "comment_cache_persistent.db")
+PERSISTENT_ANALYSIS_DB   = os.path.join(os.getcwd(), "analysis_cache_persistent.db")
 
-transcript_shelf = SqliteDict(PERSISTENT_TRANSCRIPT_DB, tablename="transcripts", autocommit=True)
-comment_shelf    = SqliteDict(PERSISTENT_COMMENT_DB, tablename="comments", autocommit=True)
-analysis_shelf   = SqliteDict(PERSISTENT_ANALYSIS_DB, tablename="analysis", autocommit=True)
+transcript_shelf = shelve.open(PERSISTENT_TRANSCRIPT_DB)
+comment_shelf    = shelve.open(PERSISTENT_COMMENT_DB)
+analysis_shelf   = shelve.open(PERSISTENT_ANALYSIS_DB)
 import re
 import time
 import itertools
@@ -24,29 +24,7 @@ import logging
 from functools import lru_cache
 from collections import deque 
 from threading import Lock
-from contextlib import contextmanager
-
-# Robust per-video lock helper
-_global_fetch_lock = Lock()          # guards the dictionary itself
-_video_fetch_locks: dict[str, Lock] = {}
-
-@contextmanager
-def video_lock(vid: str):
-    """
-    Ensure only ONE thread in this process fetches a given video at a time.
-    Prevents duplicate network work and keeps _video_fetch_locks from growing unbounded.
-    """
-    with _global_fetch_lock:
-        lk = _video_fetch_locks.setdefault(vid, Lock())
-    lk.acquire()
-    try:
-        yield
-    finally:
-        lk.release()
-        # prune the lock object if nobody else is waiting
-        with _global_fetch_lock:
-            if not lk.locked():
-                _video_fetch_locks.pop(vid, None)
+_video_fetch_locks = {}
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future
 
 from flask import Flask, request, jsonify, make_response
@@ -458,7 +436,8 @@ def _get_or_spawn(video_id: str, timeout: float = 25.0) -> str:
     Ensure only one worker fetches a given transcript while others await it.
     Uses a lock per video_id to avoid race condition of launching the same fetch.
     """
-    with video_lock(video_id):
+    lock = _video_fetch_locks.setdefault(video_id, Lock())
+    with lock:
         # Check persistent shelf first
         if video_id in transcript_shelf:
             return transcript_shelf[video_id]
@@ -472,10 +451,12 @@ def _get_or_spawn(video_id: str, timeout: float = 25.0) -> str:
             result = fut.result(timeout=timeout)
             transcript_cache[video_id] = result
             transcript_shelf[video_id] = result
+            transcript_shelf.sync()
             return result
         finally:
             if fut.done():
                 _pending.pop(video_id, None)
+            _video_fetch_locks.pop(video_id, None)
 
 # ─────────────────────────────────────────────
 # Endpoints
@@ -567,6 +548,7 @@ def comments():
     if scraped:
         comment_cache[vid] = scraped
         comment_shelf[vid] = scraped
+        comment_shelf.sync()
         app.logger.info("Comments fetched via youtube-comment-downloader for %s", vid)
         return jsonify({"comments": scraped}), 200
 
@@ -575,6 +557,7 @@ def comments():
     if js and (lst := [c["comment"] for c in js.get("comments", [])]):
         comment_cache[vid] = lst
         comment_shelf[vid] = lst
+        comment_shelf.sync()
         app.logger.info("Comments fetched via Piped for %s", vid)
         return jsonify({"comments": lst}), 200
 
@@ -586,6 +569,7 @@ def comments():
             if lst:
                 comment_cache[vid] = lst
                 comment_shelf[vid] = lst
+                comment_shelf.sync()
                 app.logger.info("Comments fetched via yt-dlp for %s", vid)
                 return jsonify({"comments": lst}), 200
         except Exception as e:
@@ -598,6 +582,7 @@ def comments():
     if js and (lst := [c["content"] for c in js.get("comments", [])]):
         comment_cache[vid] = lst
         comment_shelf[vid] = lst
+        comment_shelf.sync()
         app.logger.info("Comments fetched via Invidious for %s", vid)
         return jsonify({"comments": lst}), 200
 
