@@ -4,25 +4,47 @@
 # All transcript fetches are coordinated via a per-video_id lock to avoid race conditions.
 # The list of fallback languages is configurable via the POPULAR_LANGS environment variable (comma-separated).
 
+# Additions for improved language fallback and host cooldown logic
 import os
-import shelve
-# Persistent cache files
-PERSISTENT_TRANSCRIPT_DB = os.path.join(os.getcwd(), "transcript_cache_persistent.db")
-PERSISTENT_COMMENT_DB    = os.path.join(os.getcwd(), "comment_cache_persistent.db")
-transcript_shelf = shelve.open(PERSISTENT_TRANSCRIPT_DB)
-comment_shelf    = shelve.open(PERSISTENT_COMMENT_DB)
-# Persistent cache for analysis results
-PERSISTENT_ANALYSIS_DB = os.path.join(os.getcwd(), "analysis_cache_persistent.db")
-analysis_shelf = shelve.open(PERSISTENT_ANALYSIS_DB)
+import random
+from sqlitedict import SqliteDict
+# Persistent cache files (WAL SQLite, concurrent-safe)
+PERSISTENT_TRANSCRIPT_DB = os.path.join(os.getcwd(), "transcript_cache_persistent.sqlite")
+PERSISTENT_COMMENT_DB    = os.path.join(os.getcwd(), "comment_cache_persistent.sqlite")
+PERSISTENT_ANALYSIS_DB   = os.path.join(os.getcwd(), "analysis_cache_persistent.sqlite")
+
+transcript_shelf = SqliteDict(PERSISTENT_TRANSCRIPT_DB, tablename="transcripts", autocommit=True)
+comment_shelf    = SqliteDict(PERSISTENT_COMMENT_DB, tablename="comments", autocommit=True)
+analysis_shelf   = SqliteDict(PERSISTENT_ANALYSIS_DB, tablename="analysis", autocommit=True)
 import re
 import json
 import logging
-import time
-import itertools
 from functools import lru_cache
 from collections import deque 
 from threading import Lock
-_video_fetch_locks = {}
+from contextlib import contextmanager
+
+# Robust per-video lock helper
+_global_fetch_lock = Lock()          # guards the dictionary itself
+_video_fetch_locks: dict[str, Lock] = {}
+
+@contextmanager
+def video_lock(vid: str):
+    """
+    Ensure only ONE thread in this process fetches a given video at a time.
+    Prevents duplicate network work and keeps _video_fetch_locks from growing unbounded.
+    """
+    with _global_fetch_lock:
+        lk = _video_fetch_locks.setdefault(vid, Lock())
+    lk.acquire()
+    try:
+        yield
+    finally:
+        lk.release()
+        # prune the lock object if nobody else is waiting
+        with _global_fetch_lock:
+            if not lk.locked():
+                _video_fetch_locks.pop(vid, None)
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future
 
 from flask import Flask, request, jsonify, make_response
@@ -92,7 +114,6 @@ PROXY_ROTATION = (
     [{}]
 )
 
-import itertools
 _proxy_cycle = itertools.cycle(PROXY_ROTATION)
 def rnd_proxy() -> dict:       # always returns {"https": "..."} or {}
     return next(_proxy_cycle)
@@ -223,6 +244,24 @@ def extract_video_id(input_str: str) -> str:
     raise ValueError("Invalid YouTube URL or video ID")
 
 
+# Discover available transcript languages for a video (fast, no proxy)
+def discover_available_langs(video_id):
+    "Return sorted list of transcript languages actually present for this video (fast, no proxy)."
+    try:
+        transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
+        codes = [tr.language_code for tr in transcripts]
+        # Move English first if present
+        if "en" in codes:
+            codes.remove("en")
+            codes = ["en"] + codes
+        return codes
+    except Exception:
+        # Fallback to common popular list
+        return [
+            "en", "es", "hi", "pt", "id", "ru", "ja", "ko", "de", "fr",
+            "tr", "vi", "it", "ar", "pl", "uk", "fa", "nl", "th", "ro"
+        ]
+
 
 
 
@@ -246,6 +285,10 @@ def _fetch_resilient(video_id: str) -> str:
       5. All steps are logged for observability.
     """
     import concurrent.futures
+
+    # Graceful cooldown dicts for Piped and Invidious
+    piped_errors = {}
+    invidious_errors = {}
 
     # Allow POPULAR_LANGS override by environment variable (comma-separated)
     POPULAR_LANGS = os.getenv("POPULAR_LANGS")
@@ -307,12 +350,13 @@ def _fetch_resilient(video_id: str) -> str:
             app.logger.warning("[Transcript] yt-dlp captions track failed for %s: %s", video_id, e)
         return None
 
-    # --- Fallback: YouTubeTranscriptApi with popular languages (with Smartproxy)
-    def fetch_with_ytapi_popular_langs():
-        # Try each language, exit early on first valid transcript
-        for lang in POPULAR_LANGS:
+    # --- Fallback: YouTubeTranscriptApi with discovered languages (with Smartproxy, backoff)
+    def fetch_with_ytapi_discovered_langs():
+        langs = discover_available_langs(video_id)
+        for idx, lang in enumerate(langs):
             if lang == "en":
                 continue  # already tried in primary
+            backoff = min(2 ** idx, 10)
             try:
                 segs = _get_transcript(video_id, [lang], False)
                 text = " ".join(s["text"] for s in segs).strip()
@@ -322,11 +366,17 @@ def _fetch_resilient(video_id: str) -> str:
                 app.logger.warning("[Transcript] YouTubeTranscriptApi (%s) returned empty for %s", lang, video_id)
             except Exception as e:
                 app.logger.info("[Transcript] YouTubeTranscriptApi (%s) failed for %s: %s", lang, video_id, e)
+                # Exponential backoff between failed languages
+                time.sleep(backoff)
         return None
 
     # --- Fallback: Piped API, only use Smartproxy if needed
     def fetch_with_piped():
+        now = time.time()
         for host in list(PIPED_HOSTS):
+            # Skip host if recently errored
+            if piped_errors.get(host, 0) > now:
+                continue
             try:
                 url = f"{host}/api/v1/captions/{video_id}"
                 # Only use Smartproxy if needed (IP banned), try direct first
@@ -351,10 +401,12 @@ def _fetch_resilient(video_id: str) -> str:
                     app.logger.warning("[Transcript] No usable captions in Piped for %s (proxy=%s)", video_id, try_proxy)
             except Exception as e:
                 app.logger.warning(f"[Transcript] Piped failed at {host} for %s: %s", video_id, e)
+                piped_errors[host] = time.time() + random.randint(30, 90)  # skip 30–90s
                 continue
         app.logger.error("[Transcript] All Piped endpoints failed for %s", video_id)
         return None
 
+    # (To go fully async in the future: consider refactoring this block and all network calls with asyncio/gather.)
     # --- Run primary strategies in parallel: yt-dlp and YouTubeTranscriptApi (en)
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         future_to_method = {
@@ -383,10 +435,10 @@ def _fetch_resilient(video_id: str) -> str:
 
     app.logger.warning("[Transcript] Both primary methods failed for %s, trying YouTubeTranscriptApi fallback for popular languages.", video_id)
 
-    # --- Fallback: YouTubeTranscriptApi with top 20 most popular languages
-    ytapi_popular_result = fetch_with_ytapi_popular_langs()
-    if ytapi_popular_result and len(ytapi_popular_result) > 10:
-        return ytapi_popular_result
+    # --- Fallback: YouTubeTranscriptApi with discovered languages
+    ytapi_discovered_result = fetch_with_ytapi_discovered_langs()
+    if ytapi_discovered_result and len(ytapi_discovered_result) > 10:
+        return ytapi_discovered_result
 
     app.logger.warning("[Transcript] All YouTubeTranscriptApi strategies failed for %s, trying Piped fallback.", video_id)
 
@@ -404,8 +456,7 @@ def _get_or_spawn(video_id: str, timeout: float = 25.0) -> str:
     Ensure only one worker fetches a given transcript while others await it.
     Uses a lock per video_id to avoid race condition of launching the same fetch.
     """
-    lock = _video_fetch_locks.setdefault(video_id, Lock())
-    with lock:
+    with video_lock(video_id):
         # Check persistent shelf first
         if video_id in transcript_shelf:
             return transcript_shelf[video_id]
@@ -419,12 +470,10 @@ def _get_or_spawn(video_id: str, timeout: float = 25.0) -> str:
             result = fut.result(timeout=timeout)
             transcript_cache[video_id] = result
             transcript_shelf[video_id] = result
-            transcript_shelf.sync()
             return result
         finally:
             if fut.done():
                 _pending.pop(video_id, None)
-            _video_fetch_locks.pop(video_id, None)  # Clean up the lock
 
 # ─────────────────────────────────────────────
 # Endpoints
@@ -516,7 +565,6 @@ def comments():
     if scraped:
         comment_cache[vid] = scraped
         comment_shelf[vid] = scraped
-        comment_shelf.sync()
         app.logger.info("Comments fetched via youtube-comment-downloader for %s", vid)
         return jsonify({"comments": scraped}), 200
 
@@ -525,7 +573,6 @@ def comments():
     if js and (lst := [c["comment"] for c in js.get("comments", [])]):
         comment_cache[vid] = lst
         comment_shelf[vid] = lst
-        comment_shelf.sync()
         app.logger.info("Comments fetched via Piped for %s", vid)
         return jsonify({"comments": lst}), 200
 
@@ -537,7 +584,6 @@ def comments():
             if lst:
                 comment_cache[vid] = lst
                 comment_shelf[vid] = lst
-                comment_shelf.sync()
                 app.logger.info("Comments fetched via yt-dlp for %s", vid)
                 return jsonify({"comments": lst}), 200
         except Exception as e:
@@ -550,7 +596,6 @@ def comments():
     if js and (lst := [c["content"] for c in js.get("comments", [])]):
         comment_cache[vid] = lst
         comment_shelf[vid] = lst
-        comment_shelf.sync()
         app.logger.info("Comments fetched via Invidious for %s", vid)
         return jsonify({"comments": lst}), 200
 
@@ -568,81 +613,124 @@ def metadata():
         app.logger.error("[Metadata] invalid_video_id in request: %s", vid)
         return jsonify({"error": "invalid_video_id"}), 400
 
-    # 1) oEmbed
-    try:
-        m = session.get("https://www.youtube.com/oembed",
-                        params={"url": f"https://youtu.be/{vid}",
-                                "format": "json"}, timeout=4).json()
-        base = {
-            "title"        : m["title"],
-            "channelTitle" : m["author_name"],
-            "thumbnail"    : m["thumbnail_url"],
-            "thumbnailUrl" : m["thumbnail_url"],    # alias
-            "duration"     : None,
-            "viewCount"    : None,
-            "likeCount"    : None,
-            "videoId"      : vid,
-        }
-        if isinstance(base["title"], str):
-            base["title"] = base["title"].strip()
-        app.logger.info("[Metadata] oEmbed success for %s: title='%s', channel='%s'", vid, base['title'], base['channelTitle'])
-        return jsonify({"items":[base]}), 200
-    except Exception as e:
-        app.logger.warning("[Metadata] oEmbed failed for %s: %s", vid, e)
+    # ---------- robust multi‑provider flow ----------
+    base = {
+        "title": None,
+        "channelTitle": None,
+        "thumbnail": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+        "thumbnailUrl": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+        "duration": None,
+        "viewCount": None,
+        "likeCount": None,
+        "videoId": vid,
+    }
 
-    # 2) Piped
-    js = _fetch_json(PIPED_HOSTS, f"/api/v1/streams/{vid}", _PIPE_COOLDOWN)
-    if js:
-        base = {
-            "title"        : js.get("title"),
-            "channelTitle" : js.get("uploader"),
-            "thumbnail"    : js.get("thumbnailUrl"),
-            "thumbnailUrl" : js.get("thumbnailUrl"),
-            "duration"     : js.get("duration"),
-            "viewCount"    : js.get("views"),
-            "likeCount"    : js.get("likes"),
-            "videoId"      : vid,
-        }
-        if isinstance(base["title"], str):
-            base["title"] = base["title"].strip()
-        # Log each field and warn on suspicious/empty stats
-        app.logger.info("[Metadata] Piped success for %s: title='%s', channel='%s', views=%s, likes=%s", vid, base['title'], base['channelTitle'], base['viewCount'], base['likeCount'])
-        if not base["viewCount"] or base["viewCount"] in (0, "0", None):
-            app.logger.warning("[Metadata] Piped viewCount is missing or zero for %s", vid)
-        return jsonify({"items":[base]}), 200
+    # helper to merge fresh stats into the accumulating `base`
+    def _merge_stats(obj: dict):
+        nonlocal base
+        if obj.get("viewCount") not in (None, 0, "0", ""):
+            try:
+                vc = int(obj["viewCount"])
+                if vc > 0:
+                    base["viewCount"] = vc
+            except Exception:
+                pass
+        if obj.get("likeCount") not in (None, "", "NaN"):
+            try:
+                base["likeCount"] = int(obj["likeCount"])
+            except Exception:
+                pass
+        for k in ("title", "channelTitle", "thumbnail"):
+            if obj.get(k) and not base.get(k):
+                base[k] = obj[k]
+        base["thumbnailUrl"] = base["thumbnail"]
 
-    # 3) yt-dlp
+    # 1) oEmbed  – fast, metadata‑only (no stats)
     try:
-        yt = yt_dlp_info(vid)
-        base = {
-            "title"        : yt.get("title"),
-            "channelTitle" : yt.get("uploader"),
-            "thumbnail"    : yt.get("thumbnail"),
-            "thumbnailUrl" : yt.get("thumbnail"),
-            "duration"     : yt.get("duration"),
-            "viewCount"    : yt.get("view_count"),
-            "likeCount"    : yt.get("like_count"),
-            "videoId"      : vid,
-        }
-        if isinstance(base["title"], str):
-            base["title"] = base["title"].strip()
-        app.logger.info("[Metadata] yt-dlp success for %s: title='%s', channel='%s', views=%s, likes=%s", vid, base['title'], base['channelTitle'], base['viewCount'], base['likeCount'])
-        if not base["viewCount"] or base["viewCount"] in (0, "0", None):
-            app.logger.warning("[Metadata] yt-dlp viewCount is missing or zero for %s", vid)
-        return jsonify({"items":[base]}), 200
+        oe = session.get(
+            "https://www.youtube.com/oembed",
+            params={"url": f"https://youtu.be/{vid}", "format": "json"},
+            timeout=4,
+        ).json()
+        _merge_stats(
+            {
+                "title": oe.get("title"),
+                "channelTitle": oe.get("author_name"),
+                "thumbnail": oe.get("thumbnail_url"),
+            }
+        )
+        app.logger.info(
+            "[Metadata] oEmbed partial for %s – title='%s'", vid, base["title"]
+        )
     except Exception as e:
-        app.logger.error("[Metadata] yt-dlp failed for %s: %s", vid, e)
-        app.logger.warning("[Metadata] All metadata fallbacks failed for video %s — returning stub.", vid)
-        return jsonify({"items":[{
-            "title": "Unknown Title",
-            "channelTitle": "Unknown Channel",
-            "thumbnail": None,
-            "thumbnailUrl": None,
-            "duration": None,
-            "viewCount": None,
-            "likeCount": None,
-            "videoId": vid
-        }]}), 200
+        app.logger.debug("[Metadata] oEmbed fail for %s: %s", vid, e)
+
+    # 2) Piped  – primary stats source
+    piped = _fetch_json(PIPED_HOSTS, f"/api/v1/streams/{vid}", _PIPE_COOLDOWN)
+    if piped:
+        _merge_stats(
+            {
+                "title": piped.get("title"),
+                "channelTitle": piped.get("uploader"),
+                "thumbnail": piped.get("thumbnailUrl"),
+                "viewCount": piped.get("views"),
+                "likeCount": piped.get("likes"),
+            }
+        )
+        app.logger.info(
+            "[Metadata] Piped for %s: views=%s likes=%s",
+            vid,
+            base["viewCount"],
+            base["likeCount"],
+        )
+        if base["viewCount"]:
+            return jsonify({"items": [base]}), 200  # done ✅
+
+    # 3) Invidious  – secondary stats
+    if not base["viewCount"]:
+        iv = _fetch_json(INVIDIOUS_HOSTS, f"/api/v1/videos/{vid}", _IV_COOLDOWN)
+        if iv:
+            _merge_stats(
+                {
+                    "title": iv.get("title"),
+                    "channelTitle": iv.get("author"),
+                    "thumbnail": iv.get("thumbnail"),
+                    "viewCount": iv.get("viewCount"),
+                    "likeCount": iv.get("likeCount"),
+                }
+            )
+            app.logger.info(
+                "[Metadata] Invidious for %s: views=%s", vid, base["viewCount"]
+            )
+            if base["viewCount"]:
+                return jsonify({"items": [base]}), 200  # done ✅
+
+    # 4) yt‑dlp  – last‑resort scraper (slow)
+    if not base["viewCount"]:
+        try:
+            yt = yt_dlp_info(vid)
+            _merge_stats(
+                {
+                    "title": yt.get("title"),
+                    "channelTitle": yt.get("uploader"),
+                    "thumbnail": yt.get("thumbnail"),
+                    "viewCount": yt.get("view_count"),
+                    "likeCount": yt.get("like_count"),
+                }
+            )
+            app.logger.info(
+                "[Metadata] yt‑dlp for %s: views=%s", vid, base["viewCount"]
+            )
+        except Exception as e:
+            app.logger.warning("[Metadata] yt‑dlp fail for %s: %s", vid, e)
+
+    if not base["viewCount"]:
+        app.logger.warning(
+            "[Metadata] All providers lacked viewCount for %s – returning partial stub",
+            vid,
+        )
+
+    return jsonify({"items": [base]}), 200
 
 
 # ---------------- OpenAI RESPONSES POST (with Enhanced Logging) -----------
@@ -856,4 +944,5 @@ import atexit
 atexit.register(lambda: executor.shutdown(wait=False))
 atexit.register(lambda: transcript_shelf.close())
 atexit.register(lambda: comment_shelf.close())
+atexit.register(lambda: analysis_shelf.close())
 
