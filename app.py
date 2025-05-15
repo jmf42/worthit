@@ -562,8 +562,10 @@ def comments():
 def metadata():
     vid = request.args.get("videoId", "")
     if not vid:
+        app.logger.error("[Metadata] missing_video_id in request")
         return jsonify({"error": "missing_video_id"}), 400
     if not valid_id(vid):
+        app.logger.error("[Metadata] invalid_video_id in request: %s", vid)
         return jsonify({"error": "invalid_video_id"}), 400
 
     # 1) oEmbed
@@ -583,9 +585,10 @@ def metadata():
         }
         if isinstance(base["title"], str):
             base["title"] = base["title"].strip()
+        app.logger.info("[Metadata] oEmbed success for %s: title='%s', channel='%s'", vid, base['title'], base['channelTitle'])
         return jsonify({"items":[base]}), 200
     except Exception as e:
-        app.logger.info("oEmbed failed: %s", e)
+        app.logger.warning("[Metadata] oEmbed failed for %s: %s", vid, e)
 
     # 2) Piped
     js = _fetch_json(PIPED_HOSTS, f"/api/v1/streams/{vid}", _PIPE_COOLDOWN)
@@ -602,6 +605,10 @@ def metadata():
         }
         if isinstance(base["title"], str):
             base["title"] = base["title"].strip()
+        # Log each field and warn on suspicious/empty stats
+        app.logger.info("[Metadata] Piped success for %s: title='%s', channel='%s', views=%s, likes=%s", vid, base['title'], base['channelTitle'], base['viewCount'], base['likeCount'])
+        if not base["viewCount"] or base["viewCount"] in (0, "0", None):
+            app.logger.warning("[Metadata] Piped viewCount is missing or zero for %s", vid)
         return jsonify({"items":[base]}), 200
 
     # 3) yt-dlp
@@ -619,10 +626,13 @@ def metadata():
         }
         if isinstance(base["title"], str):
             base["title"] = base["title"].strip()
+        app.logger.info("[Metadata] yt-dlp success for %s: title='%s', channel='%s', views=%s, likes=%s", vid, base['title'], base['channelTitle'], base['viewCount'], base['likeCount'])
+        if not base["viewCount"] or base["viewCount"] in (0, "0", None):
+            app.logger.warning("[Metadata] yt-dlp viewCount is missing or zero for %s", vid)
         return jsonify({"items":[base]}), 200
     except Exception as e:
-        app.logger.error("Metadata fallback failed: %s", e)
-        app.logger.warning("All metadata fallbacks failed for video %s — returning stub.", vid)
+        app.logger.error("[Metadata] yt-dlp failed for %s: %s", vid, e)
+        app.logger.warning("[Metadata] All metadata fallbacks failed for video %s — returning stub.", vid)
         return jsonify({"items":[{
             "title": "Unknown Title",
             "channelTitle": "Unknown Channel",
