@@ -17,6 +17,8 @@ transcript_shelf = SqliteDict(PERSISTENT_TRANSCRIPT_DB, tablename="transcripts",
 comment_shelf    = SqliteDict(PERSISTENT_COMMENT_DB, tablename="comments", autocommit=True)
 analysis_shelf   = SqliteDict(PERSISTENT_ANALYSIS_DB, tablename="analysis", autocommit=True)
 import re
+import time
+import itertools
 import json
 import logging
 from functools import lru_cache
