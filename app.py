@@ -529,7 +529,7 @@ def _download_comments_downloader(video_id: str, limit: int = COMMENT_LIMIT) -> 
         return None
 
 
-@app.route("/youtube/comments")
+@app.route("/video/comments")
 def comments():
     vid = request.args.get("videoId", "")
     if not valid_id(vid):
@@ -590,7 +590,7 @@ def comments():
     return jsonify({"comments": comment_cache.get(vid, [])}), 200
 
 # ---------------- Metadata ---------------
-@app.route("/youtube/metadata")
+@app.route("/video/metadata")
 def metadata():
     vid = request.args.get("videoId", "")
     if not vid:
