@@ -800,8 +800,10 @@ def metadata():
         base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
         return jsonify({"items": [base]}), 200
 
-    # 3) Controlled yt-dlp fallback (max 20 s)
-    app.logger.info("[Metadata] Resorting to yt-dlp fallback for %s", vid)
+    # 3) Robust yt-dlp fallback, with additional proxy-aware Piped/Invidious attempts
+    app.logger.info("[Metadata] Resorting to robust yt-dlp/Piped/Invidious fallback for %s", vid)
+    fallback_success = False
+    # --- Try yt-dlp (max 20s)
     try:
         yt_future = executor.submit(yt_dlp_info, vid)
         yt = yt_future.result(timeout=20)  # hard upper-bound
@@ -815,10 +817,72 @@ def metadata():
                 "duration": yt.get("duration"),
             }
         )
+        # If we got what we need, set flag
+        if base.get("title") and base.get("viewCount") is not None:
+            fallback_success = True
     except concurrent.futures.TimeoutError:
         app.logger.error("[Metadata] yt-dlp timed out for %s", vid)
     except Exception as e:
         app.logger.warning("[Metadata] yt-dlp error for %s: %s", vid, e)
+
+    # --- If still missing essentials, try proxy-aware Piped and Invidious (rotating, up to 2 per)
+    if not (base.get("title") and base.get("viewCount") is not None):
+        import itertools
+        # Try Piped endpoints with proxy (if available), up to 2
+        piped_tried = 0
+        for host in itertools.islice(PIPED_HOSTS, 0, 2):
+            try:
+                app.logger.info("[Metadata] Fallback: Piped %s (proxy-aware) for %s", host, vid)
+                js = session.get(
+                    f"{host}/api/v1/streams/{vid}",
+                    proxies=(rnd_proxy() if SMARTPROXY_USER else {}),
+                    timeout=7,
+                ).json()
+                if "views" in js:
+                    _merge(
+                        {
+                            "title": js.get("title"),
+                            "channelTitle": js.get("uploader"),
+                            "thumbnail": js.get("thumbnailUrl"),
+                            "viewCount": js.get("views"),
+                            "likeCount": js.get("likes"),
+                            "duration": js.get("duration"),
+                        }
+                    )
+                    if base.get("title") and base.get("viewCount") is not None:
+                        fallback_success = True
+                        break
+            except Exception as e:
+                app.logger.warning("[Metadata] Fallback Piped error at %s for %s: %s", host, vid, e)
+            piped_tried += 1
+        # Try Invidious endpoints with proxy (if available), up to 2
+        if not (base.get("title") and base.get("viewCount") is not None):
+            invidious_tried = 0
+            for host in itertools.islice(INVIDIOUS_HOSTS, 0, 2):
+                try:
+                    app.logger.info("[Metadata] Fallback: Invidious %s (proxy-aware) for %s", host, vid)
+                    js = session.get(
+                        f"{host}/api/v1/videos/{vid}",
+                        proxies=(rnd_proxy() if SMARTPROXY_USER else {}),
+                        timeout=7,
+                    ).json()
+                    if "viewCount" in js:
+                        _merge(
+                            {
+                                "title": js.get("title"),
+                                "channelTitle": js.get("author"),
+                                "thumbnail": js.get("thumbnail"),
+                                "viewCount": js.get("viewCount"),
+                                "likeCount": js.get("likeCount"),
+                                "duration": js.get("lengthSeconds") or js.get("durationSeconds"),
+                            }
+                        )
+                        if base.get("title") and base.get("viewCount") is not None:
+                            fallback_success = True
+                            break
+                except Exception as e:
+                    app.logger.warning("[Metadata] Fallback Invidious error at %s for %s: %s", host, vid, e)
+                invidious_tried += 1
 
     # Final check – if still missing essentials, return 503 so client can degrade gracefully
     if base.get("title") is None or base.get("viewCount") is None:
