@@ -4,7 +4,6 @@
 # All transcript fetches are coordinated via a per-video_id lock to avoid race conditions.
 # The list of fallback languages is configurable via the POPULAR_LANGS environment variable (comma-separated).
 
-# Additions for improved language fallback and host cooldown logic
 import os
 import random
 import shelve
@@ -73,6 +72,7 @@ retry_cfg = Retry(
 session.mount("https://", HTTPAdapter(max_retries=retry_cfg))
 session.mount("http://", HTTPAdapter(max_retries=retry_cfg))
 
+#
 # ─────────────────────────────────────────────
 # App startup timestamp
 # ─────────────────────────────────────────────
@@ -123,6 +123,12 @@ INVIDIOUS_HOSTS = deque([
 ])
 _PIPE_COOLDOWN: dict[str, float] = {}
 _IV_COOLDOWN: dict[str, float] = {}
+
+# Top 10 global languages for transcript fallback (used in resilient transcript fetch)
+TOP_LANGS = [
+    "es", "hi", "pt", "id", "ru",
+    "ja", "ko", "de", "fr", "it"
+]
 
 
 
@@ -232,6 +238,7 @@ limiter = Limiter(app=app,
 transcript_cache = TTLCache(maxsize=2000, ttl=86_400)       # 24 h
 comment_cache    = TTLCache(maxsize=300, ttl=300)           # 5 min         # 10 min
 analysis_cache = TTLCache(maxsize=200, ttl=600)  # 10-minute in-memory cache for analysis
+NEGATIVE_TRANSCRIPT_CACHE = TTLCache(maxsize=5000, ttl=43_200)   # 12 h
 executor         = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 4))
 _pending: dict[str, Future] = {}  
 
@@ -305,12 +312,14 @@ def _get_transcript(vid: str, langs, preserve):
 
 
 def _fetch_resilient(video_id: str) -> str:
+    if video_id in NEGATIVE_TRANSCRIPT_CACHE:
+        return ""
     """
     Robustly fetch a transcript for the given video ID using parallel and fallback strategies:
       1. Run both yt-dlp and YouTubeTranscriptApi (English, with Smartproxy) in parallel as primary strategies.
          - yt-dlp runs without Smartproxy unless persistent rate limits are observed (option kept in code, but not default).
          - YouTubeTranscriptApi always uses Smartproxy.
-      2. If both fail, fallback: YouTubeTranscriptApi with top 20 most popular languages (global YouTube order), with Smartproxy.
+      2. If both fail, fallback: YouTubeTranscriptApi with top-10 global languages (parallel), with Smartproxy.
       3. If all above fail, fallback to Piped API, optionally with Smartproxy only if needed (i.e., if IP banned).
       4. Exit early upon first valid transcript.
       5. All steps are logged for observability.
@@ -357,10 +366,11 @@ def _fetch_resilient(video_id: str) -> str:
             first_track = next(iter(caps.values()), [])
             if first_track:
                 url = first_track[0]["url"]
-                r = session.get(url, timeout=8)
+                r = session.get(url, timeout=5)
                 r.raise_for_status()
                 if r.text.strip():
                     app.logger.info("[Transcript] Success: yt-dlp automatic_captions for %s", video_id)
+                    # return immediately on yt-dlp caption success
                     return r.text
             app.logger.warning("[Transcript] yt-dlp automatic_captions empty for %s", video_id)
         except Exception as e:
@@ -371,7 +381,7 @@ def _fetch_resilient(video_id: str) -> str:
             track = caps.get("en") or next(iter(caps.values()), [])
             if track:
                 url = track[0]["url"]
-                r = session.get(url, timeout=8)
+                r = session.get(url, timeout=5)
                 r.raise_for_status()
                 if r.text.strip():
                     app.logger.info("[Transcript] Success: yt-dlp captions track for %s", video_id)
@@ -379,26 +389,6 @@ def _fetch_resilient(video_id: str) -> str:
             app.logger.warning("[Transcript] yt-dlp captions track empty for %s", video_id)
         except Exception as e:
             app.logger.warning("[Transcript] yt-dlp captions track failed for %s: %s", video_id, e)
-        return None
-
-    # --- Fallback: YouTubeTranscriptApi with discovered languages (with Smartproxy, backoff)
-    def fetch_with_ytapi_discovered_langs():
-        langs = discover_available_langs(video_id)
-        for idx, lang in enumerate(langs):
-            if lang == "en":
-                continue  # already tried in primary
-            backoff = min(2 ** idx, 10)
-            try:
-                segs = _get_transcript(video_id, [lang], False)
-                text = " ".join(s["text"] for s in segs).strip()
-                if text:
-                    app.logger.info("[Transcript] Success: YouTubeTranscriptApi (%s) for %s", lang, video_id)
-                    return text
-                app.logger.warning("[Transcript] YouTubeTranscriptApi (%s) returned empty for %s", lang, video_id)
-            except Exception as e:
-                app.logger.info("[Transcript] YouTubeTranscriptApi (%s) failed for %s: %s", lang, video_id, e)
-                # Exponential backoff between failed languages
-                time.sleep(backoff)
         return None
 
     # --- Fallback: Piped API, only use Smartproxy if needed
@@ -414,7 +404,7 @@ def _fetch_resilient(video_id: str) -> str:
                 for try_proxy in (False, True) if SMARTPROXY_USER else (False,):
                     proxy = rnd_proxy() if try_proxy else {}
                     app.logger.info("[Transcript] Trying Piped captions at %s (proxy=%s)", url, try_proxy)
-                    r = session.get(url, proxies=proxy, timeout=6)
+                    r = session.get(url, proxies=proxy, timeout=5)
                     r.raise_for_status()
                     js = r.json()
                     # js is a list of available captions tracks (may be empty)
@@ -424,7 +414,7 @@ def _fetch_resilient(video_id: str) -> str:
                             lang_code = caption_track.get("languageCode", "")
                             # Prioritize English if possible, else take first
                             if lang_code == "en" or not js.index(caption_track):
-                                r2 = session.get(caption_url, timeout=8)
+                                r2 = session.get(caption_url, timeout=5)
                                 r2.raise_for_status()
                                 if r2.text.strip():
                                     app.logger.info(f"[Transcript] Success: Piped captions ({lang_code}) for %s (proxy={try_proxy})", video_id)
@@ -464,12 +454,42 @@ def _fetch_resilient(video_id: str) -> str:
             except Exception:
                 continue
 
-    app.logger.warning("[Transcript] Both primary methods failed for %s, trying YouTubeTranscriptApi fallback for popular languages.", video_id)
+    app.logger.warning("[Transcript] Both primary methods failed for %s, trying YouTubeTranscriptApi fallback for top-10 global languages.", video_id)
 
-    # --- Fallback: YouTubeTranscriptApi with discovered languages
-    ytapi_discovered_result = fetch_with_ytapi_discovered_langs()
-    if ytapi_discovered_result and len(ytapi_discovered_result) > 10:
-        return ytapi_discovered_result
+    # Run all top-10 fallback languages in parallel for transcript (fast, robust)
+    # --- Fallback: YouTubeTranscriptApi with top-10 global languages in parallel ---
+    def fetch_with_ytapi_top_langs():
+        import concurrent.futures
+
+        def _attempt(lang_code: str):
+            try:
+                segs = _get_transcript(video_id, [lang_code], False)
+                txt = " ".join(s["text"] for s in segs).strip()
+                if txt:
+                    app.logger.info("[Transcript] Success: YouTubeTranscriptApi (%s) for %s", lang_code, video_id)
+                    return txt
+            except (TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript):
+                pass
+            except Exception as e:
+                app.logger.debug("[Transcript] %s failed for %s: %s", lang_code, video_id, e)
+            return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(TOP_LANGS)) as pool:
+            fut_map = {pool.submit(_attempt, lang): lang for lang in TOP_LANGS}
+            done, _ = concurrent.futures.wait(
+                fut_map,
+                timeout=6,
+                return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            for fut in done:
+                res = fut.result()
+                if res:
+                    return res
+        return None
+
+    ytapi_top_result = fetch_with_ytapi_top_langs()
+    if ytapi_top_result and len(ytapi_top_result) > 10:
+        return ytapi_top_result
 
     app.logger.warning("[Transcript] All YouTubeTranscriptApi strategies failed for %s, trying Piped fallback.", video_id)
 
@@ -479,6 +499,7 @@ def _fetch_resilient(video_id: str) -> str:
         return piped_result
 
     app.logger.error("[Transcript] All transcript sources failed for %s", video_id)
+    NEGATIVE_TRANSCRIPT_CACHE[video_id] = True
     raise RuntimeError("Transcript unavailable from all sources")
 
 
@@ -763,6 +784,16 @@ def metadata():
             app.logger.warning("[Metadata] yt‑dlp fail for %s: %s", vid, e)
 
     if not base["viewCount"]:
+        try:
+            yt = yt_dlp_info(vid)
+            if yt.get("view_count"):
+                base["viewCount"] = yt["view_count"]
+                app.logger.info(
+                    "[Metadata] yt‑dlp fallback for %s: views=%s", vid, base["viewCount"]
+                )
+        except Exception as e:
+            app.logger.warning("[Metadata] yt‑dlp fallback fail for %s: %s", vid, e)
+    if not base["viewCount"]:
         app.logger.warning(
             "[Metadata] All providers lacked viewCount for %s – returning partial stub",
             vid,
@@ -881,33 +912,29 @@ analyzer = SentimentIntensityAnalyzer()
 @limiter.limit("50 per minute")
 def analyze_batch():
     app.logger.info("[VADER_BATCH] Received request.")
+    texts = request.get_json(force=True) or []
+    if not texts:
+        app.logger.info("[VADER_BATCH] Empty text list received.")
+        return jsonify([]), 200
+
+    num_texts = len(texts)
+    first_text_preview = texts[0][:50] if texts else "N/A"
+    app.logger.info(f"[VADER_BATCH] Processing {num_texts} texts. First text preview: '{first_text_preview}...'")
+
     try:
-        texts = request.get_json(force=True) or []
-        if not texts:
-            app.logger.info("[VADER_BATCH] Empty text list received.")
-            return jsonify([]), 200
-
-        num_texts = len(texts)
-        first_text_preview = texts[0][:50] if texts else "N/A"
-        app.logger.info(f"[VADER_BATCH] Processing {num_texts} texts. First text preview: '{first_text_preview}...'")
-
         results = []
         start_time = time.time()
         for i, t in enumerate(texts):
             score = analyzer.polarity_scores(t)["compound"]
             results.append(score)
-            # Optional: Log progress if needed, e.g., every 10 texts
-            # if (i + 1) % 10 == 0:
-            #    app.logger.debug(f"[VADER_BATCH] Processed {i+1}/{num_texts}...")
-
         end_time = time.time()
         duration = end_time - start_time
         app.logger.info(f"[VADER_BATCH] Successfully processed {num_texts} texts in {duration:.3f} seconds.")
         return jsonify(results), 200
-
     except Exception as e:
         app.logger.error(f"[VADER_BATCH] Error during batch processing: {e}", exc_info=True)
-        return jsonify({"error": "Failed to process batch sentiment"}), 500
+        neutral = [0.0 for _ in texts]
+        return jsonify(neutral), 200
     
 
 # ---------------- SIMPLE HEALTH CHECK ----------------
