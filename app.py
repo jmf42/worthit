@@ -25,6 +25,7 @@ from collections import deque
 from threading import Lock
 _video_fetch_locks = {}
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future, wait, FIRST_COMPLETED
+import concurrent.futures
 
 from flask import Flask, request, jsonify, make_response
 from youtube_transcript_api import (
@@ -124,6 +125,11 @@ INVIDIOUS_HOSTS = deque([
 _PIPE_COOLDOWN: dict[str, float] = {}
 _IV_COOLDOWN: dict[str, float] = {}
 
+# ── Healthy host pools (rotated & cooled down on failures) ───────────
+HEALTHY_PIPED_HOSTS     = deque(list(PIPED_HOSTS))
+HEALTHY_INVIDIOUS_HOSTS = deque(list(INVIDIOUS_HOSTS))
+HOST_COOLDOWN_SECONDS   = 1800          # 30‑minute cooldown after hard failure
+
 # Top 10 global languages for transcript fallback (used in resilient transcript fetch)
 TOP_LANGS = [
     "es", "hi", "pt", "id", "ru",
@@ -203,6 +209,7 @@ def yt_dlp_info(video_id: str):
     share the exact same exit IP.
     """
     opts = _YDL_OPTS.copy()
+    opts["socket_timeout"] = 12
     opts["proxy"] = rnd_proxy().get("https", None)
     with YoutubeDL(opts) as ydl:
         return ydl.extract_info(video_id, download=False, process=False)
@@ -615,51 +622,49 @@ def comments():
         comment_cache[vid] = cached_comments
         return jsonify({"comments": cached_comments}), 200
 
-    # 1) youtube-comment-downloader (default)
-    scraped = _download_comments_downloader(vid, COMMENT_LIMIT)
-    if scraped:
-        comment_cache[vid] = scraped
-        comment_shelf[vid] = scraped
+    # -------- Parallel fetch: downloader + Piped (fastest wins) --------
+    import concurrent.futures
+
+    def _piped_comments():
+        js = _fetch_json(
+            HEALTHY_PIPED_HOSTS,
+            f"/api/v1/comments/{vid}?cursor=0",
+            _PIPE_COOLDOWN
+        )
+        if js and js.get("comments"):
+            return [
+                c.get("comment") or c.get("commentText")
+                for c in js["comments"]
+                if c.get("comment") or c.get("commentText")
+            ] or None
+        return None
+
+    def _downloader_comments():
+        return _download_comments_downloader(vid, COMMENT_LIMIT)
+
+    fetched_comments, winner = None, "N/A"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        fut_map = {
+            pool.submit(_downloader_comments): "downloader",
+            pool.submit(_piped_comments): "piped"
+        }
+        for fut in concurrent.futures.as_completed(fut_map, timeout=15):
+            try:
+                res = fut.result()
+                if res:
+                    fetched_comments = res[:COMMENT_LIMIT]
+                    winner = fut_map[fut]
+                    break
+            except Exception:
+                continue
+
+    if fetched_comments:
+        app.logger.info("Comments fetched via %s for %s (count: %d)",
+                        winner, vid, len(fetched_comments))
+        comment_cache[vid] = fetched_comments
+        comment_shelf[vid] = fetched_comments
         comment_shelf.sync()
-        app.logger.info("Comments fetched via youtube-comment-downloader for %s", vid)
-        return jsonify({"comments": scraped}), 200
-
-    # 2) Piped
-    js = _fetch_json(PIPED_HOSTS, f"/api/v1/comments/{vid}?cursor=0", _PIPE_COOLDOWN)
-    if js and (lst := [c["comment"] for c in js.get("comments", [])]):
-        comment_cache[vid] = lst
-        comment_shelf[vid] = lst
-        comment_shelf.sync()
-        app.logger.info("Comments fetched via Piped for %s", vid)
-        return jsonify({"comments": lst}), 200
-
-    # 3) yt-dlp (only if cookies)
-    if YTDL_COOKIE_FILE:
-        try:
-            yt = yt_dlp_info(vid)
-            lst = [c["content"] for c in yt.get("comments", [])][:40]
-            if lst:
-                comment_cache[vid] = lst
-                comment_shelf[vid] = lst
-                comment_shelf.sync()
-                app.logger.info("Comments fetched via yt-dlp for %s", vid)
-                return jsonify({"comments": lst}), 200
-        except Exception as e:
-            app.logger.info("yt-dlp comments failed: %s", e)
-
-    # 4) Invidious
-    js = _fetch_json(INVIDIOUS_HOSTS,
-                     f"/api/v1/comments/{vid}?sort_by=top",
-                     _IV_COOLDOWN, proxy_aware=bool(SMARTPROXY_USER))
-    if js and (lst := [c["content"] for c in js.get("comments", [])]):
-        comment_cache[vid] = lst
-        comment_shelf[vid] = lst
-        comment_shelf.sync()
-        app.logger.info("Comments fetched via Invidious for %s", vid)
-        return jsonify({"comments": lst}), 200
-
-    app.logger.info("All comment sources failed for %s", vid)
-    return jsonify({"comments": comment_cache.get(vid, [])}), 200
+        return jsonify({"comments": fetched_comments}), 200
 
 # ---------------- Metadata ---------------
 @app.route("/video/metadata")
@@ -702,7 +707,6 @@ def metadata():
         for k in ("title", "channelTitle", "thumbnail"):
             if obj.get(k) and not base.get(k):
                 base[k] = obj[k]
-        base["thumbnailUrl"] = base["thumbnail"]
 
     # 1) oEmbed  – fast, metadata‑only (no stats)
     try:
@@ -724,6 +728,51 @@ def metadata():
     except Exception as e:
         app.logger.debug("[Metadata] oEmbed fail for %s: %s", vid, e)
 
+    # ---- Quick attempt (≤3 s) against 1‑2 healthy Piped/Invidious hosts ----
+    if base.get("viewCount") is None:
+        quick_piped = _fetch_json(
+            HEALTHY_PIPED_HOSTS,
+            f"/api/v1/streams/{vid}",
+            _PIPE_COOLDOWN,
+            hard_deadline=3.0
+        )
+        if quick_piped and quick_piped.get("views") is not None:
+            _merge_stats({
+                "title": quick_piped.get("title"),
+                "channelTitle": quick_piped.get("uploader"),
+                "thumbnail": quick_piped.get("thumbnailUrl"),
+                "viewCount": quick_piped.get("views"),
+                "likeCount": quick_piped.get("likes"),
+                "duration": quick_piped.get("duration"),
+            })
+            app.logger.info("[Metadata] Quick Piped success for %s (views=%s)",
+                            vid, base["viewCount"])
+
+    if base.get("viewCount") is None:
+        quick_iv = _fetch_json(
+            HEALTHY_INVIDIOUS_HOSTS,
+            f"/api/v1/videos/{vid}",
+            _IV_COOLDOWN,
+            proxy_aware=bool(SMARTPROXY_USER),
+            hard_deadline=3.0
+        )
+        if quick_iv and quick_iv.get("viewCount") is not None:
+            _merge_stats({
+                "title": quick_iv.get("title"),
+                "channelTitle": quick_iv.get("author"),
+                "thumbnail": quick_iv.get("thumbnail"),
+                "viewCount": quick_iv.get("viewCount"),
+                "likeCount": quick_iv.get("likeCount"),
+                "duration": quick_iv.get("durationSeconds"),
+            })
+            app.logger.info("[Metadata] Quick Invidious success for %s (views=%s)",
+                            vid, base["viewCount"])
+
+    # If we have both a title and a confirmed (even zero) viewCount, return fast.
+    if base.get("title") and base.get("viewCount") is not None:
+        base["thumbnailUrl"] = base["thumbnail"]
+        return jsonify({"items": [base]}), 200
+
     # 2) Piped  – primary stats source
     piped = _fetch_json(PIPED_HOSTS, f"/api/v1/streams/{vid}", _PIPE_COOLDOWN)
     if piped:
@@ -743,6 +792,8 @@ def metadata():
             base["likeCount"],
         )
         if base["viewCount"]:
+            if not base.get("thumbnailUrl"):
+                base["thumbnailUrl"] = base["thumbnail"]
             return jsonify({"items": [base]}), 200  # done ✅
 
     # 3) Invidious  – secondary stats
@@ -762,6 +813,8 @@ def metadata():
                 "[Metadata] Invidious for %s: views=%s", vid, base["viewCount"]
             )
             if base["viewCount"]:
+                if not base.get("thumbnailUrl"):
+                    base["thumbnailUrl"] = base["thumbnail"]
                 return jsonify({"items": [base]}), 200  # done ✅
 
     # 4) yt‑dlp  – last‑resort scraper (slow)
@@ -798,6 +851,9 @@ def metadata():
             "[Metadata] All providers lacked viewCount for %s – returning partial stub",
             vid,
         )
+
+    if not base.get("thumbnailUrl"):
+        base["thumbnailUrl"] = base["thumbnail"]
 
     return jsonify({"items": [base]}), 200
 
