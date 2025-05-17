@@ -105,8 +105,8 @@ YTDL_COOKIE_FILE = None      # Force‑disable cookie usage so yt‑dlp never se
 # ------------------------------------------------------------------
 # How long the Flask route will wait for a background transcript job
 # before returning HTTP 202 (pending).  Can be overridden with
-# TRANSCRIPT_FETCH_TIMEOUT env‑var – default is 45 s (was 25 s).
-TRANSCRIPT_FETCH_TIMEOUT = int(os.getenv("TRANSCRIPT_FETCH_TIMEOUT", "45"))
+# TRANSCRIPT_FETCH_TIMEOUT env‑var – default is 25 s.
+TRANSCRIPT_FETCH_TIMEOUT = int(os.getenv("TRANSCRIPT_FETCH_TIMEOUT", "25"))
 
 # Maximum comments to retrieve per video (overridable via env)
 COMMENT_LIMIT = int(os.getenv("COMMENT_LIMIT", "120"))
@@ -382,6 +382,34 @@ def _fetch_resilient(video_id: str) -> str:
     
     import concurrent.futures
 
+    # Primary: Piped API (fast path)
+    piped_primary = fetch_with_piped()
+    if piped_primary and len(piped_primary) > 10:
+        return piped_primary
+
+    # Lightweight HTML scrape fallback
+    def fetch_with_html_scrape():
+        try:
+            resp = session.get(f"https://www.youtube.com/watch?v={video_id}", timeout=3)
+            resp.raise_for_status()
+            html = resp.text
+            m = re.search(r'"captionTracks":\s*(\[\{.*?\}\])', html)
+            if m:
+                tracks = json.loads(m.group(1))
+                base_url = tracks[0].get("baseUrl")
+                if base_url:
+                    r2 = session.get(base_url, timeout=3)
+                    r2.raise_for_status()
+                    # strip XML tags to plain text
+                    return "".join(re.findall(r'<text[^>]*>(.*?)</text>', r2.text))
+        except Exception:
+            return None
+        return None
+
+    scraped = fetch_with_html_scrape()
+    if scraped and len(scraped) > 10:
+        return scraped
+
     # Graceful cooldown dicts for Piped and Invidious
     piped_errors = {}
     invidious_errors = {}
@@ -491,7 +519,7 @@ def _fetch_resilient(video_id: str) -> str:
             executor.submit(fetch_with_ytdlp): "ytdlp"
         }
         done, not_done = concurrent.futures.wait(
-            future_to_method, timeout=18, return_when=concurrent.futures.FIRST_COMPLETED
+            future_to_method, timeout=4, return_when=concurrent.futures.FIRST_COMPLETED
         )
         # Try to get first success result
         for fut in done:
@@ -504,7 +532,7 @@ def _fetch_resilient(video_id: str) -> str:
         # If neither succeeded, wait for both to complete and see if any succeeded (edge case)
         for fut in not_done:
             try:
-                res = fut.result(timeout=4)
+                res = fut.result(timeout=2)
                 if res and len(res) > 10:
                     return res
             except Exception:
@@ -534,7 +562,7 @@ def _fetch_resilient(video_id: str) -> str:
             fut_map = {pool.submit(_attempt, lang): lang for lang in TOP_LANGS}
             done, _ = concurrent.futures.wait(
                 fut_map,
-                timeout=6,
+                timeout=4,
                 return_when=concurrent.futures.FIRST_COMPLETED
             )
             for fut in done:
