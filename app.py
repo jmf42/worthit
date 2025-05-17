@@ -220,6 +220,18 @@ def yt_dlp_info(video_id: str):
 app = Flask(__name__)
 CORS(app)
 
+# ── Shelve helper ────────────────────────────────────────────
+def _safe_put(shelf, key, value):
+    """
+    Safely write to a shelve object.  Any corruption or I/O errors are
+    caught so that a single failure does not crash the whole request.
+    """
+    try:
+        shelf[key] = value
+        shelf.sync()
+    except Exception as e:  # catches gdbm.error, shelve error, etc.
+        app.logger.error("Shelve write error for key %s: %s", key, e)
+        
 # ── Minimal inbound access log ────────────────────
 @app.before_request
 def _access_log():
@@ -319,8 +331,6 @@ def _get_transcript(vid: str, langs, preserve):
 
 
 def _fetch_resilient(video_id: str) -> str:
-    if video_id in NEGATIVE_TRANSCRIPT_CACHE:
-        return ""
     """
     Robustly fetch a transcript for the given video ID using parallel and fallback strategies:
       1. Run both yt-dlp and YouTubeTranscriptApi (English, with Smartproxy) in parallel as primary strategies.
@@ -331,6 +341,9 @@ def _fetch_resilient(video_id: str) -> str:
       4. Exit early upon first valid transcript.
       5. All steps are logged for observability.
     """
+    if video_id in NEGATIVE_TRANSCRIPT_CACHE:
+        return ""
+    
     import concurrent.futures
 
     # Graceful cooldown dicts for Piped and Invidious
@@ -529,8 +542,7 @@ def _get_or_spawn(video_id: str, timeout: float = 25.0) -> str:
         try:
             result = fut.result(timeout=timeout)
             transcript_cache[video_id] = result
-            transcript_shelf[video_id] = result
-            transcript_shelf.sync()
+            _safe_put(transcript_shelf, video_id, result)
             return result
         finally:
             if fut.done():
@@ -662,22 +674,19 @@ def comments():
         app.logger.info("Comments fetched via %s for %s (count: %d)",
                         winner, vid, len(fetched_comments))
         comment_cache[vid] = fetched_comments
-        comment_shelf[vid] = fetched_comments
-        comment_shelf.sync()
+        _safe_put(comment_shelf, vid, fetched_comments)
         return jsonify({"comments": fetched_comments}), 200
+        # If we get here, all comment sources failed
+    app.logger.error("All comment sources failed for %s", vid)
+    return jsonify({"error": "Could not retrieve comments"}), 503
 
 # ---------------- Metadata ---------------
 @app.route("/video/metadata")
 def metadata():
     vid = request.args.get("videoId", "")
-    if not vid:
-        app.logger.error("[Metadata] missing_video_id in request")
-        return jsonify({"error": "missing_video_id"}), 400
     if not valid_id(vid):
-        app.logger.error("[Metadata] invalid_video_id in request: %s", vid)
         return jsonify({"error": "invalid_video_id"}), 400
 
-    # ---------- robust multi‑provider flow ----------
     base = {
         "title": None,
         "channelTitle": None,
@@ -689,8 +698,8 @@ def metadata():
         "videoId": vid,
     }
 
-    # helper to merge fresh stats into the accumulating `base`
-    def _merge_stats(obj: dict):
+    # Helper to merge fresh stats into the accumulating `base`
+    def _merge(obj: dict):
         nonlocal base
         if obj.get("viewCount") not in (None, 0, "0", ""):
             try:
@@ -708,155 +717,121 @@ def metadata():
             if obj.get(k) and not base.get(k):
                 base[k] = obj[k]
 
-    # 1) oEmbed  – fast, metadata‑only (no stats)
+    # 1) Very fast oEmbed lookup (metadata only)
     try:
         oe = session.get(
             "https://www.youtube.com/oembed",
             params={"url": f"https://youtu.be/{vid}", "format": "json"},
             timeout=4,
         ).json()
-        _merge_stats(
+        _merge(
             {
                 "title": oe.get("title"),
                 "channelTitle": oe.get("author_name"),
                 "thumbnail": oe.get("thumbnail_url"),
             }
         )
-        app.logger.info(
-            "[Metadata] oEmbed partial for %s – title='%s'", vid, base["title"]
-        )
+        app.logger.info("[Metadata] oEmbed partial for %s – title='%s'", vid, base["title"])
     except Exception as e:
         app.logger.debug("[Metadata] oEmbed fail for %s: %s", vid, e)
 
-    # ---- Quick attempt (≤3 s) against 1‑2 healthy Piped/Invidious hosts ----
+    # 2) Concurrent quick check (one healthy Piped + one healthy Invidious) with tight budget
     if base.get("viewCount") is None:
-        quick_piped = _fetch_json(
-            HEALTHY_PIPED_HOSTS,
-            f"/api/v1/streams/{vid}",
-            _PIPE_COOLDOWN,
-            hard_deadline=3.0
-        )
-        if quick_piped and quick_piped.get("views") is not None:
-            _merge_stats({
-                "title": quick_piped.get("title"),
-                "channelTitle": quick_piped.get("uploader"),
-                "thumbnail": quick_piped.get("thumbnailUrl"),
-                "viewCount": quick_piped.get("views"),
-                "likeCount": quick_piped.get("likes"),
-                "duration": quick_piped.get("duration"),
-            })
-            app.logger.info("[Metadata] Quick Piped success for %s (views=%s)",
-                            vid, base["viewCount"])
+        app.logger.info("[Metadata] Quick Piped/Invidious for essential stats on %s", vid)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = []
+            if HEALTHY_PIPED_HOSTS:
+                futures.append(
+                    pool.submit(
+                        _fetch_json,
+                        deque([HEALTHY_PIPED_HOSTS[0]]),
+                        f"/api/v1/streams/{vid}",
+                        _PIPE_COOLDOWN,
+                        hard_deadline=3.0,
+                    )
+                )
+            if HEALTHY_INVIDIOUS_HOSTS:
+                futures.append(
+                    pool.submit(
+                        _fetch_json,
+                        deque([HEALTHY_INVIDIOUS_HOSTS[0]]),
+                        f"/api/v1/videos/{vid}",
+                        _IV_COOLDOWN,
+                        proxy_aware=bool(SMARTPROXY_USER),
+                        hard_deadline=3.0,
+                    )
+                )
+            try:
+                for fut in concurrent.futures.as_completed(futures, timeout=3.5):
+                    data = fut.result()
+                    if not data:
+                        continue
+                    # Piped shape
+                    if "views" in data:
+                        _merge(
+                            {
+                                "title": data.get("title"),
+                                "channelTitle": data.get("uploader"),
+                                "thumbnail": data.get("thumbnailUrl"),
+                                "viewCount": data.get("views"),
+                                "likeCount": data.get("likes"),
+                                "duration": data.get("duration"),
+                            }
+                        )
+                    # Invidious shape
+                    elif "viewCount" in data:
+                        _merge(
+                            {
+                                "title": data.get("title"),
+                                "channelTitle": data.get("author"),
+                                "thumbnail": data.get("thumbnail"),
+                                "viewCount": data.get("viewCount"),
+                                "likeCount": data.get("likeCount"),
+                                "duration": data.get("lengthSeconds") or data.get("durationSeconds"),
+                            }
+                        )
+                    if base.get("title") and base.get("viewCount") is not None:
+                        break  # we have enough
+            except Exception as e:
+                app.logger.warning("[Metadata] Quick concurrent check failed for %s: %s", vid, e)
 
-    if base.get("viewCount") is None:
-        quick_iv = _fetch_json(
-            HEALTHY_INVIDIOUS_HOSTS,
-            f"/api/v1/videos/{vid}",
-            _IV_COOLDOWN,
-            proxy_aware=bool(SMARTPROXY_USER),
-            hard_deadline=3.0
-        )
-        if quick_iv and quick_iv.get("viewCount") is not None:
-            _merge_stats({
-                "title": quick_iv.get("title"),
-                "channelTitle": quick_iv.get("author"),
-                "thumbnail": quick_iv.get("thumbnail"),
-                "viewCount": quick_iv.get("viewCount"),
-                "likeCount": quick_iv.get("likeCount"),
-                "duration": quick_iv.get("durationSeconds"),
-            })
-            app.logger.info("[Metadata] Quick Invidious success for %s (views=%s)",
-                            vid, base["viewCount"])
-
-    # If we have both a title and a confirmed (even zero) viewCount, return fast.
+    # If we now have title and viewCount, respond immediately.
     if base.get("title") and base.get("viewCount") is not None:
-        base["thumbnailUrl"] = base["thumbnail"]
+        base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
         return jsonify({"items": [base]}), 200
 
-    # 2) Piped  – primary stats source
-    piped = _fetch_json(PIPED_HOSTS, f"/api/v1/streams/{vid}", _PIPE_COOLDOWN)
-    if piped:
-        _merge_stats(
+    # 3) Controlled yt-dlp fallback (max 20 s)
+    app.logger.info("[Metadata] Resorting to yt-dlp fallback for %s", vid)
+    try:
+        yt_future = executor.submit(yt_dlp_info, vid)
+        yt = yt_future.result(timeout=20)  # hard upper-bound
+        _merge(
             {
-                "title": piped.get("title"),
-                "channelTitle": piped.get("uploader"),
-                "thumbnail": piped.get("thumbnailUrl"),
-                "viewCount": piped.get("views"),
-                "likeCount": piped.get("likes"),
+                "title": yt.get("title"),
+                "channelTitle": yt.get("uploader"),
+                "thumbnail": yt.get("thumbnail"),
+                "viewCount": yt.get("view_count"),
+                "likeCount": yt.get("like_count"),
+                "duration": yt.get("duration"),
             }
         )
-        app.logger.info(
-            "[Metadata] Piped for %s: views=%s likes=%s",
-            vid,
-            base["viewCount"],
-            base["likeCount"],
-        )
-        if base["viewCount"]:
-            if not base.get("thumbnailUrl"):
-                base["thumbnailUrl"] = base["thumbnail"]
-            return jsonify({"items": [base]}), 200  # done ✅
+    except concurrent.futures.TimeoutError:
+        app.logger.error("[Metadata] yt-dlp timed out for %s", vid)
+    except Exception as e:
+        app.logger.warning("[Metadata] yt-dlp error for %s: %s", vid, e)
 
-    # 3) Invidious  – secondary stats
-    if not base["viewCount"]:
-        iv = _fetch_json(INVIDIOUS_HOSTS, f"/api/v1/videos/{vid}", _IV_COOLDOWN)
-        if iv:
-            _merge_stats(
-                {
-                    "title": iv.get("title"),
-                    "channelTitle": iv.get("author"),
-                    "thumbnail": iv.get("thumbnail"),
-                    "viewCount": iv.get("viewCount"),
-                    "likeCount": iv.get("likeCount"),
-                }
-            )
-            app.logger.info(
-                "[Metadata] Invidious for %s: views=%s", vid, base["viewCount"]
-            )
-            if base["viewCount"]:
-                if not base.get("thumbnailUrl"):
-                    base["thumbnailUrl"] = base["thumbnail"]
-                return jsonify({"items": [base]}), 200  # done ✅
-
-    # 4) yt‑dlp  – last‑resort scraper (slow)
-    if not base["viewCount"]:
-        try:
-            yt = yt_dlp_info(vid)
-            _merge_stats(
-                {
-                    "title": yt.get("title"),
-                    "channelTitle": yt.get("uploader"),
-                    "thumbnail": yt.get("thumbnail"),
-                    "viewCount": yt.get("view_count"),
-                    "likeCount": yt.get("like_count"),
-                }
-            )
-            app.logger.info(
-                "[Metadata] yt‑dlp for %s: views=%s", vid, base["viewCount"]
-            )
-        except Exception as e:
-            app.logger.warning("[Metadata] yt‑dlp fail for %s: %s", vid, e)
-
-    if not base["viewCount"]:
-        try:
-            yt = yt_dlp_info(vid)
-            if yt.get("view_count"):
-                base["viewCount"] = yt["view_count"]
-                app.logger.info(
-                    "[Metadata] yt‑dlp fallback for %s: views=%s", vid, base["viewCount"]
-                )
-        except Exception as e:
-            app.logger.warning("[Metadata] yt‑dlp fallback fail for %s: %s", vid, e)
-    if not base["viewCount"]:
-        app.logger.warning(
-            "[Metadata] All providers lacked viewCount for %s – returning partial stub",
+    # Final check – if still missing essentials, return 503 so client can degrade gracefully
+    if base.get("title") is None or base.get("viewCount") is None:
+        app.logger.error(
+            "[Metadata] Unrecoverable: missing essential metadata for %s after all strategies. Returning 503.",
             vid,
         )
+        return jsonify({"error": "Could not retrieve essential video metadata"}), 503
 
-    if not base.get("thumbnailUrl"):
-        base["thumbnailUrl"] = base["thumbnail"]
-
+    base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
     return jsonify({"items": [base]}), 200
 
+   
 
 # ---------------- OpenAI RESPONSES POST (with Enhanced Logging) -----------
 @app.route("/openai/responses", methods=["POST"])
