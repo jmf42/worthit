@@ -92,9 +92,17 @@ SMARTPROXY_HOST  = "gate.smartproxy.com"
 SMARTPROXY_PORT  = "10000"
 SMARTPROXY_API_TOKEN = os.getenv("SMARTPROXY_API_TOKEN")
 
-OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY")
-YOUTUBE_DATA_API_KEY = os.getenv("YOUTUBE_API_KEY")
-YTDL_COOKIE_FILE     = os.getenv("YTDL_COOKIE_FILE")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# ✂️  Removed reliance on the official YouTube Data API and on local cookie files
+YTDL_COOKIE_FILE = None      # Force‑disable cookie usage so yt‑dlp never sends personal cookies
+
+# ------------------------------------------------------------------
+# Runtime tunables (env‑driven)
+# ------------------------------------------------------------------
+# How long the Flask route will wait for a background transcript job
+# before returning HTTP 202 (pending).  Can be overridden with
+# TRANSCRIPT_FETCH_TIMEOUT env‑var – default is 45 s (was 25 s).
+TRANSCRIPT_FETCH_TIMEOUT = int(os.getenv("TRANSCRIPT_FETCH_TIMEOUT", "45"))
 
 # Maximum comments to retrieve per video (overridable via env)
 COMMENT_LIMIT = int(os.getenv("COMMENT_LIMIT", "120"))
@@ -206,7 +214,6 @@ _YDL_OPTS = {
     "forcejson": True,
     "socket_timeout": 8,
     "retries": 1,
-    **({"cookiefile": YTDL_COOKIE_FILE} if YTDL_COOKIE_FILE else {}),
 }
 
 def yt_dlp_info(video_id: str):
@@ -548,7 +555,7 @@ def _fetch_resilient(video_id: str) -> str:
     raise RuntimeError("Transcript unavailable from all sources")
 
 
-def _get_or_spawn(video_id: str, timeout: float = 25.0) -> str:
+def _get_or_spawn(video_id: str, timeout: float = TRANSCRIPT_FETCH_TIMEOUT) -> str:
     """
     Ensure only one worker fetches a given transcript while others await it.
     Uses a lock per video_id to avoid race condition of launching the same fetch.
@@ -732,13 +739,15 @@ def metadata():
     # Helper to merge fresh stats into the accumulating `base`
     def _merge(obj: dict):
         nonlocal base
-        if obj.get("viewCount") not in (None, 0, "0", ""):
-            try:
-                vc = int(obj["viewCount"])
-                if vc > 0:
-                    base["viewCount"] = vc
-            except Exception:
-                pass
+        # viewCount == 0 is almost always a sign that the mirror failed to
+        # scrape the stats.  Ignore anything that is missing or ≤ 0.
+        vc_raw = obj.get("viewCount")
+        try:
+            vc = int(vc_raw) if vc_raw not in (None, "", "NaN") else None
+        except Exception:
+            vc = None
+        if vc and vc > 0:
+            base["viewCount"] = vc
         if obj.get("likeCount") not in (None, "", "NaN"):
             try:
                 base["likeCount"] = int(obj["likeCount"])
@@ -918,6 +927,12 @@ def metadata():
                     app.logger.warning("[Metadata] Fallback Invidious error at %s for %s: %s", host, vid, e)
                 invidious_tried += 1
 
+    # yt‑dlp / some mirrors occasionally return the literal string
+    # 'Untitled Video' when they cannot access the metadata.  Treat it
+    # as missing so the fallback logic keeps running.
+    if base.get("title") == "Untitled Video":
+        base["title"] = None
+
     # Final check – if still missing essentials, return 503 so client can degrade gracefully
     if base.get("title") is None or base.get("viewCount") is None:
         app.logger.error(
@@ -929,6 +944,7 @@ def metadata():
     base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
     metadata_cache[vid] = base
     _safe_put(metadata_shelf, vid, base)
+    # Calculated engagementScore (guard is above)
     return jsonify({"items": [base]}), 200
 
    
@@ -1081,10 +1097,12 @@ def health_check():
 @app.route("/health/deep", methods=["GET"])
 def deep_health_check():
     checks = {}
+    # NOTE: The service no longer calls the official YouTube Data API,
+    # which improves robustness on high‑volume deployments that can’t
+    # obtain or refresh API quotas.
     # env
     checks['env'] = {
         'OPENAI_KEY': bool(OPENAI_API_KEY),
-        'YOUTUBE_KEY': bool(YOUTUBE_DATA_API_KEY),
         'SMARTPROXY_TOKEN': bool(SMARTPROXY_API_TOKEN)
     }
     # external
@@ -1094,13 +1112,7 @@ def deep_health_check():
         checks['external']['openai_api'] = r.status_code == 200
     except Exception:
         checks['external']['openai_api'] = False
-    try:
-        r = session.get("https://www.googleapis.com/youtube/v3/videos",
-                        params={'id':'dQw4w9WgXcQ','part':'id','key':YOUTUBE_DATA_API_KEY},
-                        timeout=5)
-        checks['external']['youtube_api'] = r.status_code == 200
-    except Exception:
-        checks['external']['youtube_api'] = False
+    checks['external']['youtube_api'] = None  # skipped – official API disabled
     try:
         r = session.post("https://dashboard.smartproxy.com/subscription-api/v1/api/public/statistics/traffic",
                          json={"proxyType":"residential_proxies","limit":1},
