@@ -7,6 +7,7 @@
 import os
 import random
 import shelve
+import os
 # Persistent cache files
 PERSISTENT_TRANSCRIPT_DB = os.path.join(os.getcwd(), "transcript_cache_persistent.db")
 PERSISTENT_COMMENT_DB    = os.path.join(os.getcwd(), "comment_cache_persistent.db")
@@ -15,6 +16,9 @@ PERSISTENT_ANALYSIS_DB   = os.path.join(os.getcwd(), "analysis_cache_persistent.
 transcript_shelf = shelve.open(PERSISTENT_TRANSCRIPT_DB)
 comment_shelf    = shelve.open(PERSISTENT_COMMENT_DB)
 analysis_shelf   = shelve.open(PERSISTENT_ANALYSIS_DB)
+# Persistent metadata cache
+PERSISTENT_METADATA_DB = os.path.join(os.getcwd(), "metadata_cache_persistent.db")
+metadata_shelf = shelve.open(PERSISTENT_METADATA_DB)
 import re
 import time
 import itertools
@@ -260,10 +264,14 @@ def _rate_limit_key():
     ua = request.headers.get("User-Agent", "")
     return f"{get_remote_address()}-{hash(ua) % 1000}"
 
-limiter = Limiter(app=app,
-                  key_func=_rate_limit_key,
-                  default_limits=["200 per hour", "50 per minute"],
-                  headers_enabled=True)
+redis_url = os.getenv("REDIS_URL")
+limiter = Limiter(
+    app=app,
+    key_func=_rate_limit_key,
+    default_limits=["200 per hour", "50 per minute"],
+    headers_enabled=True,
+    storage_uri=redis_url
+)
 
 # --------------------------------------------------
 # Worker pool / cache
@@ -275,9 +283,6 @@ analysis_cache = TTLCache(maxsize=200, ttl=600)  # 10-minute in-memory cache for
 ytdl_cache     = TTLCache(maxsize=1000, ttl=900)
 metadata_cache = TTLCache(maxsize=2000, ttl=900)
 NEGATIVE_TRANSCRIPT_CACHE = TTLCache(maxsize=5000, ttl=43_200)   # 12 h
-# 15-minute caches for yt-dlp info and metadata
-ytdl_cache     = TTLCache(maxsize=1000, ttl=900)
-metadata_cache = TTLCache(maxsize=2000, ttl=900)
 executor         = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 4))
 _pending: dict[str, Future] = {}  
 
@@ -704,9 +709,12 @@ def comments():
 @app.route("/video/metadata")
 def metadata():
     vid = request.args.get("videoId", "")
+    # Check persistent metadata shelf
+    if vid in metadata_shelf:
+        return jsonify({"items": [metadata_shelf[vid]]}), 200
     # Hot metadata cache (15 min)
     if vid in metadata_cache:
-     return jsonify({"items": [metadata_cache[vid]]}), 200
+        return jsonify({"items": [metadata_cache[vid]]}), 200
     if not valid_id(vid):
         return jsonify({"error": "invalid_video_id"}), 400
 
@@ -823,15 +831,16 @@ def metadata():
         base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
         # Store hot cache so subsequent requests finish instantly
         metadata_cache[vid] = base
+        _safe_put(metadata_shelf, vid, base)
         return jsonify({"items": [base]}), 200
 
     # 3) Robust yt-dlp fallback, with additional proxy-aware Piped/Invidious attempts
     app.logger.info("[Metadata] Resorting to robust yt-dlp/Piped/Invidious fallback for %s", vid)
     fallback_success = False
-    # --- Try yt-dlp (max 20s)
+    # --- Try yt-dlp (max 10s)
     try:
         yt_future = executor.submit(yt_dlp_info, vid)
-        yt = yt_future.result(timeout=20)  # hard upper-bound
+        yt = yt_future.result(timeout=10)  # hard upper-bound
         _merge(
             {
                 "title": yt.get("title"),
@@ -919,6 +928,7 @@ def metadata():
 
     base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
     metadata_cache[vid] = base
+    _safe_put(metadata_shelf, vid, base)
     return jsonify({"items": [base]}), 200
 
    
@@ -1004,17 +1014,21 @@ def create_response():
         return jsonify(response_data), resp.status_code
 
     except requests.HTTPError as he:
-        # Log the specific HTTP error from OpenAI
-        err_msg = f"OpenAI API HTTP error: Status Code {he.response.status_code if he.response else 'N/A'}"
+        status = he.response.status_code if he.response else 500
+        err_msg = f"OpenAI API HTTP error: Status Code {status}"
         err_details = resp.text[:1000] if resp else "No response object"
         app.logger.error(f"[OpenAI Proxy /responses] {err_msg}. Details: {err_details}", exc_info=True)
         clean_details = err_details
-        try: # Try to parse standard OpenAI error format
+        try:
             error_json = json.loads(err_details)
-            if isinstance(error_json, dict) and "error" in error_json and isinstance(error_json["error"], dict) and "message" in error_json["error"]:
-                 clean_details = error_json["error"]["message"]
-        except: pass # Keep original details if parsing fails
-        return jsonify({'error': 'OpenAI API error', 'details': clean_details}), he.response.status_code if he.response is not None else 500
+            clean_details = error_json.get("error", {}).get("message", clean_details)
+        except:
+            pass
+        headers = {}
+        retry_after = resp.headers.get("Retry-After") if resp else None
+        if status == 429 and retry_after:
+            headers["Retry-After"] = retry_after
+        return (jsonify({'error': 'OpenAI API error', 'details': clean_details}), status, headers)
     except requests.exceptions.RequestException as req_err:
         # Handle network errors (timeout, connection error, etc.)
         app.logger.error(f"[OpenAI Proxy /responses] Network error connecting to OpenAI: {req_err}", exc_info=True)
