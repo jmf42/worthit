@@ -5,6 +5,10 @@
 # The list of fallback languages is configurable via the POPULAR_LANGS environment variable (comma-separated).
 
 import os
+# Gunicorn’s default worker timeout is 30 s; keep our worst‑case
+# request below that by capping every external call at ≤ 5 s and
+# limiting fallback attempts.  If you change these values, remember
+# to adjust your `timeout` setting in Render / Heroku accordingly.
 import random
 import shelve
 import os
@@ -212,8 +216,8 @@ _YDL_OPTS = {
     "user_agent": BROWSER_UA,
     "extract_flat": True,
     "forcejson": True,
-    "socket_timeout": 8,
-    "retries": 1,
+    "socket_timeout": 5,   # was 8  → keep each read fast
+    "retries": 0,          # was 1  → fail‑fast so Gunicorn doesn’t time‑out
 }
 
 def yt_dlp_info(video_id: str):
@@ -871,15 +875,15 @@ def metadata():
     # --- If still missing essentials, try proxy-aware Piped and Invidious (rotating, up to 2 per)
     if not (base.get("title") and base.get("viewCount") is not None):
         import itertools
-        # Try Piped endpoints with proxy (if available), up to 2
+        # Try Piped endpoints with proxy (if available), up to 1 (was 2)
         piped_tried = 0
-        for host in itertools.islice(PIPED_HOSTS, 0, 2):
+        for host in itertools.islice(PIPED_HOSTS, 0, 1):
             try:
                 app.logger.info("[Metadata] Fallback: Piped %s (proxy-aware) for %s", host, vid)
                 js = session.get(
                     f"{host}/api/v1/streams/{vid}",
                     proxies=(rnd_proxy() if SMARTPROXY_USER else {}),
-                    timeout=7,
+                    timeout=5,
                 ).json()
                 if "views" in js:
                     _merge(
@@ -898,16 +902,16 @@ def metadata():
             except Exception as e:
                 app.logger.warning("[Metadata] Fallback Piped error at %s for %s: %s", host, vid, e)
             piped_tried += 1
-        # Try Invidious endpoints with proxy (if available), up to 2
+        # Try Invidious endpoints with proxy (if available), up to 1 (was 2)
         if not (base.get("title") and base.get("viewCount") is not None):
             invidious_tried = 0
-            for host in itertools.islice(INVIDIOUS_HOSTS, 0, 2):
+            for host in itertools.islice(INVIDIOUS_HOSTS, 0, 1):
                 try:
                     app.logger.info("[Metadata] Fallback: Invidious %s (proxy-aware) for %s", host, vid)
                     js = session.get(
                         f"{host}/api/v1/videos/{vid}",
                         proxies=(rnd_proxy() if SMARTPROXY_USER else {}),
-                        timeout=7,
+                        timeout=5,
                     ).json()
                     if "viewCount" in js:
                         _merge(
