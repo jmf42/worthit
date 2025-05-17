@@ -141,7 +141,7 @@ TOP_LANGS = [
 def _fetch_json(hosts: deque, path: str,
                 cooldown: dict[str, float],
                 proxy_aware: bool = False,
-                hard_deadline: float = 6.0):
+                hard_deadline: float = 3.0):
     """
     Query up to 4 candidate hosts concurrently and return
     the first successful JSON response.  Hosts that error
@@ -198,21 +198,35 @@ _YDL_OPTS = {
     "skip_download": True,
     "innertube_key": "AIzaSyA-DkzGi-tv79Q",
     "user_agent": BROWSER_UA,
+    "extract_flat": True,
+    "forcejson": True,
+    "socket_timeout": 8,
+    "retries": 1,
     **({"cookiefile": YTDL_COOKIE_FILE} if YTDL_COOKIE_FILE else {}),
 }
 
-# Light wrapper around yt‑dlp that injects a fresh proxy on every call so hundreds of concurrent users don’t all share the exact same exit IP.
 def yt_dlp_info(video_id: str):
     """
-    Light wrapper around yt‑dlp that injects a fresh proxy
-    on every call so hundreds of concurrent users don’t all
-    share the exact same exit IP.
+    Thin wrapper around yt-dlp that
+      • returns a cached JSON blob if we fetched the same video
+        in the last 15 minutes,
+      • injects a fresh proxy on every cold fetch,
+      • uses aggressive time-outs so we fail fast when the exit IP
+        is rate-limited.
     """
+    if video_id in ytdl_cache:
+        return ytdl_cache[video_id]
+
     opts = _YDL_OPTS.copy()
-    opts["socket_timeout"] = 12
     opts["proxy"] = rnd_proxy().get("https", None)
+
     with YoutubeDL(opts) as ydl:
-        return ydl.extract_info(video_id, download=False, process=False)
+        info = ydl.extract_info(video_id, download=False, process=False)
+
+    # Cache only if we obtained a sensible response (title present)
+    if info.get("title"):
+        ytdl_cache[video_id] = info
+    return info
 
 # --------------------------------------------------
 # Flask init
@@ -257,7 +271,13 @@ limiter = Limiter(app=app,
 transcript_cache = TTLCache(maxsize=2000, ttl=86_400)       # 24 h
 comment_cache    = TTLCache(maxsize=300, ttl=300)           # 5 min         # 10 min
 analysis_cache = TTLCache(maxsize=200, ttl=600)  # 10-minute in-memory cache for analysis
+# 15-minute caches for yt-dlp info and metadata
+ytdl_cache     = TTLCache(maxsize=1000, ttl=900)
+metadata_cache = TTLCache(maxsize=2000, ttl=900)
 NEGATIVE_TRANSCRIPT_CACHE = TTLCache(maxsize=5000, ttl=43_200)   # 12 h
+# 15-minute caches for yt-dlp info and metadata
+ytdl_cache     = TTLCache(maxsize=1000, ttl=900)
+metadata_cache = TTLCache(maxsize=2000, ttl=900)
 executor         = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 4))
 _pending: dict[str, Future] = {}  
 
@@ -684,6 +704,9 @@ def comments():
 @app.route("/video/metadata")
 def metadata():
     vid = request.args.get("videoId", "")
+    # Hot metadata cache (15 min)
+    if vid in metadata_cache:
+     return jsonify({"items": [metadata_cache[vid]]}), 200
     if not valid_id(vid):
         return jsonify({"error": "invalid_video_id"}), 400
 
@@ -798,6 +821,8 @@ def metadata():
     # If we now have title and viewCount, respond immediately.
     if base.get("title") and base.get("viewCount") is not None:
         base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
+        # Store hot cache so subsequent requests finish instantly
+        metadata_cache[vid] = base
         return jsonify({"items": [base]}), 200
 
     # 3) Robust yt-dlp fallback, with additional proxy-aware Piped/Invidious attempts
@@ -893,6 +918,7 @@ def metadata():
         return jsonify({"error": "Could not retrieve essential video metadata"}), 503
 
     base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
+    metadata_cache[vid] = base
     return jsonify({"items": [base]}), 200
 
    
