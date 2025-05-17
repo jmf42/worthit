@@ -25,7 +25,7 @@ from functools import lru_cache
 from collections import deque 
 from threading import Lock
 _video_fetch_locks = {}
-from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future, wait, FIRST_COMPLETED
 
 from flask import Flask, request, jsonify, make_response
 from youtube_transcript_api import (
@@ -50,6 +50,15 @@ import functools
 from youtube_comment_downloader import YoutubeCommentDownloader  # fallback comments scraper
 
 session = requests.Session()
+
+# ── Global browser UA to dodge anti‑bot filters ─────────────
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+session.headers.update({"User-Agent": BROWSER_UA})
+
 session.request = functools.partial(session.request, timeout=10)
 retry_cfg = Retry(
     total=3,                # retry up to 3 times for any error type
@@ -87,8 +96,8 @@ COMMENT_LIMIT = int(os.getenv("COMMENT_LIMIT", "120"))
 
 PROXY_ROTATION = (
     [
-        {"https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:10000"},
-        {"https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:10001"},
+        {"https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:{10000+i}"}
+        for i in range(20)
     ]
     if SMARTPROXY_USER else
     [{}]
@@ -116,32 +125,59 @@ _PIPE_COOLDOWN: dict[str, float] = {}
 _IV_COOLDOWN: dict[str, float] = {}
 
 
+
 def _fetch_json(hosts: deque, path: str,
                 cooldown: dict[str, float],
                 proxy_aware: bool = False,
                 hard_deadline: float = 6.0):
-    # Track last successful host access time
+    """
+    Query up to 4 candidate hosts concurrently and return
+    the first successful JSON response.  Hosts that error
+    are put on cool‑down (5 min for network errors,
+    10 min for malformed bodies).
+    """
     host_success = getattr(_fetch_json, "_host_success", {})
     _fetch_json._host_success = host_success
-    deadline = time.time() + hard_deadline
-    for host in sorted(hosts, key=lambda h: -host_success.get(h, 0)):
-        if time.time() >= deadline:
-            break
-        if cooldown.get(host, 0) > time.time():
-            continue
-        url = f"{host}{path}"
-        proxy = rnd_proxy() if proxy_aware else {}
-        app.logger.info("[OUT] → %s", url)
-        try:
-            r = session.get(url, proxies=proxy, timeout=1)
-            r.raise_for_status()
-            if "application/json" not in r.headers.get("Content-Type", ""):
-                raise ValueError("non-JSON body")
-            host_success[host] = time.time()
-            return r.json()
-        except Exception as e:
-            app.logger.warning("Host %s failed: %s", host, e)
-            cooldown[host] = time.time() + (600 if isinstance(e, ValueError) else 300)
+
+    now = time.time()
+    # Pick hosts not on cool‑down, best past success first
+    candidates = [
+        h for h in sorted(hosts, key=lambda h: -host_success.get(h, 0))
+        if cooldown.get(h, 0) <= now
+    ][:4]  # race at most 4
+
+    if not candidates:
+        return None
+
+    with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+        future_to_host = {
+            pool.submit(
+                session.get,
+                f"{h}{path}",
+                proxies=(rnd_proxy() if proxy_aware else {}),
+                timeout=3
+            ): h
+            for h in candidates
+        }
+
+        done, _ = wait(future_to_host.keys(),
+                       timeout=hard_deadline,
+                       return_when=FIRST_COMPLETED)
+
+        for fut in done:
+            host = future_to_host[fut]
+            try:
+                r = fut.result()
+                r.raise_for_status()
+                if "application/json" not in r.headers.get("Content-Type", ""):
+                    raise ValueError("non‑JSON body")
+                host_success[host] = time.time()  # mark good
+                return r.json()
+            except Exception as e:
+                app.logger.warning("Host %s failed: %s", host, e)
+                cooldown[host] = time.time() + (
+                    600 if isinstance(e, ValueError) else 300
+                )
     return None
 
 
@@ -149,11 +185,20 @@ _YDL_OPTS = {
     "quiet": True,
     "skip_download": True,
     "innertube_key": "AIzaSyA-DkzGi-tv79Q",
+    "user_agent": BROWSER_UA,
     **({"cookiefile": YTDL_COOKIE_FILE} if YTDL_COOKIE_FILE else {}),
 }
 
+# Light wrapper around yt‑dlp that injects a fresh proxy on every call so hundreds of concurrent users don’t all share the exact same exit IP.
 def yt_dlp_info(video_id: str):
-    with YoutubeDL(_YDL_OPTS) as ydl:
+    """
+    Light wrapper around yt‑dlp that injects a fresh proxy
+    on every call so hundreds of concurrent users don’t all
+    share the exact same exit IP.
+    """
+    opts = _YDL_OPTS.copy()
+    opts["proxy"] = rnd_proxy().get("https", None)
+    with YoutubeDL(opts) as ydl:
         return ydl.extract_info(video_id, download=False, process=False)
 
 # --------------------------------------------------
@@ -170,15 +215,21 @@ def _access_log():
 # --------------------------------------------------
 # Rate limiting
 # --------------------------------------------------
+# Combine remote IP with a hash of User‑Agent to avoid grouping
+# every device on one home router into a single limiter bucket.
+def _rate_limit_key():
+    ua = request.headers.get("User-Agent", "")
+    return f"{get_remote_address()}-{hash(ua) % 1000}"
+
 limiter = Limiter(app=app,
-                  key_func=get_remote_address,
+                  key_func=_rate_limit_key,
                   default_limits=["200 per hour", "50 per minute"],
                   headers_enabled=True)
 
 # --------------------------------------------------
 # Worker pool / cache
 # --------------------------------------------------
-transcript_cache = TTLCache(maxsize=500, ttl=600)           # 10 min
+transcript_cache = TTLCache(maxsize=2000, ttl=86_400)       # 24 h
 comment_cache    = TTLCache(maxsize=300, ttl=300)           # 5 min         # 10 min
 analysis_cache = TTLCache(maxsize=200, ttl=600)  # 10-minute in-memory cache for analysis
 executor         = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 4))
