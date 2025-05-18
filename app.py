@@ -382,6 +382,42 @@ def _fetch_resilient(video_id: str) -> str:
     
     import concurrent.futures
 
+    # --- Fallback: Piped API, only use Smartproxy if needed
+    def fetch_with_piped():
+        now = time.time()
+        for host in list(PIPED_HOSTS):
+            # Skip host if recently errored
+            if piped_errors.get(host, 0) > now:
+                continue
+            try:
+                url = f"{host}/api/v1/captions/{video_id}"
+                # Only use Smartproxy if needed (IP banned), try direct first
+                for try_proxy in (False, True) if SMARTPROXY_USER else (False,):
+                    proxy = rnd_proxy() if try_proxy else {}
+                    app.logger.info("[Transcript] Trying Piped captions at %s (proxy=%s)", url, try_proxy)
+                    r = session.get(url, proxies=proxy, timeout=5)
+                    r.raise_for_status()
+                    js = r.json()
+                    # js is a list of available captions tracks (may be empty)
+                    for caption_track in js:
+                        if caption_track.get("url"):
+                            caption_url = caption_track["url"]
+                            lang_code = caption_track.get("languageCode", "")
+                            # Prioritize English if possible, else take first
+                            if lang_code == "en" or not js.index(caption_track):
+                                r2 = session.get(caption_url, timeout=5)
+                                r2.raise_for_status()
+                                if r2.text.strip():
+                                    app.logger.info(f"[Transcript] Success: Piped captions ({lang_code}) for %s (proxy={try_proxy})", video_id)
+                                    return r2.text
+                    app.logger.warning("[Transcript] No usable captions in Piped for %s (proxy=%s)", video_id, try_proxy)
+            except Exception as e:
+                app.logger.warning(f"[Transcript] Piped failed at {host} for %s: %s", video_id, e)
+                piped_errors[host] = time.time() + random.randint(30, 90)  # skip 30–90s
+                continue
+        app.logger.error("[Transcript] All Piped endpoints failed for %s", video_id)
+        return None
+
     # Primary: Piped API (fast path)
     piped_primary = fetch_with_piped()
     if piped_primary and len(piped_primary) > 10:
@@ -475,41 +511,6 @@ def _fetch_resilient(video_id: str) -> str:
             app.logger.warning("[Transcript] yt-dlp captions track failed for %s: %s", video_id, e)
         return None
 
-    # --- Fallback: Piped API, only use Smartproxy if needed
-    def fetch_with_piped():
-        now = time.time()
-        for host in list(PIPED_HOSTS):
-            # Skip host if recently errored
-            if piped_errors.get(host, 0) > now:
-                continue
-            try:
-                url = f"{host}/api/v1/captions/{video_id}"
-                # Only use Smartproxy if needed (IP banned), try direct first
-                for try_proxy in (False, True) if SMARTPROXY_USER else (False,):
-                    proxy = rnd_proxy() if try_proxy else {}
-                    app.logger.info("[Transcript] Trying Piped captions at %s (proxy=%s)", url, try_proxy)
-                    r = session.get(url, proxies=proxy, timeout=5)
-                    r.raise_for_status()
-                    js = r.json()
-                    # js is a list of available captions tracks (may be empty)
-                    for caption_track in js:
-                        if caption_track.get("url"):
-                            caption_url = caption_track["url"]
-                            lang_code = caption_track.get("languageCode", "")
-                            # Prioritize English if possible, else take first
-                            if lang_code == "en" or not js.index(caption_track):
-                                r2 = session.get(caption_url, timeout=5)
-                                r2.raise_for_status()
-                                if r2.text.strip():
-                                    app.logger.info(f"[Transcript] Success: Piped captions ({lang_code}) for %s (proxy={try_proxy})", video_id)
-                                    return r2.text
-                    app.logger.warning("[Transcript] No usable captions in Piped for %s (proxy=%s)", video_id, try_proxy)
-            except Exception as e:
-                app.logger.warning(f"[Transcript] Piped failed at {host} for %s: %s", video_id, e)
-                piped_errors[host] = time.time() + random.randint(30, 90)  # skip 30–90s
-                continue
-        app.logger.error("[Transcript] All Piped endpoints failed for %s", video_id)
-        return None
 
     # (To go fully async in the future: consider refactoring this block and all network calls with asyncio/gather.)
     # --- Run primary strategies in parallel: yt-dlp and YouTubeTranscriptApi (en)
