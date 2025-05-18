@@ -59,7 +59,9 @@ app_start_time = time.time()
 # --------------------------------------------------
 SMARTPROXY_USER  = os.getenv("SMARTPROXY_USER")
 SMARTPROXY_PASS  = os.getenv("SMARTPROXY_PASS")
-SMARTPROXY_HOST  = "gate.smartproxy.com"
+# Use password exactly as given in the environment variable (do not URL encode)
+# SMARTPROXY_PASS is already set from os.getenv above
+SMARTPROXY_HOST  = "gate.decodo.com"
 SMARTPROXY_PORT  = "10000"
 SMARTPROXY_API_TOKEN = os.getenv("SMARTPROXY_API_TOKEN")
 
