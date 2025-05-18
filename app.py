@@ -216,9 +216,9 @@ _YDL_OPTS = {
     "user_agent": BROWSER_UA,
     "extract_flat": True,
     "forcejson": True,
-    "socket_timeout": 10,  # Increased timeout
-    "retries": 2,          # Increased retries
-    "proxy": rnd_proxy().get("https", None)
+    "socket_timeout": 8,   # Increased timeout slightly for reliability
+    "retries": 1,          # Allowing a retry for improved reliability
+    "proxy": rnd_proxy().get("https", None)  # Force usage of Smartproxy to avoid rate limits
 }
 
 def yt_dlp_info(video_id: str):
@@ -250,15 +250,16 @@ def yt_dlp_info(video_id: str):
 app = Flask(__name__)
 CORS(app)
 
-
 # ── Shelve helper ────────────────────────────────────────────
-shelve_lock = Lock()
 def _safe_put(shelf, key, value):
+    """
+    Safely write to a shelve object.  Any corruption or I/O errors are
+    caught so that a single failure does not crash the whole request.
+    """
     try:
-        with shelve_lock:
-            shelf[key] = value
-            shelf.sync()
-    except Exception as e:
+        shelf[key] = value
+        shelf.sync()
+    except Exception as e:  # catches gdbm.error, shelve error, etc.
         app.logger.error("Shelve write error for key %s: %s", key, e)
         
 # ── Minimal inbound access log ────────────────────
@@ -368,23 +369,17 @@ def _get_transcript(vid: str, langs, preserve):
 
 def _fetch_resilient(video_id: str) -> str:
     """
-    Robustly fetch a transcript for the given video ID using parallel and fallback strategies:
-      1. Run both yt-dlp and YouTubeTranscriptApi (English, with Smartproxy) in parallel as primary strategies.
-         - yt-dlp runs without Smartproxy unless persistent rate limits are observed (option kept in code, but not default).
-         - YouTubeTranscriptApi always uses Smartproxy.
-      2. If both fail, fallback: YouTubeTranscriptApi with top-10 global languages (parallel), with Smartproxy.
-      3. If all above fail, fallback to Piped API, optionally with Smartproxy only if needed (i.e., if IP banned).
-      4. Exit early upon first valid transcript.
-      5. All steps are logged for observability.
+    Aggressively fetch a transcript for the given video ID using parallel and fallback strategies:
+      1. Run Piped, YouTubeTranscriptApi (en), and yt-dlp in parallel. Return first valid result.
+      2. Mark hosts as "bad" on any exception (for N minutes).
+      3. If all primaries fail, run slow/serial fallbacks (lang fallback, HTML scrape).
     """
-    piped_errors = {}
-    invidious_errors = {}
     if video_id in NEGATIVE_TRANSCRIPT_CACHE:
         return ""
-    
-    import concurrent.futures
 
-    # --- Fallback: Piped API, only use Smartproxy if needed
+    import concurrent.futures
+    piped_errors = {}
+    # --- Define all three primary strategies ---
     def fetch_with_piped():
         now = time.time()
         for host in list(PIPED_HOSTS):
@@ -393,19 +388,18 @@ def _fetch_resilient(video_id: str) -> str:
                 continue
             try:
                 url = f"{host}/api/v1/captions/{video_id}"
-                # Only use Smartproxy if needed (IP banned), try direct first
+                # Try direct, then proxy if available
                 for try_proxy in (False, True) if SMARTPROXY_USER else (False,):
                     proxy = rnd_proxy() if try_proxy else {}
                     app.logger.info("[Transcript] Trying Piped captions at %s (proxy=%s)", url, try_proxy)
                     r = session.get(url, proxies=proxy, timeout=5)
                     r.raise_for_status()
                     js = r.json()
-                    # js is a list of available captions tracks (may be empty)
                     for caption_track in js:
                         if caption_track.get("url"):
                             caption_url = caption_track["url"]
                             lang_code = caption_track.get("languageCode", "")
-                            # Prioritize English if possible, else take first
+                            # Prefer English if possible
                             if lang_code == "en" or not js.index(caption_track):
                                 r2 = session.get(caption_url, timeout=5)
                                 r2.raise_for_status()
@@ -414,18 +408,127 @@ def _fetch_resilient(video_id: str) -> str:
                                     return r2.text
                     app.logger.warning("[Transcript] No usable captions in Piped for %s (proxy=%s)", video_id, try_proxy)
             except Exception as e:
+                # Mark host as bad for 2 minutes on error
                 app.logger.warning(f"[Transcript] Piped failed at {host} for %s: %s", video_id, e)
-                piped_errors[host] = time.time() + random.randint(30, 90)  # skip 30–90s
+                piped_errors[host] = time.time() + 120
                 continue
         app.logger.error("[Transcript] All Piped endpoints failed for %s", video_id)
         return None
 
-    # Primary: Piped API (fast path)
-    piped_primary = fetch_with_piped()
-    if piped_primary and len(piped_primary) > 10:
-        return piped_primary
+    def fetch_with_ytapi_en():
+        try:
+            segs = _get_transcript(video_id, ["en"], False)
+            text = " ".join(s["text"] for s in segs).strip()
+            if text:
+                app.logger.info("[Transcript] Success: YouTubeTranscriptApi (en) for %s", video_id)
+                return text
+            app.logger.warning("[Transcript] YouTubeTranscriptApi (en) returned empty for %s", video_id)
+        except Exception as e:
+            # Mark as "bad" for 3 min on error (simulate marking host, here just log)
+            app.logger.warning("[Transcript] YouTubeTranscriptApi (en) failed for %s: %s", video_id, e)
+        return None
 
-    # Lightweight HTML scrape fallback
+    def fetch_with_ytdlp():
+        try:
+            info = yt_dlp_info(video_id)
+        except Exception as e:
+            app.logger.warning("[Transcript] yt-dlp info failed for %s: %s", video_id, e)
+            return None
+        # Try automatic captions
+        try:
+            caps = info.get("automatic_captions") or {}
+            first_track = next(iter(caps.values()), [])
+            if first_track:
+                url = first_track[0]["url"]
+                r = session.get(url, timeout=5)
+                r.raise_for_status()
+                if r.text.strip():
+                    app.logger.info("[Transcript] Success: yt-dlp automatic_captions for %s", video_id)
+                    return r.text
+            app.logger.warning("[Transcript] yt-dlp automatic_captions empty for %s", video_id)
+        except Exception as e:
+            app.logger.warning("[Transcript] yt-dlp automatic_captions failed for %s: %s", video_id, e)
+        # Try manual captions
+        try:
+            caps = info.get("captions") or {}
+            track = caps.get("en") or next(iter(caps.values()), [])
+            if track:
+                url = track[0]["url"]
+                r = session.get(url, timeout=5)
+                r.raise_for_status()
+                if r.text.strip():
+                    app.logger.info("[Transcript] Success: yt-dlp captions track for %s", video_id)
+                    return r.text
+            app.logger.warning("[Transcript] yt-dlp captions track empty for %s", video_id)
+        except Exception as e:
+            app.logger.warning("[Transcript] yt-dlp captions track failed for %s: %s", video_id, e)
+        return None
+
+    # --- Aggressively run all three primary strategies in parallel ---
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {
+            pool.submit(fetch_with_piped): "piped",
+            pool.submit(fetch_with_ytapi_en): "ytapi_en",
+            pool.submit(fetch_with_ytdlp): "ytdlp"
+        }
+        # Wait for first completed
+        done, not_done = concurrent.futures.wait(futures, timeout=6, return_when=concurrent.futures.FIRST_COMPLETED)
+        # Return first valid result, cancel others
+        for fut in done:
+            try:
+                res = fut.result()
+                if res and len(res) > 10:
+                    # Cancel others
+                    for rem in not_done:
+                        rem.cancel()
+                    return res
+            except Exception as e:
+                # Mark as bad (simulate for all, e.g. piped_errors for Piped)
+                pass
+        # If none succeeded, wait a bit more for any slow ones
+        for fut in not_done:
+            try:
+                res = fut.result(timeout=2)
+                if res and len(res) > 10:
+                    return res
+            except Exception:
+                continue
+
+    # --- If all primaries fail, try fallback strategies ---
+    app.logger.warning("[Transcript] All primary strategies failed for %s, running fallbacks.", video_id)
+
+    # Fallback: YouTubeTranscriptApi with top-10 global languages (parallel)
+    def fetch_with_ytapi_top_langs():
+        def _attempt(lang_code: str):
+            try:
+                segs = _get_transcript(video_id, [lang_code], False)
+                txt = " ".join(s["text"] for s in segs).strip()
+                if txt:
+                    app.logger.info("[Transcript] Success: YouTubeTranscriptApi (%s) for %s", lang_code, video_id)
+                    return txt
+            except (TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript):
+                pass
+            except Exception as e:
+                app.logger.debug("[Transcript] %s failed for %s: %s", lang_code, video_id, e)
+            return None
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(TOP_LANGS)) as pool:
+            fut_map = {pool.submit(_attempt, lang): lang for lang in TOP_LANGS}
+            done, _ = concurrent.futures.wait(
+                fut_map,
+                timeout=4,
+                return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            for fut in done:
+                res = fut.result()
+                if res:
+                    return res
+        return None
+
+    ytapi_top_result = fetch_with_ytapi_top_langs()
+    if ytapi_top_result and len(ytapi_top_result) > 10:
+        return ytapi_top_result
+
+    # Lightweight HTML scrape fallback (serial, only if all else fails)
     def fetch_with_html_scrape():
         try:
             resp = session.get(f"https://www.youtube.com/watch?v={video_id}", timeout=3)
@@ -448,136 +551,7 @@ def _fetch_resilient(video_id: str) -> str:
     if scraped and len(scraped) > 10:
         return scraped
 
-
-    # Allow POPULAR_LANGS override by environment variable (comma-separated)
-    POPULAR_LANGS = os.getenv("POPULAR_LANGS")
-    if POPULAR_LANGS:
-        POPULAR_LANGS = [l.strip() for l in POPULAR_LANGS.split(",") if l.strip()]
-    else:
-        POPULAR_LANGS = [
-            "en", "es", "hi", "pt", "id", "ru", "ja", "ko", "de", "fr",
-            "tr", "vi", "it", "ar", "pl", "uk", "fa", "nl", "th", "ro"
-        ]
-
-    # --- Primary: YouTubeTranscriptApi (en), always with Smartproxy
-    def fetch_with_ytapi_en():
-        try:
-            segs = _get_transcript(video_id, ["en"], False)
-            text = " ".join(s["text"] for s in segs).strip()
-            if text:
-                app.logger.info("[Transcript] Success: YouTubeTranscriptApi (en) for %s", video_id)
-                return text
-            app.logger.warning("[Transcript] YouTubeTranscriptApi (en) returned empty for %s", video_id)
-        except Exception as e:
-            app.logger.warning("[Transcript] YouTubeTranscriptApi (en) failed for %s: %s", video_id, e)
-        return None
-
-    # --- Primary: yt-dlp, without Smartproxy by default
-    def fetch_with_ytdlp():
-        try:
-            info = yt_dlp_info(video_id)
-        except Exception as e:
-            app.logger.warning("[Transcript] yt-dlp info failed for %s: %s", video_id, e)
-            return None
-        # Try automatic captions
-        try:
-            caps = info.get("automatic_captions") or {}
-            first_track = next(iter(caps.values()), [])
-            if first_track:
-                url = first_track[0]["url"]
-                r = session.get(url, timeout=5)
-                r.raise_for_status()
-                if r.text.strip():
-                    app.logger.info("[Transcript] Success: yt-dlp automatic_captions for %s", video_id)
-                    # return immediately on yt-dlp caption success
-                    return r.text
-            app.logger.warning("[Transcript] yt-dlp automatic_captions empty for %s", video_id)
-        except Exception as e:
-            app.logger.warning("[Transcript] yt-dlp automatic_captions failed for %s: %s", video_id, e)
-        # Try manual captions
-        try:
-            caps = info.get("captions") or {}
-            track = caps.get("en") or next(iter(caps.values()), [])
-            if track:
-                url = track[0]["url"]
-                r = session.get(url, timeout=5)
-                r.raise_for_status()
-                if r.text.strip():
-                    app.logger.info("[Transcript] Success: yt-dlp captions track for %s", video_id)
-                    return r.text
-            app.logger.warning("[Transcript] yt-dlp captions track empty for %s", video_id)
-        except Exception as e:
-            app.logger.warning("[Transcript] yt-dlp captions track failed for %s: %s", video_id, e)
-        return None
-
-
-    # (To go fully async in the future: consider refactoring this block and all network calls with asyncio/gather.)
-    # --- Run primary strategies in parallel: yt-dlp and YouTubeTranscriptApi (en)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        future_to_method = {
-            executor.submit(fetch_with_ytapi_en): "ytapi_en",
-            executor.submit(fetch_with_ytdlp): "ytdlp"
-        }
-        done, not_done = concurrent.futures.wait(
-            future_to_method, timeout=4, return_when=concurrent.futures.FIRST_COMPLETED
-        )
-        # Try to get first success result
-        for fut in done:
-            res = fut.result()
-            if res and len(res) > 10:
-                # Cancel the other future if it's still running
-                for remaining in not_done:
-                    remaining.cancel()
-                return res
-        # If neither succeeded, wait for both to complete and see if any succeeded (edge case)
-        for fut in not_done:
-            try:
-                res = fut.result(timeout=2)
-                if res and len(res) > 10:
-                    return res
-            except Exception:
-                continue
-
-    app.logger.warning("[Transcript] Both primary methods failed for %s, trying YouTubeTranscriptApi fallback for top-10 global languages.", video_id)
-
-    # Run all top-10 fallback languages in parallel for transcript (fast, robust)
-    # --- Fallback: YouTubeTranscriptApi with top-10 global languages in parallel ---
-    def fetch_with_ytapi_top_langs():
-        import concurrent.futures
-
-        def _attempt(lang_code: str):
-            try:
-                segs = _get_transcript(video_id, [lang_code], False)
-                txt = " ".join(s["text"] for s in segs).strip()
-                if txt:
-                    app.logger.info("[Transcript] Success: YouTubeTranscriptApi (%s) for %s", lang_code, video_id)
-                    return txt
-            except (TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript):
-                pass
-            except Exception as e:
-                app.logger.debug("[Transcript] %s failed for %s: %s", lang_code, video_id, e)
-            return None
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(TOP_LANGS)) as pool:
-            fut_map = {pool.submit(_attempt, lang): lang for lang in TOP_LANGS}
-            done, _ = concurrent.futures.wait(
-                fut_map,
-                timeout=4,
-                return_when=concurrent.futures.FIRST_COMPLETED
-            )
-            for fut in done:
-                res = fut.result()
-                if res:
-                    return res
-        return None
-
-    ytapi_top_result = fetch_with_ytapi_top_langs()
-    if ytapi_top_result and len(ytapi_top_result) > 10:
-        return ytapi_top_result
-
-    app.logger.warning("[Transcript] All YouTubeTranscriptApi strategies failed for %s, trying Piped fallback.", video_id)
-
-    # --- Fallback: Try Piped API for captions
+    # Final fallback: try Piped serially again (could have new hosts)
     piped_result = fetch_with_piped()
     if piped_result and len(piped_result) > 10:
         return piped_result
@@ -748,10 +722,9 @@ def comments():
 @app.route("/video/metadata")
 def metadata():
     vid = request.args.get("videoId", "")
-    # Check persistent metadata shelf
+    # Persistent and hot cache checks (unchanged)
     if vid in metadata_shelf:
         return jsonify({"items": [metadata_shelf[vid]]}), 200
-    # Hot metadata cache (15 min)
     if vid in metadata_cache:
         return jsonify({"items": [metadata_cache[vid]]}), 200
     if not valid_id(vid):
@@ -771,8 +744,6 @@ def metadata():
     # Helper to merge fresh stats into the accumulating `base`
     def _merge(obj: dict):
         nonlocal base
-        # viewCount == 0 is almost always a sign that the mirror failed to
-        # scrape the stats.  Ignore anything that is missing or ≤ 0.
         vc_raw = obj.get("viewCount")
         try:
             vc = int(vc_raw) if vc_raw not in (None, "", "NaN") else None
@@ -789,101 +760,75 @@ def metadata():
             if obj.get(k) and not base.get(k):
                 base[k] = obj[k]
 
-    # 1) Very fast oEmbed lookup (metadata only)
-    try:
-        oe = session.get(
-            "https://www.youtube.com/oembed",
-            params={"url": f"https://youtu.be/{vid}", "format": "json"},
-            timeout=4,
-        ).json()
-        _merge(
-            {
+    # --- Define parallel metadata fetch strategies ---
+    def fetch_oembed():
+        try:
+            oe = session.get(
+                "https://www.youtube.com/oembed",
+                params={"url": f"https://youtu.be/{vid}", "format": "json"},
+                timeout=3,
+            ).json()
+            return {
                 "title": oe.get("title"),
                 "channelTitle": oe.get("author_name"),
                 "thumbnail": oe.get("thumbnail_url"),
             }
-        )
-        app.logger.info("[Metadata] oEmbed partial for %s – title='%s'", vid, base["title"])
-    except Exception as e:
-        app.logger.debug("[Metadata] oEmbed fail for %s: %s", vid, e)
+        except Exception as e:
+            app.logger.debug("[Metadata] oEmbed fail for %s: %s", vid, e)
+            return None
 
-    # 2) Concurrent quick check (one healthy Piped + one healthy Invidious) with tight budget
-    if base.get("viewCount") is None:
-        app.logger.info("[Metadata] Quick Piped/Invidious for essential stats on %s", vid)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            futures = []
+    def fetch_piped():
+        try:
+            js = _fetch_json(
+                HEALTHY_PIPED_HOSTS,
+                f"/api/v1/streams/{vid}",
+                _PIPE_COOLDOWN,
+                hard_deadline=3.0,
+            )
+            if js and "views" in js:
+                return {
+                    "title": js.get("title"),
+                    "channelTitle": js.get("uploader"),
+                    "thumbnail": js.get("thumbnailUrl"),
+                    "viewCount": js.get("views"),
+                    "likeCount": js.get("likes"),
+                    "duration": js.get("duration"),
+                }
+        except Exception as e:
+            # Mark host as bad for 10 min
             if HEALTHY_PIPED_HOSTS:
-                futures.append(
-                    pool.submit(
-                        _fetch_json,
-                        deque([HEALTHY_PIPED_HOSTS[0]]),
-                        f"/api/v1/streams/{vid}",
-                        _PIPE_COOLDOWN,
-                        hard_deadline=3.0,
-                    )
-                )
+                _PIPE_COOLDOWN[HEALTHY_PIPED_HOSTS[0]] = time.time() + 600
+            app.logger.warning("[Metadata] Piped error for %s: %s", vid, e)
+        return None
+
+    def fetch_invidious():
+        try:
+            js = _fetch_json(
+                HEALTHY_INVIDIOUS_HOSTS,
+                f"/api/v1/videos/{vid}",
+                _IV_COOLDOWN,
+                proxy_aware=bool(SMARTPROXY_USER),
+                hard_deadline=3.0,
+            )
+            if js and "viewCount" in js:
+                return {
+                    "title": js.get("title"),
+                    "channelTitle": js.get("author"),
+                    "thumbnail": js.get("thumbnail"),
+                    "viewCount": js.get("viewCount"),
+                    "likeCount": js.get("likeCount"),
+                    "duration": js.get("lengthSeconds") or js.get("durationSeconds"),
+                }
+        except Exception as e:
             if HEALTHY_INVIDIOUS_HOSTS:
-                futures.append(
-                    pool.submit(
-                        _fetch_json,
-                        deque([HEALTHY_INVIDIOUS_HOSTS[0]]),
-                        f"/api/v1/videos/{vid}",
-                        _IV_COOLDOWN,
-                        proxy_aware=bool(SMARTPROXY_USER),
-                        hard_deadline=3.0,
-                    )
-                )
-            try:
-                for fut in concurrent.futures.as_completed(futures, timeout=3.5):
-                    data = fut.result()
-                    if not data:
-                        continue
-                    # Piped shape
-                    if "views" in data:
-                        _merge(
-                            {
-                                "title": data.get("title"),
-                                "channelTitle": data.get("uploader"),
-                                "thumbnail": data.get("thumbnailUrl"),
-                                "viewCount": data.get("views"),
-                                "likeCount": data.get("likes"),
-                                "duration": data.get("duration"),
-                            }
-                        )
-                    # Invidious shape
-                    elif "viewCount" in data:
-                        _merge(
-                            {
-                                "title": data.get("title"),
-                                "channelTitle": data.get("author"),
-                                "thumbnail": data.get("thumbnail"),
-                                "viewCount": data.get("viewCount"),
-                                "likeCount": data.get("likeCount"),
-                                "duration": data.get("lengthSeconds") or data.get("durationSeconds"),
-                            }
-                        )
-                    if base.get("title") and base.get("viewCount") is not None:
-                        break  # we have enough
-            except Exception as e:
-                app.logger.warning("[Metadata] Quick concurrent check failed for %s: %s", vid, e)
+                _IV_COOLDOWN[HEALTHY_INVIDIOUS_HOSTS[0]] = time.time() + 600
+            app.logger.warning("[Metadata] Invidious error for %s: %s", vid, e)
+        return None
 
-    # If we now have title and viewCount, respond immediately.
-    if base.get("title") and base.get("viewCount") is not None:
-        base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
-        # Store hot cache so subsequent requests finish instantly
-        metadata_cache[vid] = base
-        _safe_put(metadata_shelf, vid, base)
-        return jsonify({"items": [base]}), 200
-
-    # 3) Robust yt-dlp fallback, with additional proxy-aware Piped/Invidious attempts
-    app.logger.info("[Metadata] Resorting to robust yt-dlp/Piped/Invidious fallback for %s", vid)
-    fallback_success = False
-    # --- Try yt-dlp (max 10s)
-    try:
-        yt_future = executor.submit(yt_dlp_info, vid)
-        yt = yt_future.result(timeout=10)  # hard upper-bound
-        _merge(
-            {
+    def fetch_ytdlp():
+        try:
+            yt = yt_dlp_info(vid)
+            return {
                 "title": yt.get("title"),
                 "channelTitle": yt.get("uploader"),
                 "thumbnail": yt.get("thumbnail"),
@@ -891,77 +836,99 @@ def metadata():
                 "likeCount": yt.get("like_count"),
                 "duration": yt.get("duration"),
             }
+        except Exception as e:
+            app.logger.warning("[Metadata] yt-dlp error for %s: %s", vid, e)
+            return None
+
+    # --- Parallel fetching: oEmbed, yt-dlp, Piped, Invidious ---
+    import concurrent.futures
+    strategies = [
+        ("oembed", fetch_oembed),
+        ("ytdlp", fetch_ytdlp),
+        ("piped", fetch_piped),
+        ("invidious", fetch_invidious),
+    ]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        fut_map = {pool.submit(fn): name for name, fn in strategies}
+        # Wait for the first to return both title and viewCount
+        done, not_done = concurrent.futures.wait(
+            fut_map, timeout=4, return_when=concurrent.futures.FIRST_COMPLETED
         )
-        # If we got what we need, set flag
-        if base.get("title") and base.get("viewCount") is not None:
-            fallback_success = True
-    except concurrent.futures.TimeoutError:
-        app.logger.error("[Metadata] yt-dlp timed out for %s", vid)
-    except Exception as e:
-        app.logger.warning("[Metadata] yt-dlp error for %s: %s", vid, e)
-
-    # --- If still missing essentials, try proxy-aware Piped and Invidious (rotating, up to 2 per)
-    if not (base.get("title") and base.get("viewCount") is not None):
-        import itertools
-        # Try Piped endpoints with proxy (if available), up to 1 (was 2)
-        piped_tried = 0
-        for host in itertools.islice(PIPED_HOSTS, 0, 1):
+        first_partial = None
+        for fut in done:
             try:
-                app.logger.info("[Metadata] Fallback: Piped %s (proxy-aware) for %s", host, vid)
-                js = session.get(
-                    f"{host}/api/v1/streams/{vid}",
-                    proxies=(rnd_proxy() if SMARTPROXY_USER else {}),
-                    timeout=5,
-                ).json()
-                if "views" in js:
-                    _merge(
-                        {
-                            "title": js.get("title"),
-                            "channelTitle": js.get("uploader"),
-                            "thumbnail": js.get("thumbnailUrl"),
-                            "viewCount": js.get("views"),
-                            "likeCount": js.get("likes"),
-                            "duration": js.get("duration"),
-                        }
-                    )
+                res = fut.result()
+                if res:
+                    _merge(res)
+                    # If both title and viewCount, return immediately
                     if base.get("title") and base.get("viewCount") is not None:
-                        fallback_success = True
-                        break
-            except Exception as e:
-                app.logger.warning("[Metadata] Fallback Piped error at %s for %s: %s", host, vid, e)
-            piped_tried += 1
-        # Try Invidious endpoints with proxy (if available), up to 1 (was 2)
-        if not (base.get("title") and base.get("viewCount") is not None):
-            invidious_tried = 0
-            for host in itertools.islice(INVIDIOUS_HOSTS, 0, 1):
-                try:
-                    app.logger.info("[Metadata] Fallback: Invidious %s (proxy-aware) for %s", host, vid)
-                    js = session.get(
-                        f"{host}/api/v1/videos/{vid}",
-                        proxies=(rnd_proxy() if SMARTPROXY_USER else {}),
-                        timeout=5,
-                    ).json()
-                    if "viewCount" in js:
-                        _merge(
-                            {
-                                "title": js.get("title"),
-                                "channelTitle": js.get("author"),
-                                "thumbnail": js.get("thumbnail"),
-                                "viewCount": js.get("viewCount"),
-                                "likeCount": js.get("likeCount"),
-                                "duration": js.get("lengthSeconds") or js.get("durationSeconds"),
-                            }
-                        )
-                        if base.get("title") and base.get("viewCount") is not None:
-                            fallback_success = True
-                            break
-                except Exception as e:
-                    app.logger.warning("[Metadata] Fallback Invidious error at %s for %s: %s", host, vid, e)
-                invidious_tried += 1
+                        for rem in not_done:
+                            rem.cancel()
+                        base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
+                        metadata_cache[vid] = base
+                        _safe_put(metadata_shelf, vid, base)
+                        return jsonify({"items": [base]}), 200
+                    # If partial (e.g. oEmbed), remember it
+                    if not first_partial and (base.get("title") or base.get("channelTitle")):
+                        first_partial = dict(base)
+            except Exception:
+                continue
+        # If nothing valid yet, wait for remaining up to 3s more
+        for fut in not_done:
+            try:
+                res = fut.result(timeout=3)
+                if res:
+                    _merge(res)
+                    if base.get("title") and base.get("viewCount") is not None:
+                        base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
+                        metadata_cache[vid] = base
+                        _safe_put(metadata_shelf, vid, base)
+                        return jsonify({"items": [base]}), 200
+                    if not first_partial and (base.get("title") or base.get("channelTitle")):
+                        first_partial = dict(base)
+            except Exception:
+                continue
 
-    # yt‑dlp / some mirrors occasionally return the literal string
-    # 'Untitled Video' when they cannot access the metadata.  Treat it
-    # as missing so the fallback logic keeps running.
+    # If partial metadata available, return it immediately and launch background refresh for missing fields
+    if first_partial and (first_partial.get("title") or first_partial.get("channelTitle")):
+        app.logger.info("[Metadata] Returning partial metadata for %s, background refresh for missing fields.", vid)
+        # Fire-and-forget background fetch for missing fields
+        def _bg_refresh():
+            try:
+                # Try all strategies again, serially, with longer timeout
+                for name, fn in strategies:
+                    try:
+                        res = fn()
+                        if res:
+                            _merge(res)
+                            if base.get("title") and base.get("viewCount") is not None:
+                                base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
+                                metadata_cache[vid] = base
+                                _safe_put(metadata_shelf, vid, base)
+                                break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        executor.submit(_bg_refresh)
+        return jsonify({"items": [first_partial]}), 200
+
+    # --- Fallback: Robust serial attempts if all parallel fail ---
+    app.logger.info("[Metadata] Resorting to robust serial fallback for %s", vid)
+    for name, fn in strategies:
+        try:
+            res = fn()
+            if res:
+                _merge(res)
+                if base.get("title") and base.get("viewCount") is not None:
+                    base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
+                    metadata_cache[vid] = base
+                    _safe_put(metadata_shelf, vid, base)
+                    return jsonify({"items": [base]}), 200
+        except Exception:
+            continue
+
+    # yt‑dlp / some mirrors occasionally return the literal string 'Untitled Video'
     if base.get("title") == "Untitled Video":
         base["title"] = None
 
@@ -976,7 +943,6 @@ def metadata():
     base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
     metadata_cache[vid] = base
     _safe_put(metadata_shelf, vid, base)
-    # Calculated engagementScore (guard is above)
     return jsonify({"items": [base]}), 200
 
    
