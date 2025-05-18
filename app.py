@@ -216,8 +216,9 @@ _YDL_OPTS = {
     "user_agent": BROWSER_UA,
     "extract_flat": True,
     "forcejson": True,
-    "socket_timeout": 5,   # was 8  → keep each read fast
-    "retries": 0,          # was 1  → fail‑fast so Gunicorn doesn’t time‑out
+    "socket_timeout": 10,  # Increased timeout
+    "retries": 2,          # Increased retries
+    "proxy": rnd_proxy().get("https", None)
 }
 
 def yt_dlp_info(video_id: str):
@@ -249,16 +250,15 @@ def yt_dlp_info(video_id: str):
 app = Flask(__name__)
 CORS(app)
 
+
 # ── Shelve helper ────────────────────────────────────────────
+shelve_lock = Lock()
 def _safe_put(shelf, key, value):
-    """
-    Safely write to a shelve object.  Any corruption or I/O errors are
-    caught so that a single failure does not crash the whole request.
-    """
     try:
-        shelf[key] = value
-        shelf.sync()
-    except Exception as e:  # catches gdbm.error, shelve error, etc.
+        with shelve_lock:
+            shelf[key] = value
+            shelf.sync()
+    except Exception as e:
         app.logger.error("Shelve write error for key %s: %s", key, e)
         
 # ── Minimal inbound access log ────────────────────
@@ -377,6 +377,8 @@ def _fetch_resilient(video_id: str) -> str:
       4. Exit early upon first valid transcript.
       5. All steps are logged for observability.
     """
+    piped_errors = {}
+    invidious_errors = {}
     if video_id in NEGATIVE_TRANSCRIPT_CACHE:
         return ""
     
@@ -446,9 +448,6 @@ def _fetch_resilient(video_id: str) -> str:
     if scraped and len(scraped) > 10:
         return scraped
 
-    # Graceful cooldown dicts for Piped and Invidious
-    piped_errors = {}
-    invidious_errors = {}
 
     # Allow POPULAR_LANGS override by environment variable (comma-separated)
     POPULAR_LANGS = os.getenv("POPULAR_LANGS")
