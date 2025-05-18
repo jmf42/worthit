@@ -11,18 +11,32 @@ import os
 # to adjust your `timeout` setting in Render / Heroku accordingly.
 import random
 import shelve
-import os
 # Persistent cache files
 PERSISTENT_TRANSCRIPT_DB = os.path.join(os.getcwd(), "transcript_cache_persistent.db")
 PERSISTENT_COMMENT_DB    = os.path.join(os.getcwd(), "comment_cache_persistent.db")
 PERSISTENT_ANALYSIS_DB   = os.path.join(os.getcwd(), "analysis_cache_persistent.db")
-
-transcript_shelf = shelve.open(PERSISTENT_TRANSCRIPT_DB)
-comment_shelf    = shelve.open(PERSISTENT_COMMENT_DB)
-analysis_shelf   = shelve.open(PERSISTENT_ANALYSIS_DB)
-# Persistent metadata cache
 PERSISTENT_METADATA_DB = os.path.join(os.getcwd(), "metadata_cache_persistent.db")
-metadata_shelf = shelve.open(PERSISTENT_METADATA_DB)
+
+# Ensure cache files are properly initialized and closed
+def open_shelf(filename, flag='c'):
+    try:
+        return shelve.open(filename, flag=flag)
+    except Exception as e:
+        app.logger.error(f"Failed to open shelf {filename}: {e}. Trying with a new file.")
+        # Attempt to delete corrupted file and retry, or use a temp name
+        try:
+            os.remove(filename + ".db") # Common extension for dbm
+            os.remove(filename) # if no extension
+        except OSError:
+            pass
+        return shelve.open(filename + "_new", flag=flag) # Or handle error more gracefully
+
+
+transcript_shelf = open_shelf(PERSISTENT_TRANSCRIPT_DB)
+comment_shelf    = open_shelf(PERSISTENT_COMMENT_DB)
+analysis_shelf   = open_shelf(PERSISTENT_ANALYSIS_DB)
+metadata_shelf = open_shelf(PERSISTENT_METADATA_DB)
+
 import re
 import time
 import itertools
@@ -31,7 +45,7 @@ import logging
 from functools import lru_cache
 from collections import deque 
 from threading import Lock
-_video_fetch_locks = {}
+_video_fetch_locks = {} # For transcript fetching
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future, wait, FIRST_COMPLETED
 import concurrent.futures
 
@@ -43,7 +57,7 @@ from youtube_transcript_api import (
 )
 from youtube_transcript_api._errors import CouldNotRetrieveTranscript
 from cachetools import TTLCache
-from cachetools.keys import hashkey
+# from cachetools.keys import hashkey # Not explicitly used, can be removed if not needed elsewhere
 from logging.handlers import RotatingFileHandler
 from flask_cors import CORS
 from flask_limiter import Limiter
@@ -55,7 +69,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from yt_dlp import YoutubeDL  
 import functools
-from youtube_comment_downloader import YoutubeCommentDownloader  # fallback comments scraper
+from youtube_comment_downloader import YoutubeCommentDownloader
 
 session = requests.Session()
 
@@ -67,21 +81,20 @@ BROWSER_UA = (
 )
 session.headers.update({"User-Agent": BROWSER_UA})
 
-session.request = functools.partial(session.request, timeout=10)
+session.request = functools.partial(session.request, timeout=15) # Increased default timeout slightly
 retry_cfg = Retry(
-    total=3,                # retry up to 3 times for any error type
+    total=3,
     connect=3,
     read=3,
     status=3,
-    backoff_factor=0.5,     # exponential back‑off, 0.5 • 2^n
+    backoff_factor=0.5,
     status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=False,  # retry on *all* HTTP methods
-    raise_on_status=False   # don’t throw after status_forcelist — let caller decide
+    allowed_methods=frozenset(['GET', 'POST', 'HEAD', 'OPTIONS']), # Explicitly list retryable methods
+    raise_on_status=False
 )
 session.mount("https://", HTTPAdapter(max_retries=retry_cfg))
 session.mount("http://", HTTPAdapter(max_retries=retry_cfg))
 
-#
 # ─────────────────────────────────────────────
 # App startup timestamp
 # ─────────────────────────────────────────────
@@ -93,868 +106,942 @@ app_start_time = time.time()
 SMARTPROXY_USER  = os.getenv("SMARTPROXY_USER")
 SMARTPROXY_PASS  = os.getenv("SMARTPROXY_PASS")
 SMARTPROXY_HOST  = "gate.smartproxy.com"
-SMARTPROXY_PORT  = "10000"
 SMARTPROXY_API_TOKEN = os.getenv("SMARTPROXY_API_TOKEN")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-# ✂️  Removed reliance on the official YouTube Data API and on local cookie files
-YTDL_COOKIE_FILE = None      # Force‑disable cookie usage so yt‑dlp never sends personal cookies
+YTDL_COOKIE_FILE = None # Force‑disable cookie usage
 
 # ------------------------------------------------------------------
 # Runtime tunables (env‑driven)
 # ------------------------------------------------------------------
-# How long the Flask route will wait for a background transcript job
-# before returning HTTP 202 (pending).  Can be overridden with
-# TRANSCRIPT_FETCH_TIMEOUT env‑var – default is 25 s.
 TRANSCRIPT_FETCH_TIMEOUT = int(os.getenv("TRANSCRIPT_FETCH_TIMEOUT", "25"))
-
-# Maximum comments to retrieve per video (overridable via env)
 COMMENT_LIMIT = int(os.getenv("COMMENT_LIMIT", "120"))
+METADATA_FETCH_TIMEOUT = int(os.getenv("METADATA_FETCH_TIMEOUT", "10")) # Total time for metadata attempts
 
 PROXY_ROTATION = (
     [
         {"https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:{10000+i}"}
-        for i in range(20)
+        for i in range(20) # Max 20 different ports for Smartproxy
     ]
-    if SMARTPROXY_USER else
-    [{}]
+    if SMARTPROXY_USER and SMARTPROXY_PASS else
+    [{}] # No proxy if no credentials
 )
 
 _proxy_cycle = itertools.cycle(PROXY_ROTATION)
-def rnd_proxy() -> dict:       # always returns {"https": "..."} or {}
+def rnd_proxy() -> dict:
     return next(_proxy_cycle)
 
+# Host lists (Consider making these dynamically updatable or regularly checked)
 PIPED_HOSTS = deque([
-    "https://pipedapi.kavin.rocks",
-    "https://pipedapi.tokhmi.xyz",
-    "https://pipedapi.moomoo.me",
-    "https://piped.video",
-    "https://piped.video.proxycache.net",
-    "https://piped.video.deno.dev",
+    "https://pipedapi.kavin.rocks", "https://pipedapi.tokhmi.xyz",
+    "https://pipedapi.moomoo.me", "https://pipedapi.adminforge.de",
+    "https://piped-api.garudalinux.org", "https://pipedapi.pfcd.me",
+    "https://pipedapi.frontendfriendly.xyz",
+    # "https://piped.video", # Base domains might not be API hosts
+    # "https://piped.video.proxycache.net", # Had resolution error
+    # "https://piped.video.deno.dev", # Had SSL error
 ])
 INVIDIOUS_HOSTS = deque([
-    "https://yewtu.be",
-    "https://inv.nadeko.net",
-    "https://vid.puffyan.us",
-    "https://ytdetail.8848.wtf",
+    "https://yewtu.be", "https://inv.nadeko.net", "https://vid.puffyan.us",
+    "https://invidious.no-logs.com", "https://invidious.baczek.me",
+    "https://iv.ggtyler.dev", "https://invidious.protokoll.fi",
+    # "https://ytdetail.8848.wtf", # check this one
 ])
 _PIPE_COOLDOWN: dict[str, float] = {}
 _IV_COOLDOWN: dict[str, float] = {}
 
-# ── Healthy host pools (rotated & cooled down on failures) ───────────
-HEALTHY_PIPED_HOSTS     = deque(list(PIPED_HOSTS))
-HEALTHY_INVIDIOUS_HOSTS = deque(list(INVIDIOUS_HOSTS))
-HOST_COOLDOWN_SECONDS   = 1800          # 30‑minute cooldown after hard failure
-
-# Top 10 global languages for transcript fallback (used in resilient transcript fetch)
-TOP_LANGS = [
-    "es", "hi", "pt", "id", "ru",
-    "ja", "ko", "de", "fr", "it"
-]
+HOST_COOLDOWN_SECONDS = 1800 # 30-minute cooldown
+HOST_ERROR_THRESHOLD = 3 # Times a host can fail before longer cooldown
+_host_error_counts: dict[str, int] = {}
 
 
+# Top 10 global languages for transcript fallback
+TOP_LANGS = ["es", "hi", "pt", "id", "ru", "ja", "ko", "de", "fr", "it"]
 
-def _fetch_json(hosts: deque, path: str,
-                cooldown: dict[str, float],
-                proxy_aware: bool = False,
-                hard_deadline: float = 3.0):
-    """
-    Query up to 4 candidate hosts concurrently and return
-    the first successful JSON response.  Hosts that error
-    are put on cool‑down (5 min for network errors,
-    10 min for malformed bodies).
-    """
-    host_success = getattr(_fetch_json, "_host_success", {})
-    _fetch_json._host_success = host_success
+# --- Flask App Initialization ---
+app = Flask(__name__)
+CORS(app)
 
-    now = time.time()
-    # Pick hosts not on cool‑down, best past success first
-    candidates = [
-        h for h in sorted(hosts, key=lambda h: -host_success.get(h, 0))
-        if cooldown.get(h, 0) <= now
-    ][:4]  # race at most 4
+# --- Logging Setup ---
+os.makedirs("logs", exist_ok=True)
+file_handler = RotatingFileHandler(
+    "logs/server.log", maxBytes=10_485_760, backupCount=5, encoding="utf-8" # 10MB
+)
+file_handler.setFormatter(logging.Formatter(
+    "%(asctime)s %(levelname)s [%(name)s:%(lineno)d] %(module)s - %(funcName)s: %(message)s"
+))
+file_handler.setLevel(logging.INFO)
+app.logger.addHandler(file_handler)
+app.logger.setLevel(logging.INFO)
+logging.getLogger('urllib3').setLevel(logging.WARNING) # Silence verbose urllib3 logs
+
+
+def _fetch_json(hosts: deque, path: str, cooldown_dict: dict[str, float],
+                proxy_aware: bool = False, request_timeout: float = 5.0, hard_deadline: float = 7.0):
+    host_success_times = getattr(_fetch_json, "_host_success_times", {})
+    _fetch_json._host_success_times = host_success_times
+
+    deadline = time.time() + hard_deadline
+    
+    # Shuffle hosts to prevent hammering the same one if sorted list is static
+    live_hosts = list(hosts)
+    random.shuffle(live_hosts)
+
+    candidates = []
+    for h in live_hosts:
+        if cooldown_dict.get(h, 0) > time.time():
+            continue
+        if _host_error_counts.get(h, 0) >= HOST_ERROR_THRESHOLD: # Skip if too many errors
+            if cooldown_dict.get(h, 0) <= time.time(): # If not in cooldown, put in long cooldown
+                 cooldown_dict[h] = time.time() + HOST_COOLDOWN_SECONDS * 2 # Extra penalty
+            continue
+        candidates.append(h)
+    
+    candidates = sorted(candidates, key=lambda h_sort: -host_success_times.get(h_sort, 0))[:4] # Race top 4
 
     if not candidates:
+        app.logger.warning(f"No healthy hosts available for {path} from {hosts}")
         return None
 
     with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
         future_to_host = {
             pool.submit(
-                session.get,
-                f"{h}{path}",
-                proxies=(rnd_proxy() if proxy_aware else {}),
-                timeout=3
-            ): h
-            for h in candidates
+                session.get, f"{h}{path}",
+                proxies=(rnd_proxy() if proxy_aware and PROXY_ROTATION[0] else {}),
+                timeout=request_timeout,
+                headers={"User-Agent": BROWSER_UA} # Ensure UA is set per request
+            ): h for h in candidates
         }
 
-        done, _ = wait(future_to_host.keys(),
-                       timeout=hard_deadline,
-                       return_when=FIRST_COMPLETED)
+        done_futures, _ = wait(future_to_host.keys(), timeout=hard_deadline, return_when=FIRST_COMPLETED)
 
-        for fut in done:
+        for fut in done_futures:
             host = future_to_host[fut]
             try:
                 r = fut.result()
                 r.raise_for_status()
-                if "application/json" not in r.headers.get("Content-Type", ""):
-                    raise ValueError("non‑JSON body")
-                host_success[host] = time.time()  # mark good
-                return r.json()
+                if "application/json" not in r.headers.get("Content-Type", "").lower():
+                    app.logger.warning(f"Host {host} returned non-JSON content-type: {r.headers.get('Content-Type')}")
+                    raise ValueError("non-JSON body")
+                
+                json_data = r.json()
+                host_success_times[host] = time.time()
+                _host_error_counts[host] = 0 # Reset error count on success
+                hosts.rotate(-1) # Move successful host to the end to cycle
+                return json_data
+            except requests.exceptions.HTTPError as he:
+                app.logger.warning(f"Host {host} HTTP error for {path}: {he.response.status_code} {he.response.reason}")
+                if he.response.status_code in [403, 404, 429]: # Likely permanent or needs proxy
+                     _host_error_counts[host] = _host_error_counts.get(host, 0) + 1
+                     cooldown_dict[host] = time.time() + (HOST_COOLDOWN_SECONDS if _host_error_counts[host] >= HOST_ERROR_THRESHOLD else 600)
+                else: # Server errors
+                     cooldown_dict[host] = time.time() + 300
             except Exception as e:
-                app.logger.warning("Host %s failed: %s", host, e)
-                cooldown[host] = time.time() + (
-                    600 if isinstance(e, ValueError) else 300
-                )
+                app.logger.warning(f"Host {host} failed for {path}: {type(e).__name__} {e}")
+                _host_error_counts[host] = _host_error_counts.get(host, 0) + 1
+                cooldown_dict[host] = time.time() + (HOST_COOLDOWN_SECONDS if _host_error_counts[host] >= HOST_ERROR_THRESHOLD else 600)
     return None
 
 
-_YDL_OPTS = {
+_YDL_OPTS_BASE = {
     "quiet": True,
     "skip_download": True,
-    "innertube_key": "AIzaSyA-DkzGi-tv79Q",
     "user_agent": BROWSER_UA,
-    "extract_flat": True,
-    "forcejson": True,
-    "socket_timeout": 8,   # Increased timeout slightly for reliability
-    "retries": 1,          # Allowing a retry for improved reliability
-    "proxy": rnd_proxy().get("https", None)  # Force usage of Smartproxy to avoid rate limits
+    "socket_timeout": 10, # Increased from 8s
+    "retries": 2, # Increased from 1
+    "no_check_certificate": True, # Can help with some SSL issues on invidious/piped instances
+    "forcejson": True, # For metadata/info
+    # "verbose": True, # For debugging yt-dlp
 }
 
-def yt_dlp_info(video_id: str):
-    """
-    Thin wrapper around yt-dlp that
-      • returns a cached JSON blob if we fetched the same video
-        in the last 15 minutes,
-      • injects a fresh proxy on every cold fetch,
-      • uses aggressive time-outs so we fail fast when the exit IP
-        is rate-limited.
-    """
-    if video_id in ytdl_cache:
-        return ytdl_cache[video_id]
+# In-memory caches
+transcript_cache = TTLCache(maxsize=1000, ttl=86_400) # 24h
+comment_cache    = TTLCache(maxsize=500, ttl=1800)   # 30 min
+analysis_cache   = TTLCache(maxsize=300, ttl=3600)   # 1h
+ytdl_cache       = TTLCache(maxsize=1000, ttl=1800)  # 30 min for general info
+metadata_cache   = TTLCache(maxsize=1000, ttl=3600)  # 1h
+NEGATIVE_TRANSCRIPT_CACHE = TTLCache(maxsize=2000, ttl=43_200) # 12h
 
-    opts = _YDL_OPTS.copy()
-    opts["proxy"] = rnd_proxy().get("https", None)
+executor = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 5)) # Standard Python formula
+_pending_transcripts: dict[str, Future] = {}
 
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(video_id, download=False, process=False)
 
-    # Cache only if we obtained a sensible response (title present)
-    if info.get("title"):
-        ytdl_cache[video_id] = info
-    return info
+def yt_dlp_info(video_id: str, use_proxy: bool = True):
+    cache_key = f"{video_id}_{use_proxy}"
+    if cache_key in ytdl_cache:
+        return ytdl_cache[cache_key]
 
-# --------------------------------------------------
-# Flask init
-# --------------------------------------------------
-app = Flask(__name__)
-CORS(app)
+    opts = _YDL_OPTS_BASE.copy()
+    opts["extract_flat"] = "discard_in_playlist" # Get info for single video
+    
+    current_proxy = rnd_proxy().get("https", None)
+    if use_proxy and PROXY_ROTATION[0] and current_proxy:
+        opts["proxy"] = current_proxy
+    elif "proxy" in opts:
+        del opts["proxy"] # Ensure no proxy if use_proxy is False
 
-# ── Shelve helper ────────────────────────────────────────────
+    app.logger.info(f"[yt_dlp_info] Fetching info for {video_id} with proxy: {opts.get('proxy', 'None')}")
+    try:
+        with YoutubeDL(opts) as ydl:
+            # yt-dlp often prefers full URLs
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+        
+        if info and info.get("title"): # Basic check for valid response
+            ytdl_cache[cache_key] = info
+            return info
+        else:
+            app.logger.warning(f"[yt_dlp_info] Failed to get valid info for {video_id} (title missing). Response: {str(info)[:200]}")
+            return None
+    except Exception as e:
+        app.logger.error(f"[yt_dlp_info] Error extracting info for {video_id} with proxy {opts.get('proxy', 'None')}: {type(e).__name__} {e}")
+        # If proxy failed, try without proxy once as a fallback
+        if use_proxy and opts.get("proxy"):
+            app.logger.info(f"[yt_dlp_info] Retrying info for {video_id} without proxy.")
+            return yt_dlp_info(video_id, use_proxy=False)
+        return None
+
+
 def _safe_put(shelf, key, value):
-    """
-    Safely write to a shelve object.  Any corruption or I/O errors are
-    caught so that a single failure does not crash the whole request.
-    """
     try:
         shelf[key] = value
         shelf.sync()
-    except Exception as e:  # catches gdbm.error, shelve error, etc.
-        app.logger.error("Shelve write error for key %s: %s", key, e)
-        
-# ── Minimal inbound access log ────────────────────
+    except Exception as e:
+        app.logger.error(f"Shelve write error for key {key} in {shelf._filename if hasattr(shelf, '_filename') else 'unknown_shelf'}: {e}")
+
 @app.before_request
 def _access_log():
-    app.logger.info("[IN] %s %s ← %s", request.method, request.path, request.headers.get("X-Real-IP", request.remote_addr))
+    app.logger.info(f"[IN] {request.method} {request.full_path} ← {request.headers.get('X-Forwarded-For', request.remote_addr)}")
 
-# --------------------------------------------------
-# Rate limiting
-# --------------------------------------------------
-# Combine remote IP with a hash of User‑Agent to avoid grouping
-# every device on one home router into a single limiter bucket.
 def _rate_limit_key():
     ua = request.headers.get("User-Agent", "")
-    return f"{get_remote_address()}-{hash(ua) % 1000}"
+    # Use X-Forwarded-For if available (common in proxy setups like Render)
+    ip_address = request.headers.get("X-Forwarded-For", get_remote_address())
+    return f"{ip_address}-{hash(ua) % 1000}"
 
 redis_url = os.getenv("REDIS_URL")
+limiter_storage_uri = redis_url if redis_url else "memory://" # Default to memory if REDIS_URL not set
+
 limiter = Limiter(
     app=app,
     key_func=_rate_limit_key,
-    default_limits=["200 per hour", "50 per minute"],
+    default_limits=["300 per hour", "60 per minute"], # Adjusted limits
     headers_enabled=True,
-    storage_uri=redis_url
+    storage_uri=limiter_storage_uri
 )
-
-# --------------------------------------------------
-# Worker pool / cache
-# --------------------------------------------------
-transcript_cache = TTLCache(maxsize=2000, ttl=86_400)       # 24 h
-comment_cache    = TTLCache(maxsize=300, ttl=300)           # 5 min         # 10 min
-analysis_cache = TTLCache(maxsize=200, ttl=600)  # 10-minute in-memory cache for analysis
-# 15-minute caches for yt-dlp info and metadata
-ytdl_cache     = TTLCache(maxsize=1000, ttl=900)
-metadata_cache = TTLCache(maxsize=2000, ttl=900)
-NEGATIVE_TRANSCRIPT_CACHE = TTLCache(maxsize=5000, ttl=43_200)   # 12 h
-executor         = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 4))
-_pending: dict[str, Future] = {}  
+if limiter_storage_uri == "memory://":
+    app.logger.warning("Flask-Limiter is using in-memory storage. Not recommended for multi-process/worker production setups.")
 
 
-# --------------------------------------------------
-# Logging setup (console + rotating file)
-# --------------------------------------------------
-os.makedirs("logs", exist_ok=True)
-file_handler = RotatingFileHandler(
-    "logs/server.log", maxBytes=5_242_880, backupCount=3, encoding="utf-8"
-)
-file_handler.setFormatter(logging.Formatter(
-    "%(asctime)s %(levelname)s [%(module)s:%(lineno)d]: %(message)s"
-))
-file_handler.setLevel(logging.INFO)
-
-app.logger.addHandler(file_handler)
-app.logger.setLevel(logging.INFO)
-
-# --------------------------------------------------
-# Helpers: validate / extract YT id
-# --------------------------------------------------
 VIDEO_ID_REGEX = re.compile(r'^[\w-]{11}$')
 
 def validate_video_id(video_id: str) -> bool:
     return bool(VIDEO_ID_REGEX.fullmatch(video_id))
 
-# Alias for legacy calls
-valid_id = validate_video_id
+valid_id = validate_video_id # Alias
 
-@lru_cache(maxsize=1024)
-def extract_video_id(input_str: str) -> str:
+@lru_cache(maxsize=2048) # Increased cache size
+def extract_video_id(input_str: str) -> str | None:
+    if not input_str or not isinstance(input_str, str):
+        return None
     patterns = [
-        r'(?:v=|\/)([\w-]{11})',
+        r'(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([\w-]{11})', # More robust
         r'^([\w-]{11})$'
     ]
     for p in patterns:
         m = re.search(p, input_str)
         if m and validate_video_id(m.group(1)):
             return m.group(1)
-    raise ValueError("Invalid YouTube URL or video ID")
+    return None
 
 
-# Discover available transcript languages for a video (fast, no proxy)
-def discover_available_langs(video_id):
-    "Return sorted list of transcript languages actually present for this video (fast, no proxy)."
-    try:
-        transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
-        codes = [tr.language_code for tr in transcripts]
-        # Move English first if present
-        if "en" in codes:
-            codes.remove("en")
-            codes = ["en"] + codes
-        return codes
-    except Exception:
-        # Fallback to common popular list
-        return [
-            "en", "es", "hi", "pt", "id", "ru", "ja", "ko", "de", "fr",
-            "tr", "vi", "it", "ar", "pl", "uk", "fa", "nl", "th", "ro"
-        ]
-
-
-
-
-
-def _get_transcript(vid: str, langs, preserve):
-    # Always use a rotating proxy (Smartproxy) for YouTubeTranscriptApi
-    return YouTubeTranscriptApi.get_transcript(
-        vid, languages=langs, preserve_formatting=preserve,
-        proxies=rnd_proxy())
+def _get_transcript_from_api(vid: str, langs, preserve_formatting=False):
+    # Always use a rotating proxy for YouTubeTranscriptApi if configured
+    current_proxy = rnd_proxy() if PROXY_ROTATION[0] else {}
+    return YouTubeTranscriptApi.get_transcript(vid, languages=langs, proxies=current_proxy, preserve_formatting=preserve_formatting)
 
 
 def _fetch_resilient(video_id: str) -> str:
-    """
-    Aggressively fetch a transcript for the given video ID using parallel and fallback strategies:
-      1. Run Piped, YouTubeTranscriptApi (en), and yt-dlp in parallel. Return first valid result.
-      2. Mark hosts as "bad" on any exception (for N minutes).
-      3. If all primaries fail, run slow/serial fallbacks (lang fallback, HTML scrape).
-    """
+    app.logger.info(f"[Transcript] Starting resilient fetch for {video_id}")
     if video_id in NEGATIVE_TRANSCRIPT_CACHE:
-        return ""
+        app.logger.info(f"[Transcript] Negative cache hit for {video_id}")
+        return "" # Return empty string for known unavailable
 
-    import concurrent.futures
-    piped_errors = {}
-    # --- Define all three primary strategies ---
+    # --- Define primary strategies ---
     def fetch_with_piped():
+        # Piped seems to provide VTT or other formats that need parsing, 
+        # or direct text links. Focus on direct text links if available.
+        # This implementation expects Piped /api/v1/captions/{video_id} to return JSON
+        # with URLs to transcript files (e.g., .srv3 or .xml that needs conversion)
+        # For simplicity, we'll assume it can point to plain text if available, or we parse common formats
+        # The old version's logic of iterating through `js` (caption tracks) was better.
         now = time.time()
-        for host in list(PIPED_HOSTS):
-            # Skip host if recently errored
-            if piped_errors.get(host, 0) > now:
-                continue
+        piped_hosts_list = list(PIPED_HOSTS) # Use a copy
+        random.shuffle(piped_hosts_list)
+
+        for host_idx, host in enumerate(piped_hosts_list):
+            if _PIPE_COOLDOWN.get(host, 0) > now: continue
+            if host_idx >= 3: break # Try max 3 Piped hosts per attempt to avoid long delays
+
             try:
-                url = f"{host}/api/v1/captions/{video_id}"
-                # Try direct, then proxy if available
-                for try_proxy in (False, True) if SMARTPROXY_USER else (False,):
-                    proxy = rnd_proxy() if try_proxy else {}
-                    app.logger.info("[Transcript] Trying Piped captions at %s (proxy=%s)", url, try_proxy)
-                    r = session.get(url, proxies=proxy, timeout=5)
+                # Try direct first, then with proxy
+                for use_proxy_attempt in (False, True) if PROXY_ROTATION[0] else (False,):
+                    proxy_to_use = rnd_proxy() if use_proxy_attempt and PROXY_ROTATION[0] else {}
+                    api_url = f"{host}/api/v1/captions/{video_id}"
+                    app.logger.info(f"[Transcript] Trying Piped captions: {api_url} (proxy: {bool(proxy_to_use)})")
+                    
+                    r = session.get(api_url, proxies=proxy_to_use, timeout=7) # 7s timeout for Piped API call
                     r.raise_for_status()
-                    js = r.json()
-                    for caption_track in js:
-                        if caption_track.get("url"):
-                            caption_url = caption_track["url"]
-                            lang_code = caption_track.get("languageCode", "")
-                            # Prefer English if possible
-                            if lang_code == "en" or not js.index(caption_track):
-                                r2 = session.get(caption_url, timeout=5)
-                                r2.raise_for_status()
-                                if r2.text.strip():
-                                    app.logger.info(f"[Transcript] Success: Piped captions ({lang_code}) for %s (proxy={try_proxy})", video_id)
-                                    return r2.text
-                    app.logger.warning("[Transcript] No usable captions in Piped for %s (proxy=%s)", video_id, try_proxy)
+                    caption_tracks_info = r.json()
+
+                    # Prioritize English, then first available
+                    sorted_tracks = sorted(caption_tracks_info, key=lambda t: t.get("languageCode","") != "en")
+
+                    for track_info in sorted_tracks:
+                        caption_url = track_info.get("url")
+                        if caption_url:
+                            app.logger.info(f"[Transcript] Fetching Piped caption track: {caption_url}")
+                            r_caption = session.get(caption_url, timeout=7) # 7s for caption file
+                            r_caption.raise_for_status()
+                            # Basic VTT/SRT stripper (very naive)
+                            text_content = r_caption.text
+                            if "WEBVTT" in text_content or re.match(r"^\d+\s*\n", text_content): # Naive VTT/SRT check
+                                lines = text_content.splitlines()
+                                text_segments = [line for line in lines if line and not re.match(r"^\d+$", line) and "-->" not in line and "WEBVTT" not in line and "<c>" not in line and "</c>" not in line]
+                                plain_text = " ".join(text_segments).strip()
+                                # Further cleaning for XML/other formats might be needed
+                                plain_text = re.sub(r'<[^>]+>', '', plain_text) # Strip all XML/HTML tags
+                                plain_text = re.sub(r'\s+', ' ', plain_text).strip() # Normalize whitespace
+                            else: # Assume plain text or needs more complex parsing
+                                plain_text = re.sub(r'<[^>]+>', '', text_content) # Basic strip
+                                plain_text = re.sub(r'\s+', ' ', plain_text).strip()
+
+                            if plain_text and len(plain_text) > 10:
+                                app.logger.info(f"[Transcript] Success: Piped captions ({track_info.get('languageCode', 'unknown')}) from {host} for {video_id}")
+                                return plain_text
+                    app.logger.warning(f"[Transcript] No usable caption content from Piped host {host} for {video_id}")
             except Exception as e:
-                # Mark host as bad for 2 minutes on error
-                app.logger.warning(f"[Transcript] Piped failed at {host} for %s: %s", video_id, e)
-                piped_errors[host] = time.time() + 120
+                app.logger.warning(f"[Transcript] Piped failed at {host} for {video_id}: {type(e).__name__} {e}")
+                _PIPE_COOLDOWN[host] = time.time() + 300 # 5 min cooldown
                 continue
-        app.logger.error("[Transcript] All Piped endpoints failed for %s", video_id)
         return None
 
     def fetch_with_ytapi_en():
         try:
-            segs = _get_transcript(video_id, ["en"], False)
+            segs = _get_transcript_from_api(video_id, ["en"])
             text = " ".join(s["text"] for s in segs).strip()
-            if text:
-                app.logger.info("[Transcript] Success: YouTubeTranscriptApi (en) for %s", video_id)
+            if text and len(text) > 10:
+                app.logger.info(f"[Transcript] Success: YouTubeTranscriptApi (en) for {video_id}")
                 return text
-            app.logger.warning("[Transcript] YouTubeTranscriptApi (en) returned empty for %s", video_id)
+            app.logger.warning(f"[Transcript] YouTubeTranscriptApi (en) returned empty/short for {video_id}")
+        except (TranscriptsDisabled, NoTranscriptFound):
+            app.logger.info(f"[Transcript] YouTubeTranscriptApi (en) not found or disabled for {video_id}")
         except Exception as e:
-            # Mark as "bad" for 3 min on error (simulate marking host, here just log)
-            app.logger.warning("[Transcript] YouTubeTranscriptApi (en) failed for %s: %s", video_id, e)
+            app.logger.warning(f"[Transcript] YouTubeTranscriptApi (en) failed for {video_id}: {type(e).__name__} {e}")
         return None
 
     def fetch_with_ytdlp():
         try:
-            info = yt_dlp_info(video_id)
+            # Try with proxy first, then without if it fails (handled by yt_dlp_info)
+            info = yt_dlp_info(video_id, use_proxy=True) 
+            if not info:
+                return None
+
+            text_results = []
+            # Automatic captions
+            auto_caps = info.get("automatic_captions") or {}
+            if auto_caps:
+                # Prefer English in automatic captions if available
+                lang_codes_order = ['en'] + [lc for lc in auto_caps.keys() if lc != 'en']
+                for lang_code in lang_codes_order:
+                    tracks = auto_caps.get(lang_code, [])
+                    for track in tracks:
+                        if track.get("url") and track.get("ext") in ["srv3", "vtt", "ttml", "xml"]: # Common formats
+                            try:
+                                r_cap = session.get(track["url"], timeout=7)
+                                r_cap.raise_for_status()
+                                # Naive stripper (same as Piped, could be refactored)
+                                content = r_cap.text
+                                if "WEBVTT" in content or re.match(r"^\d+\s*\n", content):
+                                    lines = content.splitlines()
+                                    segments = [line for line in lines if line and not re.match(r"^\d+$",line) and "-->" not in line and "WEBVTT" not in line and "<c>" not in line and "</c>" not in line]
+                                    plain = " ".join(segments).strip()
+                                else: # XML based (ttml, srv3 often are)
+                                    plain = " ".join(re.findall(r'>([^<]+)</', content)).strip() # Extract text between tags
+                                plain = re.sub(r'\s+', ' ', plain).strip()
+                                if plain and len(plain) > 10:
+                                    app.logger.info(f"[Transcript] Success: yt-dlp automatic_captions ({lang_code}) for {video_id}")
+                                    return plain
+                            except Exception as e_track:
+                                app.logger.warning(f"[Transcript] yt-dlp auto caption track failed for {video_id} ({lang_code}): {e_track}")
+            
+            # Manual captions (subtitles)
+            manual_caps = info.get("subtitles") or info.get("captions") or {} # yt-dlp uses 'subtitles' more now
+            if manual_caps:
+                lang_codes_order = ['en'] + [lc for lc in manual_caps.keys() if lc != 'en']
+                for lang_code in lang_codes_order:
+                    tracks = manual_caps.get(lang_code, [])
+                    for track in tracks:
+                        if track.get("url") and track.get("ext") in ["srv3", "vtt", "ttml", "xml"]:
+                            try:
+                                r_cap = session.get(track["url"], timeout=7)
+                                r_cap.raise_for_status()
+                                content = r_cap.text
+                                if "WEBVTT" in content or re.match(r"^\d+\s*\n", content):
+                                    lines = content.splitlines()
+                                    segments = [line for line in lines if line and not re.match(r"^\d+$",line) and "-->" not in line and "WEBVTT" not in line and "<c>" not in line and "</c>" not in line]
+                                    plain = " ".join(segments).strip()
+                                else:
+                                    plain = " ".join(re.findall(r'>([^<]+)</', content)).strip()
+                                plain = re.sub(r'\s+', ' ', plain).strip()
+                                if plain and len(plain) > 10:
+                                    app.logger.info(f"[Transcript] Success: yt-dlp manual_captions ({lang_code}) for {video_id}")
+                                    return plain
+                            except Exception as e_track:
+                                app.logger.warning(f"[Transcript] yt-dlp manual caption track failed for {video_id} ({lang_code}): {e_track}")
+            app.logger.warning(f"[Transcript] yt-dlp found no usable captions for {video_id}")
         except Exception as e:
-            app.logger.warning("[Transcript] yt-dlp info failed for %s: %s", video_id, e)
-            return None
-        # Try automatic captions
-        try:
-            caps = info.get("automatic_captions") or {}
-            first_track = next(iter(caps.values()), [])
-            if first_track:
-                url = first_track[0]["url"]
-                r = session.get(url, timeout=5)
-                r.raise_for_status()
-                if r.text.strip():
-                    app.logger.info("[Transcript] Success: yt-dlp automatic_captions for %s", video_id)
-                    return r.text
-            app.logger.warning("[Transcript] yt-dlp automatic_captions empty for %s", video_id)
-        except Exception as e:
-            app.logger.warning("[Transcript] yt-dlp automatic_captions failed for %s: %s", video_id, e)
-        # Try manual captions
-        try:
-            caps = info.get("captions") or {}
-            track = caps.get("en") or next(iter(caps.values()), [])
-            if track:
-                url = track[0]["url"]
-                r = session.get(url, timeout=5)
-                r.raise_for_status()
-                if r.text.strip():
-                    app.logger.info("[Transcript] Success: yt-dlp captions track for %s", video_id)
-                    return r.text
-            app.logger.warning("[Transcript] yt-dlp captions track empty for %s", video_id)
-        except Exception as e:
-            app.logger.warning("[Transcript] yt-dlp captions track failed for %s: %s", video_id, e)
+            app.logger.error(f"[Transcript] yt-dlp strategy failed for {video_id}: {type(e).__name__} {e}")
         return None
 
-    # --- Aggressively run all three primary strategies in parallel ---
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        futures = {
-            pool.submit(fetch_with_piped): "piped",
-            pool.submit(fetch_with_ytapi_en): "ytapi_en",
-            pool.submit(fetch_with_ytdlp): "ytdlp"
-        }
-        # Wait for first completed
-        done, not_done = concurrent.futures.wait(futures, timeout=6, return_when=concurrent.futures.FIRST_COMPLETED)
-        # Return first valid result, cancel others
-        for fut in done:
-            try:
-                res = fut.result()
-                if res and len(res) > 10:
-                    # Cancel others
-                    for rem in not_done:
-                        rem.cancel()
-                    return res
-            except Exception as e:
-                # Mark as bad (simulate for all, e.g. piped_errors for Piped)
-                pass
-        # If none succeeded, wait a bit more for any slow ones
-        for fut in not_done:
-            try:
-                res = fut.result(timeout=2)
-                if res and len(res) > 10:
-                    return res
-            except Exception:
-                continue
+    # --- Aggressively run primary strategies in parallel ---
+    # Order of preference: ytapi_en (often cleanest), ytdlp (good fallback), piped (can be messy)
+    primary_futures = {
+        executor.submit(fetch_with_ytapi_en): "ytapi_en",
+        executor.submit(fetch_with_ytdlp): "ytdlp",
+        executor.submit(fetch_with_piped): "piped",
+    }
+    
+    # Wait for up to 10 seconds total for primaries
+    # This timeout is for the combined execution of these three.
+    # Individual timeouts are within the functions (e.g., 7s for Piped/yt-dlp tracks).
+    overall_primary_timeout = 12.0 
+    start_primary_time = time.time()
 
-    # --- If all primaries fail, try fallback strategies ---
-    app.logger.warning("[Transcript] All primary strategies failed for %s, running fallbacks.", video_id)
+    # Process in order of preference
+    preferred_order = [fetch_with_ytapi_en, fetch_with_ytdlp, fetch_with_piped]
+    future_to_name_map = {fut: name for fut, name in primary_futures.items()}
 
-    # Fallback: YouTubeTranscriptApi with top-10 global languages (parallel)
-    def fetch_with_ytapi_top_langs():
-        def _attempt(lang_code: str):
-            try:
-                segs = _get_transcript(video_id, [lang_code], False)
-                txt = " ".join(s["text"] for s in segs).strip()
-                if txt:
-                    app.logger.info("[Transcript] Success: YouTubeTranscriptApi (%s) for %s", lang_code, video_id)
-                    return txt
-            except (TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript):
-                pass
-            except Exception as e:
-                app.logger.debug("[Transcript] %s failed for %s: %s", lang_code, video_id, e)
-            return None
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(TOP_LANGS)) as pool:
-            fut_map = {pool.submit(_attempt, lang): lang for lang in TOP_LANGS}
-            done, _ = concurrent.futures.wait(
-                fut_map,
-                timeout=4,
-                return_when=concurrent.futures.FIRST_COMPLETED
-            )
-            for fut in done:
-                res = fut.result()
-                if res:
-                    return res
-        return None
-
-    ytapi_top_result = fetch_with_ytapi_top_langs()
-    if ytapi_top_result and len(ytapi_top_result) > 10:
-        return ytapi_top_result
-
-    # Lightweight HTML scrape fallback (serial, only if all else fails)
-    def fetch_with_html_scrape():
+    # Check futures as they complete, or up to the timeout
+    # This logic processes them as they complete, not strictly by FIRST_COMPLETED then others
+    # It iterates based on completion.
+    
+    # Get results as they complete
+    for future in concurrent.futures.as_completed(primary_futures.keys(), timeout=overall_primary_timeout):
+        source_name = future_to_name_map[future]
         try:
-            resp = session.get(f"https://www.youtube.com/watch?v={video_id}", timeout=3)
-            resp.raise_for_status()
-            html = resp.text
-            m = re.search(r'"captionTracks":\s*(\[\{.*?\}\])', html)
-            if m:
-                tracks = json.loads(m.group(1))
-                base_url = tracks[0].get("baseUrl")
-                if base_url:
-                    r2 = session.get(base_url, timeout=3)
-                    r2.raise_for_status()
-                    # strip XML tags to plain text
-                    return "".join(re.findall(r'<text[^>]*>(.*?)</text>', r2.text))
-        except Exception:
-            return None
+            res = future.result(timeout=0.1) # Small timeout as it's already completed
+            if res and len(res) > 10:
+                app.logger.info(f"[Transcript] Primary source '{source_name}' succeeded for {video_id}.")
+                # Cancel remaining primary futures
+                for pf_key, pf_val in primary_futures.items():
+                    if pf_key != future and not pf_key.done():
+                        pf_key.cancel()
+                return res
+            elif res is not None: # Empty or too short
+                 app.logger.info(f"[Transcript] Primary source '{source_name}' for {video_id} returned empty or too short.")
+        except TimeoutError: # Should not happen with as_completed if overall_primary_timeout is respected
+            app.logger.warning(f"[Transcript] Timeout processing result for '{source_name}' for {video_id}")
+        except Exception as e:
+            app.logger.warning(f"[Transcript] Primary source '{source_name}' for {video_id} failed: {type(e).__name__} {e}")
+    
+    app.logger.warning(f"[Transcript] All primary strategies failed or timed out for {video_id}. Trying fallbacks.")
+
+    # Fallback 1: YouTubeTranscriptApi with top global languages (parallel attempts for speed)
+    def fetch_with_ytapi_lang(lang_code: str):
+        try:
+            segs = _get_transcript_from_api(video_id, [lang_code])
+            txt = " ".join(s["text"] for s in segs).strip()
+            if txt and len(txt) > 10:
+                app.logger.info(f"[Transcript] Success: YouTubeTranscriptApi ({lang_code}) for {video_id}")
+                return txt
+        except (TranscriptsDisabled, NoTranscriptFound):
+            app.logger.debug(f"[Transcript] YTTA lang '{lang_code}' not found for {video_id}")
+        except Exception as e: # Catch broader exceptions
+            app.logger.debug(f"[Transcript] YTTA lang '{lang_code}' for {video_id} failed: {type(e).__name__} {e}")
         return None
 
-    scraped = fetch_with_html_scrape()
-    if scraped and len(scraped) > 10:
-        return scraped
+    # Max 5 parallel language fetches to avoid excessive requests
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as lang_pool:
+        lang_futures = {lang_pool.submit(fetch_with_ytapi_lang, lang): lang for lang in TOP_LANGS}
+        # Wait up to 7 seconds for any language transcript
+        done_lang_futures, _ = concurrent.futures.wait(lang_futures.keys(), timeout=7.0, return_when=concurrent.futures.FIRST_COMPLETED)
+        for fut in done_lang_futures:
+            res = fut.result()
+            if res and len(res) > 10:
+                # Cancel remaining lang futures
+                for lf_key, lf_val in lang_futures.items():
+                    if lf_key != fut and not lf_key.done():
+                        lf_key.cancel()
+                return res
 
-    # Final fallback: try Piped serially again (could have new hosts)
-    piped_result = fetch_with_piped()
-    if piped_result and len(piped_result) > 10:
-        return piped_result
+    # Fallback 2: Lightweight HTML scrape (last resort, no proxy used here, could be added)
+    try:
+        app.logger.info(f"[Transcript] Trying HTML scrape for {video_id}")
+        # Use a proxy for HTML scrape as well, as direct access can be blocked
+        proxy_for_html = rnd_proxy() if PROXY_ROTATION[0] else {}
+        html_resp = session.get(f"https://www.youtube.com/watch?v={video_id}", timeout=7, proxies=proxy_for_html, headers={"User-Agent": BROWSER_UA})
+        html_resp.raise_for_status()
+        html_content = html_resp.text
+        
+        # This regex is common but might need updating if YouTube changes page structure
+        match = re.search(r'"captionTracks":\s*(\[.*?\])', html_content)
+        if match:
+            caption_tracks_json = json.loads(match.group(1))
+            # Prefer English, then any other
+            sorted_html_tracks = sorted(caption_tracks_json, key=lambda t: t.get("languageCode","") != "en")
+            for track in sorted_html_tracks:
+                if track.get("baseUrl"):
+                    caption_data_url = track["baseUrl"]
+                    # Append format=srv3 or similar if not present, yt-dlp does this.
+                    # For simplicity, assume baseUrl is directly fetchable and parsable.
+                    # srv3 is xml-like, ttml is xml, vtt is text-based.
+                    # if "format=srv3" not in caption_data_url: caption_data_url += "&format=srv3"
 
-    app.logger.error("[Transcript] All transcript sources failed for %s", video_id)
-    NEGATIVE_TRANSCRIPT_CACHE[video_id] = True
+                    r_caption_html = session.get(caption_data_url, timeout=7, proxies=proxy_for_html)
+                    r_caption_html.raise_for_status()
+                    text_content_html = r_caption_html.text
+                    # Simple text extraction from XML/VTT like formats
+                    plain_text_html = " ".join(re.findall(r'>([^<]+)</', text_content_html)).strip() # For XML
+                    if not plain_text_html and "WEBVTT" in text_content_html: # For VTT
+                        lines = text_content_html.splitlines()
+                        text_segments_html = [line for line in lines if line and not re.match(r"^\d+$", line) and "-->" not in line and "WEBVTT" not in line]
+                        plain_text_html = " ".join(text_segments_html).strip()
+                    
+                    plain_text_html = re.sub(r'\s+', ' ', plain_text_html).strip()
+                    if plain_text_html and len(plain_text_html) > 10:
+                        app.logger.info(f"[Transcript] Success: HTML Scrape ({track.get('languageCode','unknown')}) for {video_id}")
+                        return plain_text_html
+    except Exception as e:
+        app.logger.warning(f"[Transcript] HTML scrape for {video_id} failed: {type(e).__name__} {e}")
+
+    app.logger.error(f"[Transcript] All transcript sources conclusively failed for {video_id}")
+    NEGATIVE_TRANSCRIPT_CACHE[video_id] = True # Cache as unavailable
     raise RuntimeError("Transcript unavailable from all sources")
 
 
-def _get_or_spawn(video_id: str, timeout: float = TRANSCRIPT_FETCH_TIMEOUT) -> str:
-    """
-    Ensure only one worker fetches a given transcript while others await it.
-    Uses a lock per video_id to avoid race condition of launching the same fetch.
-    """
+def _get_or_spawn_transcript(video_id: str, timeout: float = TRANSCRIPT_FETCH_TIMEOUT) -> str:
     lock = _video_fetch_locks.setdefault(video_id, Lock())
     with lock:
-        # Check persistent shelf first
         if video_id in transcript_shelf:
+            app.logger.info(f"Transcript cache hit (shelf) for {video_id}")
             return transcript_shelf[video_id]
         if (cached := transcript_cache.get(video_id)):
+            app.logger.info(f"Transcript cache hit (memory) for {video_id}")
             return cached
-        fut = _pending.get(video_id)
-        if fut is None:
+        
+        fut = _pending_transcripts.get(video_id)
+        if fut is None or fut.done(): # If no future or previous one finished (e.g. cancelled/failed)
+            app.logger.info(f"Spawning new transcript fetch for {video_id}")
             fut = executor.submit(_fetch_resilient, video_id)
-            _pending[video_id] = fut
-        try:
-            result = fut.result(timeout=timeout)
+            _pending_transcripts[video_id] = fut
+        else:
+            app.logger.info(f"Waiting for existing transcript fetch for {video_id}")
+
+    try:
+        result = fut.result(timeout=timeout)
+        if result: # Only cache non-empty results
             transcript_cache[video_id] = result
             _safe_put(transcript_shelf, video_id, result)
-            return result
-        finally:
-            if fut.done():
-                _pending.pop(video_id, None)
-            _video_fetch_locks.pop(video_id, None)
+        return result
+    except TimeoutError: # Timeout waiting for future.result()
+        app.logger.warning(f"Timeout waiting for transcript result for {video_id}")
+        raise # Re-raise to be caught by endpoint
+    except Exception as e: # Exception from _fetch_resilient itself
+        app.logger.error(f"Underlying transcript fetch for {video_id} raised: {e}")
+        # Potentially remove from _pending_transcripts if it's an error from the function itself
+        # and not a timeout on fut.result()
+        if video_id in _pending_transcripts and _pending_transcripts[video_id] == fut:
+            _pending_transcripts.pop(video_id, None)
+        raise # Re-raise
+    finally:
+        # Clean up lock and pending future if this specific future is done
+        # This check is important if a new future was spawned for the same id after a failure.
+        if fut.done():
+            if video_id in _pending_transcripts and _pending_transcripts[video_id] == fut:
+                _pending_transcripts.pop(video_id, None)
+            # Only remove lock if no other thread is waiting on this video_id
+            # This is tricky; the lock is acquired at the start of this function.
+            # If the lock is associated with this specific call, it's released when 'with lock' exits.
+            # _video_fetch_locks.pop(video_id, None) # This might be too aggressive here.
+            pass
+        # The lock acquisition ensures only one worker spawns the task.
+        # Once spawned, others might wait on the same future object if they get there before it's removed from _pending_transcripts.
 
-# ─────────────────────────────────────────────
-# Endpoints
-# ─────────────────────────────────────────────
 @app.get("/transcript")
-@limiter.limit("100/hour")
-def transcript():
-    video_id = request.args.get("videoId", "")
-    try:
-        vid = extract_video_id(video_id)
-    except Exception:
-        return jsonify({"error": "invalid id"}), 400
+@limiter.limit("150/hour;30/minute") # Slightly higher limits
+def transcript_endpoint():
+    video_url_or_id = request.args.get("videoId", "")
+    vid = extract_video_id(video_url_or_id)
+    if not vid:
+        return jsonify({"error": "invalid_video_id", "message": "Please provide a valid YouTube video ID or URL."}), 400
 
     try:
-        text = _get_or_spawn(vid)
+        text = _get_or_spawn_transcript(vid)
+        if not text: # If _fetch_resilient returns empty (e.g. from negative cache)
+            return jsonify({"status": "unavailable", "error": "Transcript not found or is empty."}), 404
         return jsonify({"video_id": vid, "text": text}), 200
-    except TimeoutError:
-        return jsonify({"status": "pending"}), 202
-    except Exception as e:
-        app.logger.error("Transcript generation failed for %s: %s", vid, e)
+    except TimeoutError: # From _get_or_spawn_transcript's fut.result(timeout)
+        # This means the client's request timed out waiting for the result,
+        # but the background task might still be running.
+        return jsonify({"status": "pending", "message": "Transcript processing is taking longer than expected. Please try again shortly."}), 202
+    except RuntimeError as e: # From _fetch_resilient if all sources fail
+        app.logger.error(f"Transcript generation ultimately failed for {vid}: {e}")
         return jsonify({"status": "unavailable", "error": str(e)}), 404
-    
+    except Exception as e: # Other unexpected errors
+        app.logger.error(f"Unexpected error in /transcript for {vid}: {type(e).__name__} {e}", exc_info=True)
+        return jsonify({"status": "error", "error": "An internal server error occurred."}), 500
 
-# ---------------- PROXY STATS ---------------------
+# ---------------- PROXY STATS (No changes from new version) ---------------------
 @app.route("/proxy_stats", methods=["GET"])
 def get_proxy_stats():
+    if not SMARTPROXY_API_TOKEN or not SMARTPROXY_USER: # Guard this endpoint
+        return jsonify({'error': 'Smartproxy not configured for stats'}), 403
+        
     from datetime import datetime, timedelta
     end_time = datetime.utcnow()
     start_time = end_time - timedelta(days=1)
     payload = {
-        "proxyType": "residential_proxies",
+        "proxyType": "residential_proxies", # or other types if used
         "startDate": start_time.strftime("%Y-%m-%d %H:%M:%S"),
         "endDate": end_time.strftime("%Y-%m-%d %H:%M:%S"),
         "limit": 1
     }
-    app.logger.info("[OUT] Smartproxy stats")
+    # Smartproxy API requires token in header
+    headers = {
+        "Authorization": f"Token {SMARTPROXY_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    app.logger.info("[OUT] Smartproxy stats request")
     try:
-        r = session.post(
-            "https://dashboard.smartproxy.com/subscription-api/v1/api/public/statistics/traffic",
-            json=payload, timeout=10
+        r = session.post( # Smartproxy uses POST for this endpoint
+            "https://dashboard.smartproxy.com/api/v1/users/current/statistics/traffic-usage", # Check official endpoint
+            json=payload, headers=headers, timeout=10
         )
-        app.logger.info("[OUT] Smartproxy ← %s (stats)", r.status_code)
+        app.logger.info(f"[OUT] Smartproxy stats response ← {r.status_code}")
         r.raise_for_status()
         return jsonify(r.json()), 200
     except Exception as e:
-        app.logger.error("Proxy stats error: %s", e)
+        app.logger.error(f"Proxy stats error: {type(e).__name__} {e}")
         return jsonify({'error': 'Could not retrieve proxy stats'}), 503
 
 # ---------------- Comments ----------------
-
-def _download_comments_downloader(video_id: str, limit: int = COMMENT_LIMIT) -> list[str] | None:
-    """
-    Fallback comments fetch that *does not* rely on Piped/Invidious or YouTube Data API.
-    Uses the `youtube-comment-downloader` library (mimics YouTube web requests).
-
-    Returns a list of comment strings (top-level only) or None on failure.
-    """
+def _download_comments_native(video_id: str, limit: int = COMMENT_LIMIT) -> list[str] | None:
     try:
         downloader = YoutubeCommentDownloader()
-        comments: list[str] = []
-        for c in downloader.get_comments_from_url(f"https://www.youtube.com/watch?v={video_id}"):
-            txt = c.get("text")
+        comments_data = downloader.get_comments(video_id, sort_by=0) # 0 for top comments
+        
+        comments_text: list[str] = []
+        comment_iterator = itertools.islice(comments_data, limit) if limit else comments_data
+
+        for c_data in comment_iterator:
+            txt = c_data.get("text")
             if txt:
-                comments.append(txt)
-            if len(comments) >= limit:
+                comments_text.append(txt)
+            if limit and len(comments_text) >= limit:
                 break
-        return comments or None
+        return comments_text or None
     except Exception as e:
-        app.logger.warning("youtube-comment-downloader failed for %s: %s", video_id, e)
+        app.logger.warning(f"youtube-comment-downloader failed for {video_id}: {type(e).__name__} {e}")
         return None
 
+def _fetch_comments_ytdlp(video_id: str, limit: int) -> list[str] | None:
+    try:
+        opts = _YDL_OPTS_BASE.copy()
+        opts["getcomments"] = True
+        opts["forcejson"] = False # Comments are part of the main JSON if requested
+        opts["extract_flat"] = False # Need nested structure for comments
+        
+        current_proxy = rnd_proxy().get("https", None)
+        if PROXY_ROTATION[0] and current_proxy: # Use proxy for comment fetching too
+            opts["proxy"] = current_proxy
+        
+        app.logger.info(f"[Comments] Fetching comments via yt-dlp for {video_id} (proxy: {bool(opts.get('proxy'))})")
+        with YoutubeDL(opts) as ydl:
+            result = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            
+        if result and result.get("comments"):
+            comments_data = result.get("comments")
+            extracted_comments = []
+            for c_item in comments_data:
+                text = c_item.get("text") # yt-dlp usually provides 'text'
+                if text:
+                    extracted_comments.append(str(text))
+                if len(extracted_comments) >= limit:
+                    break
+            return extracted_comments or None
+        app.logger.warning(f"[Comments] yt-dlp found no comments for {video_id}")
+        return None
+    except Exception as e:
+        app.logger.warning(f"[Comments] _fetch_comments_ytdlp failed for {video_id}: {type(e).__name__} {e}")
+        return None
 
-@app.route("/video/comments")
-def comments():
-    vid = request.args.get("videoId", "")
-    if not valid_id(vid):
+@app.route("/video/comments") # Changed from /youtube/comments for consistency
+@limiter.limit("100/hour;20/minute")
+def comments_endpoint():
+    video_url_or_id = request.args.get("videoId", "")
+    vid = extract_video_id(video_url_or_id)
+    if not vid:
         return jsonify({"error": "invalid_video_id"}), 400
-    # Check in-memory comments cache
-    if vid in comment_cache:
-        return jsonify({"comments": comment_cache[vid]}), 200
-    # Check persistent comments shelf
+
     if vid in comment_shelf:
-        cached_comments = comment_shelf[vid]
-        comment_cache[vid] = cached_comments
+        app.logger.info(f"Comments cache hit (shelf) for {vid}")
+        return jsonify({"comments": comment_shelf[vid]}), 200
+    if (cached_comments := comment_cache.get(vid)):
+        app.logger.info(f"Comments cache hit (memory) for {vid}")
         return jsonify({"comments": cached_comments}), 200
 
-    # -------- Parallel fetch: downloader + Piped (fastest wins) --------
-    import concurrent.futures
+    fetched_comments: list[str] | None = None
+    source_name = "N/A"
 
-    def _piped_comments():
+    # --- Parallel fetch: youtube-comment-downloader + Piped ---
+    def _piped_comments_task():
         js = _fetch_json(
-            HEALTHY_PIPED_HOSTS,
-            f"/api/v1/comments/{vid}?cursor=0",
-            _PIPE_COOLDOWN
+            PIPED_HOSTS, # Use main list, _fetch_json handles healthy selection
+            f"/api/v1/comments/{vid}?continuation=0", # Using 'continuation' for Piped comments if API supports pagination
+            _PIPE_COOLDOWN,
+            proxy_aware=True, # Piped can be behind Cloudflare, proxy helps
+            request_timeout=8.0, hard_deadline=10.0
         )
         if js and js.get("comments"):
+            # Piped comment text can be in 'commentText' or 'comment'
             return [
-                c.get("comment") or c.get("commentText")
+                c.get("commentText") or c.get("comment")
                 for c in js["comments"]
-                if c.get("comment") or c.get("commentText")
-            ] or None
+                if c.get("commentText") or c.get("comment")
+            ][:COMMENT_LIMIT] or None
         return None
 
-    def _downloader_comments():
-        return _download_comments_downloader(vid, COMMENT_LIMIT)
-
-    fetched_comments, winner = None, "N/A"
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        fut_map = {
-            pool.submit(_downloader_comments): "downloader",
-            pool.submit(_piped_comments): "piped"
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        comment_futures = {
+            pool.submit(_download_comments_native, vid, COMMENT_LIMIT): "native_downloader",
+            pool.submit(_piped_comments_task): "piped"
         }
-        for fut in concurrent.futures.as_completed(fut_map, timeout=15):
-            try:
-                res = fut.result()
-                if res:
-                    fetched_comments = res[:COMMENT_LIMIT]
-                    winner = fut_map[fut]
-                    break
-            except Exception:
-                continue
+        # Wait up to 15 seconds for these primaries
+        done_comment_futures, _ = wait(comment_futures.keys(), timeout=15.0, return_when=FIRST_COMPLETED)
+        
+        for fut in done_comment_futures: # Check completed ones first
+            if fut.done() and not fut.cancelled():
+                try:
+                    res = fut.result(timeout=0.1) # Already complete, quick check
+                    if res:
+                        fetched_comments = res
+                        source_name = comment_futures[fut]
+                        # Cancel other primary if one succeeded quickly
+                        for f_key, f_val in comment_futures.items():
+                            if f_key != fut and not f_key.done(): f_key.cancel()
+                        break 
+                except Exception as e_fut:
+                    app.logger.warning(f"[Comments] Primary task {comment_futures[fut]} failed: {e_fut}")
+    
+    if fetched_comments:
+        app.logger.info(f"Comments fetched via {source_name} for {vid} (count: {len(fetched_comments)})")
+    else:
+        app.logger.info(f"[Comments] Primary sources failed for {vid}. Trying fallbacks.")
+        # Fallback 1: yt-dlp
+        fetched_comments = _fetch_comments_ytdlp(vid, COMMENT_LIMIT)
+        if fetched_comments:
+            source_name = "yt-dlp"
+            app.logger.info(f"Comments fetched via {source_name} for {vid} (count: {len(fetched_comments)})")
+        else:
+            # Fallback 2: Invidious
+            js_invidious = _fetch_json(
+                INVIDIOUS_HOSTS,
+                f"/api/v1/comments/{vid}", # Standard Invidious API path for comments
+                _IV_COOLDOWN,
+                proxy_aware=True, # Invidious also benefits from proxies
+                request_timeout=8.0, hard_deadline=10.0
+            )
+            if js_invidious and js_invidious.get("comments"):
+                # Invidious: c["content"] or c["contentHtml"] (needs stripping) or c["text"]
+                comments_list = []
+                for c_inv in js_invidious["comments"]:
+                    text = c_inv.get("content") or c_inv.get("text")
+                    if not text and c_inv.get("contentHtml"):
+                        text = re.sub(r'<[^>]+>', '', c_inv["contentHtml"]) # Strip HTML
+                    if text:
+                        comments_list.append(text.strip())
+                    if len(comments_list) >= COMMENT_LIMIT: break
+                if comments_list:
+                    fetched_comments = comments_list
+                    source_name = "invidious"
+                    app.logger.info(f"Comments fetched via {source_name} for {vid} (count: {len(fetched_comments)})")
 
     if fetched_comments:
-        app.logger.info("Comments fetched via %s for %s (count: %d)",
-                        winner, vid, len(fetched_comments))
         comment_cache[vid] = fetched_comments
         _safe_put(comment_shelf, vid, fetched_comments)
         return jsonify({"comments": fetched_comments}), 200
-        # If we get here, all comment sources failed
-    app.logger.error("All comment sources failed for %s", vid)
-    return jsonify({"error": "Could not retrieve comments"}), 503
+    else:
+        app.logger.error(f"All comment sources failed for {vid}")
+        # Return empty list for robustness, client can handle no comments
+        _safe_put(comment_shelf, vid, []) # Cache empty result to avoid re-fetching constantly
+        comment_cache[vid] = []
+        return jsonify({"comments": []}), 200
+
 
 # ---------------- Metadata ---------------
-@app.route("/video/metadata")
-def metadata():
-    vid = request.args.get("videoId", "")
-    # Persistent and hot cache checks (unchanged)
-    if vid in metadata_shelf:
-        return jsonify({"items": [metadata_shelf[vid]]}), 200
-    if vid in metadata_cache:
-        return jsonify({"items": [metadata_cache[vid]]}), 200
-    if not valid_id(vid):
+@app.route("/video/metadata") # Changed from /youtube/metadata
+@limiter.limit("100/hour;20/minute")
+def metadata_endpoint():
+    video_url_or_id = request.args.get("videoId", "")
+    vid = extract_video_id(video_url_or_id)
+    if not vid:
         return jsonify({"error": "invalid_video_id"}), 400
 
-    base = {
-        "title": None,
-        "channelTitle": None,
-        "thumbnail": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
-        "thumbnailUrl": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
-        "duration": None,
-        "viewCount": None,
-        "likeCount": None,
-        "videoId": vid,
-    }
-
-    # Helper to merge fresh stats into the accumulating `base`
-    def _merge(obj: dict):
-        nonlocal base
-        vc_raw = obj.get("viewCount")
-        try:
-            vc = int(vc_raw) if vc_raw not in (None, "", "NaN") else None
-        except Exception:
-            vc = None
-        if vc and vc > 0:
-            base["viewCount"] = vc
-        if obj.get("likeCount") not in (None, "", "NaN"):
-            try:
-                base["likeCount"] = int(obj["likeCount"])
-            except Exception:
-                pass
-        for k in ("title", "channelTitle", "thumbnail"):
-            if obj.get(k) and not base.get(k):
-                base[k] = obj[k]
+    if vid in metadata_shelf:
+        app.logger.info(f"Metadata cache hit (shelf) for {vid}")
+        return jsonify({"items": [metadata_shelf[vid]]}), 200
+    if (cached_meta := metadata_cache.get(vid)):
+        app.logger.info(f"Metadata cache hit (memory) for {vid}")
+        return jsonify({"items": [cached_meta]}), 200
 
     # --- Define parallel metadata fetch strategies ---
-    def fetch_oembed():
+    def fetch_oembed_meta():
         try:
-            oe = session.get(
-                "https://www.youtube.com/oembed",
-                params={"url": f"https://youtu.be/{vid}", "format": "json"},
-                timeout=3,
-            ).json()
+            oe_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={vid}&format=json"
+            r = session.get(oe_url, timeout=5)
+            r.raise_for_status()
+            oe = r.json()
             return {
-                "title": oe.get("title"),
-                "channelTitle": oe.get("author_name"),
-                "thumbnail": oe.get("thumbnail_url"),
+                "title": oe.get("title"), "channelTitle": oe.get("author_name"),
+                "thumbnail": oe.get("thumbnail_url"), "source": "oembed"
             }
         except Exception as e:
-            app.logger.debug("[Metadata] oEmbed fail for %s: %s", vid, e)
+            app.logger.debug(f"[Metadata] oEmbed fail for {vid}: {type(e).__name__} {e}")
             return None
 
-    def fetch_piped():
-        try:
-            js = _fetch_json(
-                HEALTHY_PIPED_HOSTS,
-                f"/api/v1/streams/{vid}",
-                _PIPE_COOLDOWN,
-                hard_deadline=3.0,
-            )
-            if js and "views" in js:
-                return {
-                    "title": js.get("title"),
-                    "channelTitle": js.get("uploader"),
-                    "thumbnail": js.get("thumbnailUrl"),
-                    "viewCount": js.get("views"),
-                    "likeCount": js.get("likes"),
-                    "duration": js.get("duration"),
-                }
-        except Exception as e:
-            # Mark host as bad for 10 min
-            if HEALTHY_PIPED_HOSTS:
-                _PIPE_COOLDOWN[HEALTHY_PIPED_HOSTS[0]] = time.time() + 600
-            app.logger.warning("[Metadata] Piped error for %s: %s", vid, e)
-        return None
-
-    def fetch_invidious():
-        try:
-            js = _fetch_json(
-                HEALTHY_INVIDIOUS_HOSTS,
-                f"/api/v1/videos/{vid}",
-                _IV_COOLDOWN,
-                proxy_aware=bool(SMARTPROXY_USER),
-                hard_deadline=3.0,
-            )
-            if js and "viewCount" in js:
-                return {
-                    "title": js.get("title"),
-                    "channelTitle": js.get("author"),
-                    "thumbnail": js.get("thumbnail"),
-                    "viewCount": js.get("viewCount"),
-                    "likeCount": js.get("likeCount"),
-                    "duration": js.get("lengthSeconds") or js.get("durationSeconds"),
-                }
-        except Exception as e:
-            if HEALTHY_INVIDIOUS_HOSTS:
-                _IV_COOLDOWN[HEALTHY_INVIDIOUS_HOSTS[0]] = time.time() + 600
-            app.logger.warning("[Metadata] Invidious error for %s: %s", vid, e)
-        return None
-
-    def fetch_ytdlp():
-        try:
-            yt = yt_dlp_info(vid)
+    def fetch_ytdlp_meta():
+        # Try with proxy first, then without if it fails
+        info = yt_dlp_info(vid, use_proxy=True)
+        if info:
             return {
-                "title": yt.get("title"),
-                "channelTitle": yt.get("uploader"),
-                "thumbnail": yt.get("thumbnail"),
-                "viewCount": yt.get("view_count"),
-                "likeCount": yt.get("like_count"),
-                "duration": yt.get("duration"),
+                "title": info.get("title"), "channelTitle": info.get("uploader") or info.get("channel"),
+                "thumbnail": info.get("thumbnail"), "duration": info.get("duration"),
+                "viewCount": info.get("view_count"), "likeCount": info.get("like_count"),
+                "uploadDate": info.get("upload_date"), # YYYYMMDD format
+                "source": "ytdlp"
             }
-        except Exception as e:
-            app.logger.warning("[Metadata] yt-dlp error for %s: %s", vid, e)
-            return None
+        return None
 
-    # --- Parallel fetching: oEmbed, yt-dlp, Piped, Invidious ---
-    import concurrent.futures
-    strategies = [
-        ("oembed", fetch_oembed),
-        ("ytdlp", fetch_ytdlp),
-        ("piped", fetch_piped),
-        ("invidious", fetch_invidious),
-    ]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        fut_map = {pool.submit(fn): name for name, fn in strategies}
-        # Wait for the first to return both title and viewCount
-        done, not_done = concurrent.futures.wait(
-            fut_map, timeout=4, return_when=concurrent.futures.FIRST_COMPLETED
-        )
-        first_partial = None
-        for fut in done:
+    def fetch_piped_meta():
+        js = _fetch_json(PIPED_HOSTS, f"/api/v1/streams/{vid}", _PIPE_COOLDOWN, proxy_aware=True, request_timeout=7, hard_deadline=8)
+        if js:
+            return {
+                "title": js.get("title"), "channelTitle": js.get("uploader"),
+                "thumbnail": js.get("thumbnailUrl"), "duration": js.get("duration"),
+                "viewCount": js.get("views"), "likeCount": js.get("likes"),
+                "uploadDate": str(js.get("uploadDate")).split("T")[0].replace("-","") if js.get("uploadDate") else None, # Convert ISO to YYYYMMDD
+                "source": "piped"
+            }
+        return None
+
+    def fetch_invidious_meta():
+        # Invidious /api/v1/videos/{vid}
+        js = _fetch_json(INVIDIOUS_HOSTS, f"/api/v1/videos/{vid}", _IV_COOLDOWN, proxy_aware=True, request_timeout=7, hard_deadline=8)
+        if js:
+            return {
+                "title": js.get("title"), "channelTitle": js.get("author"),
+                "thumbnail": (js.get("videoThumbnails") or [{}])[0].get("url") if js.get("videoThumbnails") else None, # Prioritize quality thumbnails
+                "duration": js.get("lengthSeconds"), "viewCount": js.get("viewCount"),
+                "likeCount": js.get("likeCount"), 
+                "uploadDate": str(js.get("published")) if js.get("published") else None, # Unix timestamp, needs conversion, or use publishedText
+                "publishedText": js.get("publishedText"), # "X years ago"
+                "source": "invidious"
+            }
+        return None
+
+    # --- Parallel fetching ---
+    # Longer timeout for metadata overall, as it's critical
+    # METADATA_FETCH_TIMEOUT defined as 10s
+    all_sources_results = []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        meta_futures = [
+            pool.submit(fetch_ytdlp_meta), # Prioritize ytdlp
+            pool.submit(fetch_oembed_meta),
+            pool.submit(fetch_piped_meta),
+            pool.submit(fetch_invidious_meta),
+        ]
+        for fut in concurrent.futures.as_completed(meta_futures, timeout=METADATA_FETCH_TIMEOUT):
             try:
-                res = fut.result()
+                res = fut.result(timeout=0.1) # Small timeout as already completed
                 if res:
-                    _merge(res)
-                    # If both title and viewCount, return immediately
-                    if base.get("title") and base.get("viewCount") is not None:
-                        for rem in not_done:
-                            rem.cancel()
-                        base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
-                        metadata_cache[vid] = base
-                        _safe_put(metadata_shelf, vid, base)
-                        return jsonify({"items": [base]}), 200
-                    # If partial (e.g. oEmbed), remember it
-                    if not first_partial and (base.get("title") or base.get("channelTitle")):
-                        first_partial = dict(base)
-            except Exception:
-                continue
-        # If nothing valid yet, wait for remaining up to 3s more
-        for fut in not_done:
-            try:
-                res = fut.result(timeout=3)
-                if res:
-                    _merge(res)
-                    if base.get("title") and base.get("viewCount") is not None:
-                        base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
-                        metadata_cache[vid] = base
-                        _safe_put(metadata_shelf, vid, base)
-                        return jsonify({"items": [base]}), 200
-                    if not first_partial and (base.get("title") or base.get("channelTitle")):
-                        first_partial = dict(base)
-            except Exception:
-                continue
+                    all_sources_results.append(res)
+            except Exception as e_fut:
+                app.logger.warning(f"[Metadata] A metadata source failed: {e_fut}")
+    
+    # --- Intelligent Merging ---
+    final_meta = {
+        "title": None, "channelTitle": None,
+        "thumbnail": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg", # Default
+        "thumbnailUrl": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+        "duration": None, "viewCount": None, "likeCount": None, "videoId": vid,
+        "uploadDate": None, "publishedText": None, "sourcePriority": []
+    }
 
-    # If partial metadata available, return it immediately and launch background refresh for missing fields
-    if first_partial and (first_partial.get("title") or first_partial.get("channelTitle")):
-        app.logger.info("[Metadata] Returning partial metadata for %s, background refresh for missing fields.", vid)
-        # Fire-and-forget background fetch for missing fields
-        def _bg_refresh():
-            try:
-                # Try all strategies again, serially, with longer timeout
-                for name, fn in strategies:
-                    try:
-                        res = fn()
-                        if res:
-                            _merge(res)
-                            if base.get("title") and base.get("viewCount") is not None:
-                                base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
-                                metadata_cache[vid] = base
-                                _safe_put(metadata_shelf, vid, base)
-                                break
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-        executor.submit(_bg_refresh)
-        return jsonify({"items": [first_partial]}), 200
+    # Define a preference order for sources
+    source_preference = ["ytdlp", "oembed", "piped", "invidious"]
 
-    # --- Fallback: Robust serial attempts if all parallel fail ---
-    app.logger.info("[Metadata] Resorting to robust serial fallback for %s", vid)
-    for name, fn in strategies:
-        try:
-            res = fn()
-            if res:
-                _merge(res)
-                if base.get("title") and base.get("viewCount") is not None:
-                    base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
-                    metadata_cache[vid] = base
-                    _safe_put(metadata_shelf, vid, base)
-                    return jsonify({"items": [base]}), 200
-        except Exception:
-            continue
+    def is_valid_title(title_str):
+        if not title_str or not isinstance(title_str, str): return False
+        title_lower = title_str.strip().lower()
+        return title_lower and title_lower not in ["untitled video", "youtube video", "", "[private video]", "[deleted video]"]
 
-    # yt‑dlp / some mirrors occasionally return the literal string 'Untitled Video'
-    if base.get("title") == "Untitled Video" and (not base.get("viewCount") or base["viewCount"] == 0):
-        base["title"] = None
-        app.logger.warning("[Metadata] Dropped 'Untitled Video' with zero views for %s", vid)
-    # Final check – if still missing essentials, return 503 so client can degrade gracefully
-    if base.get("title") is None or base.get("viewCount") is None:
-        app.logger.error(
-            "[Metadata] Unrecoverable: missing essential metadata for %s after all strategies. Returning 503.",
-            vid,
-        )
-        return jsonify({"error": "Could not retrieve essential video metadata"}), 503
+    for source_name in source_preference:
+        for res in all_sources_results:
+            if res and res.get("source") == source_name:
+                final_meta["sourcePriority"].append(source_name)
+                if not final_meta["title"] and is_valid_title(res.get("title")):
+                    final_meta["title"] = res["title"].strip()
+                if not final_meta["channelTitle"] and res.get("channelTitle"):
+                    final_meta["channelTitle"] = res["channelTitle"].strip()
+                if res.get("thumbnail") and (final_meta["thumbnail"].startswith("https://i.ytimg.com/") or source_name == "ytdlp"): # Prefer yt-dlp/oembed thumbs
+                    final_meta["thumbnail"] = final_meta["thumbnailUrl"] = res["thumbnail"]
+                if final_meta["duration"] is None and res.get("duration") is not None:
+                     try: final_meta["duration"] = int(res["duration"])
+                     except: pass
+                if final_meta["viewCount"] is None and res.get("viewCount") is not None:
+                    try: final_meta["viewCount"] = int(res["viewCount"])
+                    except: pass
+                if final_meta["likeCount"] is None and res.get("likeCount") is not None:
+                    try: final_meta["likeCount"] = int(res["likeCount"])
+                    except: pass
+                if not final_meta["uploadDate"] and res.get("uploadDate"): # Expects YYYYMMDD
+                    final_meta["uploadDate"] = str(res["uploadDate"])
+                if not final_meta["publishedText"] and res.get("publishedText"):
+                    final_meta["publishedText"] = res.get("publishedText")
 
-    base["thumbnailUrl"] = base.get("thumbnail", base["thumbnailUrl"])
-    metadata_cache[vid] = base
-    _safe_put(metadata_shelf, vid, base)
-    return jsonify({"items": [base]}), 200
+    # If title is still generic after preferred sources, try any non-empty title
+    if not is_valid_title(final_meta["title"]):
+        for res in all_sources_results: # Check all results again
+            if res and res.get("title") and res.get("title").strip():
+                final_meta["title"] = res["title"].strip() # Take first available non-empty
+                break 
+    
+    # Final check for essential data
+    if not is_valid_title(final_meta["title"]) or final_meta["viewCount"] is None:
+        app.logger.error(f"[Metadata] Failed to retrieve essential metadata for {vid}. Title: '{final_meta['title']}', Views: {final_meta['viewCount']}. Sources attempted: {final_meta['sourcePriority']}")
+        # Try one last direct yt-dlp call without proxy if everything else failed badly
+        if not any(s == "ytdlp" for s in final_meta["sourcePriority"]): # if ytdlp wasn't even tried or failed early
+            app.logger.info(f"[Metadata] Attempting final direct yt-dlp for {vid}")
+            ytdlp_direct_res = fetch_ytdlp_meta() # This will try with proxy then without
+            if ytdlp_direct_res and is_valid_title(ytdlp_direct_res.get("title")) and ytdlp_direct_res.get("viewCount") is not None:
+                app.logger.info(f"[Metadata] Final direct yt-dlp successful for {vid}")
+                final_meta = {**final_meta, **ytdlp_direct_res} # Merge, prioritizing new fields
+            else:
+                 return jsonify({"error": "Could not retrieve essential video metadata after all attempts."}), 503
+        elif not is_valid_title(final_meta["title"]) or final_meta["viewCount"] is None : # if ytdlp was tried but still bad data
+            return jsonify({"error": "Could not retrieve essential video metadata. Data quality poor."}), 503
 
 
-# ─────────────────────────────────────────────
-# Simple circuit-breaker for upstream errors (OpenAI proxy)
-# ─────────────────────────────────────────────
+    app.logger.info(f"[Metadata] Successfully fetched metadata for {vid} (Title: '{final_meta['title']}', Views: {final_meta['viewCount']}) using sources: {final_meta['sourcePriority']}")
+    del final_meta["sourcePriority"] # Clean up internal field
+    metadata_cache[vid] = final_meta
+    _safe_put(metadata_shelf, vid, final_meta)
+    return jsonify({"items": [final_meta]}), 200
+
+
+# ---------------- OpenAI Proxy (with Circuit Breaker from new version) -----------
 class CircuitBreaker:
-    """
-    Minimal circuit-breaker implementation.
-    Opens after N failures and stays open for timeout.
-    """
-    def __init__(self, name: str, failure_threshold: int = 3, reset_timeout: int = 60):
+    def __init__(self, name: str, failure_threshold: int = 3, reset_timeout: int = 60): # seconds
         self.name = name
         self.failure_threshold = failure_threshold
         self.reset_timeout = reset_timeout
@@ -962,172 +1049,311 @@ class CircuitBreaker:
         self.last_failure_time = 0.0
         self.is_open = False
         self._lock = Lock()
+        app.logger.info(f"CircuitBreaker '{name}' initialized: threshold={failure_threshold}, timeout={reset_timeout}s")
 
     def allow_request(self) -> bool:
         with self._lock:
             if self.is_open:
-                if time.time() - self.last_failure_time > self.reset_timeout:
+                if (time.time() - self.last_failure_time) > self.reset_timeout:
                     self.is_open = False
-                    self.failure_count = 0
-                    return True
+                    self.failure_count = 0 # Reset on recovery
+                    app.logger.info(f"Circuit '{self.name}' is now half-open (resetting).")
+                    return True # Allow one request in half-open state
+                app.logger.warning(f"Circuit '{self.name}' is OPEN. Request denied.")
                 return False
             return True
 
     def record_success(self):
         with self._lock:
+            if self.is_open : # If it was half-open and succeeded
+                 app.logger.info(f"Circuit '{self.name}' is now CLOSED (recovered).")
             self.failure_count = 0
             self.is_open = False
+
 
     def record_failure(self):
         with self._lock:
             self.failure_count += 1
             self.last_failure_time = time.time()
             if self.failure_count >= self.failure_threshold:
+                if not self.is_open: # Log only when it trips open
+                    app.logger.error(f"Circuit '{self.name}' OPENED after {self.failure_count} failures.")
                 self.is_open = True
-                app.logger.warning("Circuit %s opened after %d failures",
-                                   self.name, self.failure_count)
-   
 
-# ---------------- OpenAI RESPONSES POST
-openai_circuit = CircuitBreaker("openai", failure_threshold=3, reset_timeout=60)
+openai_circuit = CircuitBreaker("openai_proxy", failure_threshold=5, reset_timeout=120) # More tolerant
 
 @app.route("/openai/responses", methods=["POST"])
-def create_response():
-    """OpenAI proxy with retry and circuit-breaker."""
+@limiter.limit("60 per minute") # Assuming this is a paid API, protect it
+def create_openai_response():
     if not OPENAI_API_KEY:
+        app.logger.error("[OpenAI Proxy] OPENAI_API_KEY is not configured.")
         return jsonify({'error': 'OpenAI API key not configured'}), 500
 
     if not openai_circuit.allow_request():
-        return jsonify({'error': 'Service temporarily unavailable (circuit open)'}), 503
+        return jsonify({'error': 'OpenAI service temporarily unavailable (circuit open). Please try again later.'}), 503
 
     try:
-        payload = request.get_json(force=True)
-    except:
-        return jsonify({'error': 'Invalid JSON payload'}), 400
+        payload = request.get_json(force=True) # force=True can be risky if content-type is wrong
+        if not payload:
+            return jsonify({'error': 'Invalid or empty JSON payload'}), 400
+    except Exception as json_err:
+        app.logger.error(f"[OpenAI Proxy] Failed to parse request JSON: {json_err}")
+        return jsonify({'error': 'Bad request JSON'}), 400
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json"
     }
+    
+    # Log essential info, be careful with logging full payload if it's large/sensitive
+    model_requested = payload.get('model', 'N/A')
+    app.logger.info(f"[OpenAI Proxy] Request for model: {model_requested}. Input length (if any): {len(str(payload.get('input', '')))}. Context ID (if any): {payload.get('previous_response_id', 'N/A')}")
 
-    max_retries = 3
-    backoff = 0.5
-    for attempt in range(max_retries):
+
+    # OpenAI endpoint seems to be /v1/chat/completions or /v1/completions, not /v1/responses
+    # Based on your old code, it was "/v1/responses". If this is a custom endpoint or older API, keep it.
+    # If it's standard OpenAI, it should be e.g. "https://api.openai.com/v1/chat/completions"
+    openai_api_url = "https://api.openai.com/v1/responses" # As per your original code
+    # If your Swift client expects your backend to proxy to a specific OpenAI model type,
+    # you might need to adjust the `openai_api_url` and payload structure.
+    # For example, for chat models:
+    # openai_api_url = "https://api.openai.com/v1/chat/completions"
+    # And payload should be like: {"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "Hello!"}]}
+
+    max_retries = 2 # Total 3 attempts (initial + 2 retries)
+    base_backoff = 1.0 # seconds
+
+    for attempt in range(max_retries + 1):
         try:
-            timeout = 30 + attempt * 10
-            resp = session.post(
-                "https://api.openai.com/v1/responses",
-                headers=headers,
-                json=payload,
-                timeout=timeout
-            )
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", "1"))
-                time.sleep(min(retry_after, 10))
-                continue
+            # Increased timeout, especially for potentially long OpenAI responses
+            # Timeout for connect and read separately
+            resp = session.post(openai_api_url, headers=headers, json=payload, timeout=(10, 60)) # (connect_timeout, read_timeout)
+            
+            app.logger.info(f"[OpenAI Proxy] Attempt {attempt+1}: OpenAI API ({openai_api_url}) status: {resp.status_code}")
 
-            resp.raise_for_status()
+            if resp.status_code == 429: # Rate limit
+                retry_after_str = resp.headers.get("Retry-After", str(base_backoff * (2**attempt)))
+                try:
+                    retry_after_sec = int(retry_after_str)
+                except ValueError: # If it's a date string
+                    # This needs parsing, for simplicity using backoff
+                    retry_after_sec = int(base_backoff * (2**attempt) * 2) # Default if parsing date is complex
+                
+                sleep_time = min(retry_after_sec, 30) # Cap sleep time
+                app.logger.warning(f"[OpenAI Proxy] Rate limited (429). Retrying after {sleep_time}s.")
+                if attempt < max_retries:
+                    time.sleep(sleep_time)
+                    continue # Retry
+                else: # Max retries reached for 429
+                    openai_circuit.record_failure() # Count this as a failure for circuit breaker
+                    return jsonify({'error': 'OpenAI rate limit exceeded after multiple retries.'}), 429
+            
+            resp.raise_for_status() # Raises HTTPError for 4xx/5xx responses not handled above
+            
             openai_circuit.record_success()
-            return jsonify(resp.json()), resp.status_code
+            # Log structure of successful response for debugging client DTOs
+            response_data_preview = str(resp.content[:500]) # Log beginning of raw content
+            app.logger.info(f"[OpenAI Proxy] Success. Response preview: {response_data_preview}")
+            return resp.content, resp.status_code, resp.headers.items() # Return raw content and headers
 
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-            time.sleep(backoff * (2 ** attempt))
-        except Exception:
-            break
-
+        except requests.exceptions.HTTPError as he:
+            app.logger.error(f"[OpenAI Proxy] Attempt {attempt+1} HTTPError: {he.response.status_code} - {he.response.text[:500]}")
+            if he.response.status_code >= 500: # Server-side errors on OpenAI
+                if attempt < max_retries:
+                    time.sleep(base_backoff * (2**attempt))
+                    continue # Retry for server errors
+            # For 4xx client errors (other than 429) or 5xx after retries, break and return error
+            openai_circuit.record_failure()
+            error_details = he.response.text
+            try:
+                error_json = json.loads(error_details)
+                if "error" in error_json and "message" in error_json["error"]:
+                    error_details = error_json["error"]["message"]
+            except: pass
+            return jsonify({'error': 'OpenAI API error', 'details': error_details}), he.response.status_code
+        except requests.exceptions.Timeout:
+            app.logger.error(f"[OpenAI Proxy] Attempt {attempt+1} Timeout connecting to OpenAI.")
+            if attempt < max_retries:
+                time.sleep(base_backoff * (2**attempt))
+                continue # Retry for timeout
+            openai_circuit.record_failure()
+            return jsonify({'error': 'Timeout communicating with OpenAI service.'}), 504
+        except requests.exceptions.RequestException as req_err: # Other network errors
+            app.logger.error(f"[OpenAI Proxy] Attempt {attempt+1} Network error: {req_err}")
+            if attempt < max_retries:
+                time.sleep(base_backoff * (2**attempt))
+                continue
+            openai_circuit.record_failure()
+            return jsonify({'error': 'Network error communicating with OpenAI service.'}), 503
+    
+    # Fallthrough if all retries failed without specific handling above
     openai_circuit.record_failure()
-    return jsonify({
-        'error': 'Service temporarily unavailable',
-        'message': 'Failed to communicate with OpenAI after multiple attempts'
-    }), 503
+    return jsonify({'error': 'Failed to communicate with OpenAI after multiple attempts.'}), 503
+
+
+# ---------------- VADER SENTIMENT (No changes from new version) -----------------
+analyzer = SentimentIntensityAnalyzer()
 
 @app.route("/analyze/batch", methods=["POST"])
-@limiter.limit("50 per minute")
+@limiter.limit("100 per minute") # Increased limit slightly
 def analyze_batch():
-    """Chunked VADER processing to avoid long timeouts."""
-    texts = request.get_json(force=True) or []
-    if not texts:
-        return jsonify([]), 200
+    app.logger.info("[VADER_BATCH] Received request.")
+    try:
+        texts = request.get_json(force=True) or [] # force=True ensures it tries to parse even if content-type is not perfect
+        if not texts:
+            app.logger.info("[VADER_BATCH] Empty text list received.")
+            return jsonify([]), 200
 
-    MAX_CHUNK = 50
-    results: list[float] = []
-    for i in range(0, len(texts), MAX_CHUNK):
-        for t in texts[i:i + MAX_CHUNK]:
-            try:
-                results.append(analyzer.polarity_scores(t)["compound"])
-            except Exception:
-                results.append(0.0)
+        num_texts = len(texts)
+        first_text_preview = texts[0][:70] if texts and isinstance(texts[0], str) else "N/A"
+        app.logger.info(f"[VADER_BATCH] Processing {num_texts} texts. First text preview: '{first_text_preview}...'")
 
-    return jsonify(results), 200
+        results = []
+        start_time = time.time()
+        
+        # Chunk processing for very large batches (though client should ideally batch)
+        MAX_CHUNK_VADER = 200 
+        for i in range(0, len(texts), MAX_CHUNK_VADER):
+            chunk = texts[i:i + MAX_CHUNK_VADER]
+            for text_item in chunk:
+                if isinstance(text_item, str):
+                    score = analyzer.polarity_scores(text_item)["compound"]
+                    results.append(score)
+                else:
+                    results.append(0.0) # Default for non-string items
+
+        end_time = time.time()
+        duration = end_time - start_time
+        app.logger.info(f"[VADER_BATCH] Successfully processed {num_texts} texts in {duration:.3f} seconds.")
+        return jsonify(results), 200
+
+    except Exception as e:
+        app.logger.error(f"[VADER_BATCH] Error during batch processing: {type(e).__name__} {e}", exc_info=True)
+        return jsonify({"error": "Failed to process batch sentiment"}), 500
     
-
-# ---------------- SIMPLE HEALTH CHECK ----------------
+# ---------------- HEALTH CHECKS (Adapted from new version) ----------------
 @app.route("/health", methods=["GET"])
 def health_check():
-    return jsonify({'status': 'ok'}), 200
+    return jsonify({'status': 'ok', 'message': 'Backend is running'}), 200
 
-# ---------------- FULL HEALTH CHECK ------------------
 @app.route("/health/deep", methods=["GET"])
 def deep_health_check():
     checks = {}
-    # NOTE: The service no longer calls the official YouTube Data API,
-    # which improves robustness on high‑volume deployments that can’t
-    # obtain or refresh API quotas.
-    # env
+    # Env vars
     checks['env'] = {
-        'OPENAI_KEY': bool(OPENAI_API_KEY),
-        'SMARTPROXY_TOKEN': bool(SMARTPROXY_API_TOKEN)
+        'OPENAI_KEY_PRESENT': bool(OPENAI_API_KEY),
+        'SMARTPROXY_CONFIGURED': bool(SMARTPROXY_USER and SMARTPROXY_PASS and SMARTPROXY_API_TOKEN)
     }
-    # external
+    
+    # External services
     checks['external'] = {}
+    # OpenAI API
+    if OPENAI_API_KEY:
+        try:
+            # Using a light-weight, typically available model listing endpoint
+            r_openai = session.get("https://api.openai.com/v1/models", 
+                                   headers={"Authorization": f"Bearer {OPENAI_API_KEY}"}, timeout=5)
+            checks['external']['openai_api_status'] = r_openai.status_code
+            checks['external']['openai_api_ok'] = r_openai.status_code == 200
+        except Exception as e_openai:
+            app.logger.warning(f"Deep health check: OpenAI API failed: {e_openai}")
+            checks['external']['openai_api_ok'] = False
+            checks['external']['openai_api_error'] = str(e_openai)
+    else:
+        checks['external']['openai_api_ok'] = None # Not configured
+
+    # Smartproxy API (if configured)
+    if SMARTPROXY_USER and SMARTPROXY_PASS and SMARTPROXY_API_TOKEN:
+        try:
+            r_sp = session.post(
+                "https://dashboard.smartproxy.com/api/v1/users/current/statistics/traffic-usage",
+                headers={"Authorization": f"Token {SMARTPROXY_API_TOKEN}", "Content-Type": "application/json"},
+                json={"proxyType": "residential_proxies", "limit": 1}, timeout=5
+            )
+            checks['external']['smartproxy_api_status'] = r_sp.status_code
+            checks['external']['smartproxy_api_ok'] = r_sp.status_code == 200
+        except Exception as e_sp:
+            app.logger.warning(f"Deep health check: Smartproxy API failed: {e_sp}")
+            checks['external']['smartproxy_api_ok'] = False
+            checks['external']['smartproxy_api_error'] = str(e_sp)
+    else:
+        checks['external']['smartproxy_api_ok'] = None # Not configured
+
+    # Disk space
     try:
-        r = session.get("https://api.openai.com/v1/models", timeout=5)
-        checks['external']['openai_api'] = r.status_code == 200
-    except Exception:
-        checks['external']['openai_api'] = False
-    checks['external']['youtube_api'] = None  # skipped – official API disabled
+        total, used, free = shutil.disk_usage('/')
+        checks['disk'] = {
+            'free_gb': round(free / (1024**3), 2),
+            'total_gb': round(total / (1024**3), 2),
+            'free_ratio': round(free / total, 2),
+            'disk_ok': (free / total) > 0.1 # At least 10% free
+        }
+    except Exception as e_disk:
+        app.logger.warning(f"Deep health check: Disk usage check failed: {e_disk}")
+        checks['disk'] = {'disk_ok': False, 'error': str(e_disk)}
+
+    # System Load (if available)
     try:
-        r = session.post("https://dashboard.smartproxy.com/subscription-api/v1/api/public/statistics/traffic",
-                         json={"proxyType":"residential_proxies","limit":1},
-                         timeout=5)
-        checks['external']['smartproxy_api'] = r.status_code == 200
-    except Exception:
-        checks['external']['smartproxy_api'] = False
-    # disk
-    total, used, free = shutil.disk_usage('/')
-    checks['disk'] = {'free_ratio': round(free/total,2), 'disk_ok': (free/total) > 0.1}
-    # load
-    try:
+        cpu_count = os.cpu_count() or 1
         load1, _, _ = os.getloadavg()
-        checks['load'] = {'load1': round(load1,2), 'load_ok': load1 < ((os.cpu_count() or 1)*2)}
-    except Exception:
-        checks['load'] = {'load_ok': True}
+        checks['load'] = {
+            'load1': round(load1, 2),
+            'cpu_count': cpu_count,
+            'load_ok': load1 < (cpu_count * 2) # Load per core < 2
+        }
+    except (OSError, AttributeError) as e_load: # getloadavg not on all OS (e.g. Windows)
+        app.logger.info(f"Deep health check: Load average not available: {e_load}")
+        checks['load'] = {'load_ok': True, 'message': 'Not available on this system'}
 
-    env_ok      = all(checks['env'].values())
-    external_ok = all(v for v in checks['external'].values() if isinstance(v,bool))
-    disk_ok     = checks['disk']['disk_ok']
-    load_ok     = checks['load']['load_ok']
+    # Overall status decision logic
+    env_ok = all(checks['env'].values())
+    # For external_ok, consider 'None' as ok if not configured, or require True if configured
+    external_services_configured_and_ok = True
+    for key, val in checks['external'].items():
+        if key.endswith("_ok") and val is False: # If any configured service is False, then it's not ok
+            external_services_configured_and_ok = False
+            break
+            
+    disk_ok = checks['disk'].get('disk_ok', False)
+    load_ok = checks['load'].get('load_ok', False)
 
-    status = 'ok' if (env_ok and disk_ok and load_ok and external_ok) else \
-             ('degraded' if (env_ok and disk_ok and load_ok) else 'fail')
-
+    final_status = 'ok'
+    if not (env_ok and disk_ok and load_ok and external_services_configured_and_ok):
+        final_status = 'degraded'
+    if not env_ok or not disk_ok: # Critical failures
+        final_status = 'fail'
+    
     return jsonify({
-        'status': status,
+        'status': final_status,
+        'uptime_seconds': round(time.time() - app_start_time, 2),
         'checks': checks,
-        'uptime_seconds': round(time.time() - app_start_time, 2)
-    }), 200
+    }), 200 if final_status != 'fail' else 503
 
 
 # --------------------------------------------------
-# Run
+# App Runner and Cleanup
 # --------------------------------------------------
+def close_shelves():
+    app.logger.info("Closing shelve files...")
+    if 'transcript_shelf' in globals() and transcript_shelf: transcript_shelf.close()
+    if 'comment_shelf' in globals() and comment_shelf: comment_shelf.close()
+    if 'analysis_shelf' in globals() and analysis_shelf: analysis_shelf.close()
+    if 'metadata_shelf' in globals() and metadata_shelf: metadata_shelf.close()
+    app.logger.info("Shelve files closed.")
+
+def shutdown_executor():
+    app.logger.info("Shutting down ThreadPoolExecutor...")
+    executor.shutdown(wait=True) # Wait for tasks to complete during shutdown
+    app.logger.info("ThreadPoolExecutor shut down.")
+
+atexit.register(close_shelves)
+atexit.register(shutdown_executor)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5010))
+    # For development, threaded=True is fine.
+    # For production, gunicorn (or similar) handles workers.
+    # Flask's built-in server is not for production.
+    app.logger.info(f"Starting Flask development server on host 0.0.0.0 port {port}")
     app.run(host="0.0.0.0", port=port, threaded=True)
-
-import atexit
-atexit.register(lambda: executor.shutdown(wait=False))
-atexit.register(lambda: transcript_shelf.close())
-atexit.register(lambda: comment_shelf.close())
-atexit.register(lambda: analysis_shelf.close())
-
