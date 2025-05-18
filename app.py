@@ -929,9 +929,9 @@ def metadata():
             continue
 
     # yt‑dlp / some mirrors occasionally return the literal string 'Untitled Video'
-    if base.get("title") == "Untitled Video":
+    if base.get("title") == "Untitled Video" and (not base.get("viewCount") or base["viewCount"] == 0):
         base["title"] = None
-
+        app.logger.warning("[Metadata] Dropped 'Untitled Video' with zero views for %s", vid)
     # Final check – if still missing essentials, return 503 so client can degrade gracefully
     if base.get("title") is None or base.get("viewCount") is None:
         app.logger.error(
@@ -945,145 +945,120 @@ def metadata():
     _safe_put(metadata_shelf, vid, base)
     return jsonify({"items": [base]}), 200
 
+
+# ─────────────────────────────────────────────
+# Simple circuit-breaker for upstream errors (OpenAI proxy)
+# ─────────────────────────────────────────────
+class CircuitBreaker:
+    """
+    Minimal circuit-breaker implementation.
+    Opens after N failures and stays open for timeout.
+    """
+    def __init__(self, name: str, failure_threshold: int = 3, reset_timeout: int = 60):
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self.failure_count = 0
+        self.last_failure_time = 0.0
+        self.is_open = False
+        self._lock = Lock()
+
+    def allow_request(self) -> bool:
+        with self._lock:
+            if self.is_open:
+                if time.time() - self.last_failure_time > self.reset_timeout:
+                    self.is_open = False
+                    self.failure_count = 0
+                    return True
+                return False
+            return True
+
+    def record_success(self):
+        with self._lock:
+            self.failure_count = 0
+            self.is_open = False
+
+    def record_failure(self):
+        with self._lock:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            if self.failure_count >= self.failure_threshold:
+                self.is_open = True
+                app.logger.warning("Circuit %s opened after %d failures",
+                                   self.name, self.failure_count)
    
 
-# ---------------- OpenAI RESPONSES POST (with Enhanced Logging) -----------
+# ---------------- OpenAI RESPONSES POST
+openai_circuit = CircuitBreaker("openai", failure_threshold=3, reset_timeout=60)
+
 @app.route("/openai/responses", methods=["POST"])
 def create_response():
+    """OpenAI proxy with retry and circuit-breaker."""
     if not OPENAI_API_KEY:
-        app.logger.error("[OpenAI Proxy /responses] OPENAI_API_KEY is not configured.")
         return jsonify({'error': 'OpenAI API key not configured'}), 500
 
-    try:
-        # Get the raw JSON payload sent by the iOS client
-        payload = request.get_json()
-        if not payload:
-            app.logger.error("[OpenAI Proxy /responses] Received empty or invalid JSON payload.")
-            return jsonify({'error': 'Invalid JSON payload'}), 400
-    except Exception as json_err:
-        app.logger.error(f"[OpenAI Proxy /responses] Failed to parse request JSON: {json_err}", exc_info=True)
-        return jsonify({'error': 'Bad request JSON'}), 400
+    if not openai_circuit.allow_request():
+        return jsonify({'error': 'Service temporarily unavailable (circuit open)'}), 503
 
-    # Prepare headers for the actual OpenAI API call
+    try:
+        payload = request.get_json(force=True)
+    except:
+        return jsonify({'error': 'Invalid JSON payload'}), 400
+
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json"
     }
 
-    # Log the payload received from the client (excluding potentially large 'input')
-    logged_payload = {k: v for k, v in payload.items() if k != 'input'}
-    logged_payload['input_length'] = len(payload.get('input', ''))
-    app.logger.info(f"[OpenAI Proxy /responses] Received request payload (excluding input): {json.dumps(logged_payload)}")
-    app.logger.info(f"[OpenAI Proxy /responses] Calling OpenAI API (https://api.openai.com/v1/responses) -> Model: {payload.get('model', 'N/A')}")
-
-    resp = None # Initialize resp to None
-    try:
-        # Make the POST request directly to OpenAI's /v1/responses endpoint
-        resp = requests.post("https://api.openai.com/v1/responses",
-                             headers=headers, json=payload, timeout=60) # Increased timeout
-
-        app.logger.info(f"[OpenAI Proxy /responses] OpenAI API Response Status Code: {resp.status_code}")
-
-        # Log response body especially if it's not 200 OK
-        if resp.status_code != 200:
-            response_text = resp.text[:1000] # Log first 1000 chars of error response
-            app.logger.error(f"[OpenAI Proxy /responses] OpenAI API returned error {resp.status_code}. Response body: {response_text}")
-
-        resp.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-
-        # If successful, return the JSON directly from OpenAI
-        response_data = resp.json()
-        app.logger.info(f"[OpenAI Proxy /responses] Successfully received response from OpenAI.")
-
-        # --- Log Response Structure ---
-        # Log keys to understand the structure we get back from /v1/responses
-        if isinstance(response_data, dict):
-             app.logger.debug(f"[OpenAI Proxy /responses] Response Keys: {list(response_data.keys())}")
-             # Try to log the specific fields your Swift code expects based on OpenAIProxyResponseDTO
-             resp_id = response_data.get('id', 'N/A')
-             output_text = response_data.get('output_text') # Check if SDK adds this convenience
-             output_field = response_data.get('output')
-             choices_field = response_data.get('choices')
-             text_field = response_data.get('text')
-             app.logger.debug(f"[OpenAI Proxy /responses] Response fields check: id='{resp_id}', output_text exists? {output_text is not None}, output exists? {output_field is not None}, choices exists? {choices_field is not None}, text exists? {text_field is not None}")
-             # Log preview of nested content if possible
-             content_preview = "N/A"
-             if output_text:
-                 content_preview = output_text[:200] + "..."
-             elif isinstance(output_field, list) and output_field:
-                 content_preview = str(output_field[0])[:200] + "..."
-             elif isinstance(choices_field, list) and choices_field:
-                 content_preview = str(choices_field[0])[:200] + "..."
-             elif text_field:
-                 content_preview = text_field[:200] + "..."
-             app.logger.debug(f"[OpenAI Proxy /responses] Content Preview: {content_preview}")
-
-        elif isinstance(response_data, list):
-             app.logger.debug(f"[OpenAI Proxy /responses] Response is a List (length {len(response_data)}). First item preview: {str(response_data[0])[:200] if response_data else 'Empty List'}")
-        else:
-             app.logger.debug(f"[OpenAI Proxy /responses] Response type: {type(response_data)}. Preview: {str(response_data)[:200]}")
-        # --- End Log Response Structure ---
-
-
-        return jsonify(response_data), resp.status_code
-
-    except requests.HTTPError as he:
-        status = he.response.status_code if he.response else 500
-        err_msg = f"OpenAI API HTTP error: Status Code {status}"
-        err_details = resp.text[:1000] if resp else "No response object"
-        app.logger.error(f"[OpenAI Proxy /responses] {err_msg}. Details: {err_details}", exc_info=True)
-        clean_details = err_details
+    max_retries = 3
+    backoff = 0.5
+    for attempt in range(max_retries):
         try:
-            error_json = json.loads(err_details)
-            clean_details = error_json.get("error", {}).get("message", clean_details)
-        except:
-            pass
-        headers = {}
-        retry_after = resp.headers.get("Retry-After") if resp else None
-        if status == 429 and retry_after:
-            headers["Retry-After"] = retry_after
-        return (jsonify({'error': 'OpenAI API error', 'details': clean_details}), status, headers)
-    except requests.exceptions.RequestException as req_err:
-        # Handle network errors (timeout, connection error, etc.)
-        app.logger.error(f"[OpenAI Proxy /responses] Network error connecting to OpenAI: {req_err}", exc_info=True)
-        return jsonify({'error': 'Network error communicating with OpenAI service'}), 503
-    except Exception as e:
-        # Catch any other unexpected errors
-        app.logger.error(f"[OpenAI Proxy /responses] Unexpected error: {e}", exc_info=True)
-        return jsonify({'error': 'Internal server error during OpenAI request processing'}), 500
+            timeout = 30 + attempt * 10
+            resp = session.post(
+                "https://api.openai.com/v1/responses",
+                headers=headers,
+                json=payload,
+                timeout=timeout
+            )
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", "1"))
+                time.sleep(min(retry_after, 10))
+                continue
 
+            resp.raise_for_status()
+            openai_circuit.record_success()
+            return jsonify(resp.json()), resp.status_code
 
-    
-# ---------------- VADER SENTIMENT -----------------
-analyzer = SentimentIntensityAnalyzer()
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            time.sleep(backoff * (2 ** attempt))
+        except Exception:
+            break
+
+    openai_circuit.record_failure()
+    return jsonify({
+        'error': 'Service temporarily unavailable',
+        'message': 'Failed to communicate with OpenAI after multiple attempts'
+    }), 503
 
 @app.route("/analyze/batch", methods=["POST"])
 @limiter.limit("50 per minute")
 def analyze_batch():
-    app.logger.info("[VADER_BATCH] Received request.")
+    """Chunked VADER processing to avoid long timeouts."""
     texts = request.get_json(force=True) or []
     if not texts:
-        app.logger.info("[VADER_BATCH] Empty text list received.")
         return jsonify([]), 200
 
-    num_texts = len(texts)
-    first_text_preview = texts[0][:50] if texts else "N/A"
-    app.logger.info(f"[VADER_BATCH] Processing {num_texts} texts. First text preview: '{first_text_preview}...'")
+    MAX_CHUNK = 50
+    results: list[float] = []
+    for i in range(0, len(texts), MAX_CHUNK):
+        for t in texts[i:i + MAX_CHUNK]:
+            try:
+                results.append(analyzer.polarity_scores(t)["compound"])
+            except Exception:
+                results.append(0.0)
 
-    try:
-        results = []
-        start_time = time.time()
-        for i, t in enumerate(texts):
-            score = analyzer.polarity_scores(t)["compound"]
-            results.append(score)
-        end_time = time.time()
-        duration = end_time - start_time
-        app.logger.info(f"[VADER_BATCH] Successfully processed {num_texts} texts in {duration:.3f} seconds.")
-        return jsonify(results), 200
-    except Exception as e:
-        app.logger.error(f"[VADER_BATCH] Error during batch processing: {e}", exc_info=True)
-        neutral = [0.0 for _ in texts]
-        return jsonify(neutral), 200
+    return jsonify(results), 200
     
 
 # ---------------- SIMPLE HEALTH CHECK ----------------
