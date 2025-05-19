@@ -66,7 +66,6 @@ SMARTPROXY_PORT  = "10000"
 SMARTPROXY_API_TOKEN = os.getenv("SMARTPROXY_API_TOKEN")
 
 OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY")
-YOUTUBE_DATA_API_KEY = os.getenv("YOUTUBE_API_KEY")
 YTDL_COOKIE_FILE     = os.getenv("YTDL_COOKIE_FILE")
 
 # Maximum comments to retrieve per video (overridable via env)
@@ -369,7 +368,7 @@ def get_proxy_stats():
     app.logger.info("[OUT] Smartproxy stats")
     try:
         r = session.post(
-            "https://dashboard.smartproxy.com/subscription-api/v1/api/public/statistics/traffic",
+            "https://dashboard.decodo.com/subscription-api/v1/api/public/statistics/traffic",
             json=payload, timeout=10
         )
         app.logger.info("[OUT] Smartproxy ← %s (stats)", r.status_code)
@@ -469,6 +468,45 @@ def metadata():
         return jsonify({"error": "missing_video_id"}), 400
     if not valid_id(vid):
         return jsonify({"error": "invalid_video_id"}), 400
+
+    # Handle scenario where SmartProxy is down by providing fallback metadata fetching
+    # using existing alternatives (Piped/Invidious/yt-dlp).
+    try:
+        smartproxy_ok = bool(SMARTPROXY_USER)
+    except Exception:
+        smartproxy_ok = False
+
+    if not smartproxy_ok:
+        js = _fetch_json(PIPED_HOSTS, f"/api/v1/streams/{vid}", _PIPE_COOLDOWN)
+        if js:
+            base = {
+                "title": js.get("title"),
+                "channelTitle": js.get("uploader"),
+                "thumbnail": js.get("thumbnailUrl"),
+                "thumbnailUrl": js.get("thumbnailUrl"),
+                "duration": js.get("duration"),
+                "viewCount": js.get("views"),
+                "likeCount": js.get("likes"),
+                "videoId": vid,
+            }
+            return jsonify({"items":[base]}), 200
+        # fallback to yt-dlp
+        try:
+            yt = yt_dlp_info(vid)
+            base = {
+                "title": yt.get("title"),
+                "channelTitle": yt.get("uploader"),
+                "thumbnail": yt.get("thumbnail"),
+                "thumbnailUrl": yt.get("thumbnail"),
+                "duration": yt.get("duration"),
+                "viewCount": yt.get("view_count"),
+                "likeCount": yt.get("like_count"),
+                "videoId": vid,
+            }
+            return jsonify({"items":[base]}), 200
+        except Exception:
+            pass
+        return jsonify({"error": "SmartProxy unavailable and no fallback available"}), 503
 
     # 1) oEmbed
     try:
@@ -690,7 +728,6 @@ def deep_health_check():
     # env
     checks['env'] = {
         'OPENAI_KEY': bool(OPENAI_API_KEY),
-        'YOUTUBE_KEY': bool(YOUTUBE_DATA_API_KEY),
         'SMARTPROXY_TOKEN': bool(SMARTPROXY_API_TOKEN)
     }
     # external
@@ -701,14 +738,7 @@ def deep_health_check():
     except Exception:
         checks['external']['openai_api'] = False
     try:
-        r = session.get("https://www.googleapis.com/youtube/v3/videos",
-                        params={'id':'dQw4w9WgXcQ','part':'id','key':YOUTUBE_DATA_API_KEY},
-                        timeout=5)
-        checks['external']['youtube_api'] = r.status_code == 200
-    except Exception:
-        checks['external']['youtube_api'] = False
-    try:
-        r = session.post("https://dashboard.smartproxy.com/subscription-api/v1/api/public/statistics/traffic",
+        r = session.post("https://dashboard.decodo.com/subscription-api/v1/api/public/statistics/traffic",
                          json={"proxyType":"residential_proxies","limit":1},
                          timeout=5)
         checks['external']['smartproxy_api'] = r.status_code == 200
