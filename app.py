@@ -179,6 +179,13 @@ FALLBACK_LANGUAGES = [
 ]
 
 # --------------------------------------------------
+# Test
+# --------------------------------------------------
+@app.route("/my_ip")
+def my_ip():
+    return jsonify({"ip": request.headers.get("X-Forwarded-For", request.remote_addr)})
+
+# --------------------------------------------------
 # Logging setup (console + rotating file)
 # --------------------------------------------------
 os.makedirs("logs", exist_ok=True)
@@ -778,3 +785,5 @@ if __name__ == "__main__":
 
 import atexit
 atexit.register(lambda: executor.shutdown(wait=False))
+
+
