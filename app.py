@@ -185,6 +185,15 @@ FALLBACK_LANGUAGES = [
 def my_ip():
     return jsonify({"ip": request.headers.get("X-Forwarded-For", request.remote_addr)})
 
+@app.route("/smartproxy_ip")
+def smartproxy_ip():
+    try:
+        r = session.get("https://ip.smartproxy.com", proxies=rnd_proxy(), timeout=5)
+        return jsonify({"smartproxy_seen_ip": r.text.strip()}), 200
+    except Exception as e:
+        app.logger.error("Smartproxy IP check failed: %s", e)
+        return jsonify({"error": str(e)}), 500
+
 # --------------------------------------------------
 # Logging setup (console + rotating file)
 # --------------------------------------------------
