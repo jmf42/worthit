@@ -19,6 +19,3 @@ youtube-comment-downloader
 sqlitedict>=2.1
 
 
-openai-whisper==20231116
-torch==2.2.2
-ffmpeg-python==0.2.0
