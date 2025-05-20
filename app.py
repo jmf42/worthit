@@ -69,7 +69,7 @@ OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY")
 YTDL_COOKIE_FILE     = os.getenv("YTDL_COOKIE_FILE")
 
 # Maximum comments to retrieve per video (overridable via env)
-COMMENT_LIMIT = int(os.getenv("COMMENT_LIMIT", "120"))
+COMMENT_LIMIT = int(os.getenv("COMMENT_LIMIT", "50"))
 
 PROXY_ROTATION = (
     [
@@ -85,7 +85,6 @@ def rnd_proxy() -> dict:       # always returns {"https": "..."} or {}
     return next(_proxy_cycle)
 
 PIPED_HOSTS = deque([
-    "https://pipedapi.kavin.rocks",
     "https://pipedapi.tokhmi.xyz",
     "https://pipedapi.moomoo.me",
     "https://piped.video",
@@ -176,11 +175,11 @@ limiter = Limiter(**limiter_kwargs)
 # ── Caches: smaller in‑RAM footprint, tunable via env ─────────────────────────
 transcript_cache = TTLCache(
     maxsize=int(os.getenv("TRANSCRIPT_CACHE_SIZE", "150")),  # default 150 items
-    ttl=int(os.getenv("TRANSCRIPT_CACHE_TTL", "300"))        # default 5 min
+    ttl=int(os.getenv("TRANSCRIPT_CACHE_TTL", "3600"))       # default 1 hour
 )
 comment_cache = TTLCache(
     maxsize=int(os.getenv("COMMENT_CACHE_SIZE", "100")),     # default 100 items
-    ttl=int(os.getenv("COMMENT_CACHE_TTL", "300"))           # default 5 min
+    ttl=int(os.getenv("COMMENT_CACHE_TTL", "3600"))          # default 1 hour
 )
 #
 # ── Worker pool: keep concurrency reasonable for a 512 MB instance ────────────
@@ -544,6 +543,28 @@ def metadata():
             return jsonify({"items":[base]}), 200
         except Exception:
             pass
+        # oEmbed fallback when SmartProxy and other fallbacks all failed
+        try:
+            m = session.get(
+                "https://www.youtube.com/oembed",
+                params={"url": f"https://youtu.be/{vid}", "format": "json"},
+                timeout=4
+            ).json()
+            base = {
+                "title": m["title"],
+                "channelTitle": m["author_name"],
+                "thumbnail": m["thumbnail_url"],
+                "thumbnailUrl": m["thumbnail_url"],
+                "duration": None,
+                "viewCount": None,
+                "likeCount": None,
+                "videoId": vid
+            }
+            if isinstance(base["title"], str):
+                base["title"] = base["title"].strip()
+            return jsonify({"items":[base]}), 200
+        except Exception as e:
+            app.logger.info("oEmbed fallback failed for video %s: %s", vid, e)
         return jsonify({"error": "SmartProxy unavailable and no fallback available"}), 503
 
     # 1) oEmbed
