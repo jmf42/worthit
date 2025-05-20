@@ -17,3 +17,8 @@ vaderSentiment==3.3.2
 yt-dlp>=2025.4.14
 youtube-comment-downloader
 sqlitedict>=2.1
+
+
+openai-whisper==20231116
+torch==2.2.2
+ffmpeg-python==0.2.0
