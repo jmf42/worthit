@@ -157,17 +157,36 @@ def _access_log():
 # --------------------------------------------------
 # Rate limiting
 # --------------------------------------------------
-limiter = Limiter(app=app,
-                  key_func=get_remote_address,
-                  default_limits=["200 per hour", "50 per minute"],
-                  headers_enabled=True)
+# Rate limiting: use Redis storage in production if configured
+RATELIMIT_STORAGE_URI = os.getenv("RATELIMIT_STORAGE_URI")
+limiter_kwargs = {
+    "app": app,
+    "key_func": get_remote_address,
+    "default_limits": ["200 per hour", "50 per minute"],
+    "headers_enabled": True,
+}
+if RATELIMIT_STORAGE_URI:
+    limiter_kwargs["storage_uri"] = RATELIMIT_STORAGE_URI
+limiter = Limiter(**limiter_kwargs)
 
 # --------------------------------------------------
 # Worker pool / cache
 # --------------------------------------------------
-transcript_cache = TTLCache(maxsize=500, ttl=600)           # 10 min
-comment_cache    = TTLCache(maxsize=300, ttl=300)           # 5 min         # 10 min
-executor         = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 4))
+#
+# ── Caches: smaller in‑RAM footprint, tunable via env ─────────────────────────
+transcript_cache = TTLCache(
+    maxsize=int(os.getenv("TRANSCRIPT_CACHE_SIZE", "150")),  # default 150 items
+    ttl=int(os.getenv("TRANSCRIPT_CACHE_TTL", "300"))        # default 5 min
+)
+comment_cache = TTLCache(
+    maxsize=int(os.getenv("COMMENT_CACHE_SIZE", "100")),     # default 100 items
+    ttl=int(os.getenv("COMMENT_CACHE_TTL", "300"))           # default 5 min
+)
+#
+# ── Worker pool: keep concurrency reasonable for a 512 MB instance ────────────
+# Allow override via env; default is 2×CPU cores, but cap at 8
+max_workers = int(os.getenv("MAX_WORKERS", str(min(8, (os.cpu_count() or 1) * 2))))
+executor = ThreadPoolExecutor(max_workers=max_workers)
 _pending: dict[str, Future] = {}  
 
 # --------------------------------------------------
@@ -733,11 +752,13 @@ def analyze_batch():
     
 
 # ---------------- SIMPLE HEALTH CHECK ----------------
+@limiter.exempt
 @app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({'status': 'ok'}), 200
 
 # ---------------- FULL HEALTH CHECK ------------------
+@limiter.exempt
 @app.route("/health/deep", methods=["GET"])
 def deep_health_check():
     checks = {}
