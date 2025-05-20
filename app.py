@@ -28,6 +28,16 @@ from flask_limiter.util import get_remote_address
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import requests
 import shutil
+import tempfile
+# ── Whisper fallback (local ASR) ──────────────────────────────────────────
+try:
+    import whisper  # open‑source OpenAI Whisper
+    _WHISPER_AVAILABLE = True
+except Exception:           # library not installed
+    whisper = None
+    _WHISPER_AVAILABLE = False
+# Model will be loaded lazily on first use to avoid cold‑start delay / RAM spike
+_WHISPER_MODEL = None
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from yt_dlp import YoutubeDL  
@@ -142,6 +152,64 @@ _YDL_OPTS = {
 def yt_dlp_info(video_id: str):
     with YoutubeDL(_YDL_OPTS) as ydl:
         return ydl.extract_info(video_id, download=False, process=False)
+
+# -----------------------------------------------------------------------
+# Whisper local transcription fallback
+# -----------------------------------------------------------------------
+def _whisper_transcribe(video_id: str, max_duration: int = 900) -> str | None:
+    """
+    Final fallback: download the audio stream and transcribe it with
+    a local Whisper model.  Returns the transcript text or None.
+    """
+    if not _WHISPER_AVAILABLE:
+        return None
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is None:
+        _WHISPER_MODEL = whisper.load_model(os.getenv("WHISPER_MODEL", "base.en"))
+
+    # Use template to avoid name clash between original download and the extracted mp3
+    tmpl = os.path.join(tempfile.gettempdir(), f"{video_id}.%(ext)s")
+    audio_path = tmpl.replace("%(ext)s", "mp3")
+    ydl_opts = {
+        "format": "bestaudio[filesize<25M]/bestaudio",
+        "quiet": True,
+        "outtmpl": tmpl,
+        "skip_download": False,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "64",
+        }],
+        "noplaylist": True,
+    }
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(
+                f"https://www.youtube.com/watch?v={video_id}",
+                download=True
+            )
+            dur = info.get("duration") or 0
+            if dur > max_duration:          # guard huge videos
+                app.logger.info(
+                    "Whisper skip: %s too long (%ss)", video_id, dur
+                )
+                return None
+
+        result = _WHISPER_MODEL.transcribe(audio_path)
+        text = (result or {}).get("text", "").strip()
+        if text:
+            return text
+    except Exception as e:
+        app.logger.warning(
+            "Whisper transcription failed for %s: %s", video_id, e
+        )
+    finally:
+        try:
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
+        except Exception:
+            pass
+    return None
 
 # --------------------------------------------------
 # Flask init
@@ -264,8 +332,8 @@ def _get_transcript(vid: str, langs, preserve):
 
 def _fetch_resilient(video_id: str) -> str:
     """
-    Try captions API first (English only), fall back to yt-dlp automatic captions,
-    then a reduced language fallback, then any yt-dlp caption track; log each failure.
+    Try captions API first (English only), fall back to yt‑dlp automatic captions,
+    then language fallbacks, then any yt‑dlp caption track, and finally Whisper ASR.
     """
     # 1️⃣ English captions (official / community) with retry
     for attempt in range(3):
@@ -336,6 +404,11 @@ def _fetch_resilient(video_id: str) -> str:
             app.logger.warning("yt-dlp captions track empty for video %s", video_id)
         except Exception as e:
             app.logger.warning("yt-dlp captions track failed for video %s: %s", video_id, e)
+
+    # 6️⃣ Whisper local ASR fallback
+    whisper_txt = _whisper_transcribe(video_id)
+    if whisper_txt:
+        return whisper_txt
 
     app.logger.error("All transcript sources failed for video %s", video_id)
     raise RuntimeError("Transcript unavailable from all sources")
