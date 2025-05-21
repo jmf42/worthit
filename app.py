@@ -565,6 +565,11 @@ def video_metadata():
                     like_count = int(piped.get("likeCount", 0))
             except Exception:
                 pass
+            # Overwrite fallback title/channel if needed
+            if not title or title.startswith("youtube video"):
+                title = piped.get("title") or title
+            if not channel:
+                channel = piped.get("author") or piped.get("authorName") or channel
 
     # Step 3: If still missing, try Invidious API fallback
     if duration is None or view_count is None or like_count is None or channel is None or title is None:
@@ -590,10 +595,8 @@ def video_metadata():
                     like_count = int(inv.get("likeCount", 0))
             except Exception:
                 pass
-            if title is None:
-                title = inv.get("title")
-            if channel is None:
-                channel = inv.get("author")
+            title = title or inv.get("title")
+            channel = channel or inv.get("author")
             # use the highest resolution thumbnail available
             thumbs = inv.get("videoThumbnails") or []
             if thumbs:
