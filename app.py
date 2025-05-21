@@ -499,9 +499,8 @@ def comments():
         app.logger.info("All comment sources failed for %s", vid)
         return jsonify({"comments": comment_cache.get(vid, [])}), 200
 
-# ---------------- Metadata ---------------
 @app.route("/video/metadata")
-def metadata():
+def video_metadata():
     vid = request.args.get("videoId", "")
     if not vid:
         return jsonify({"error": "missing_video_id"}), 400
@@ -521,147 +520,59 @@ def metadata():
             base["title"] = base["title"].strip()
         return base
 
-    def oembed_fallback(vid):
-        try:
-            m = session.get(
-                "https://www.youtube.com/oembed",
-                params={"url": f"https://youtu.be/{vid}", "format": "json"},
-                timeout=4
-            ).json()
-            base = {
-                "title": m.get("title"),
-                "channelTitle": m.get("author_name"),
-                "thumbnail": m.get("thumbnail_url"),
-                "thumbnailUrl": m.get("thumbnail_url"),
-                "duration": None,
-                "viewCount": None,
-                "likeCount": None,
-                "videoId": vid
-            }
-            base = ensure_metadata_keys(base)
-            app.logger.debug(f"Metadata fallback: oEmbed used for video {vid} (engagement info missing).")
-            return jsonify({"items": [base]}), 200
-        except Exception as e:
-            app.logger.info("oEmbed fallback failed for video %s: %s", vid, e)
-            return None
-
-    # SmartProxy branch
-    try:
-        smartproxy_ok = bool(SMARTPROXY_USER)
-    except Exception:
-        smartproxy_ok = False
-
-    if not smartproxy_ok:
-        # 1️⃣ yt-dlp first
-        try:
-            yt = yt_dlp_info(vid)
-            base = {
-                "title": yt.get("title"),
-                "channelTitle": yt.get("uploader"),
-                "thumbnail": yt.get("thumbnail"),
-                "thumbnailUrl": yt.get("thumbnail"),
-                "duration": yt.get("duration"),
-                "viewCount": yt.get("view_count"),
-                "likeCount": yt.get("like_count"),
-                "videoId": vid,
-            }
-            base = ensure_metadata_keys(base)
-            return jsonify({"items": [base]}), 200
-        except Exception:
-            pass
-        # 2️⃣ Piped fallback (engagement if API host is up)
-        js = _fetch_json(PIPED_HOSTS, f"/api/v1/streams/{vid}", _PIPE_COOLDOWN)
-        if js:
-            base = {
-                "title": js.get("title"),
-                "channelTitle": js.get("uploader"),
-                "thumbnail": js.get("thumbnailUrl"),
-                "thumbnailUrl": js.get("thumbnailUrl"),
-                "duration": js.get("duration"),
-                "viewCount": js.get("views"),
-                "likeCount": js.get("likes"),
-                "videoId": vid,
-            }
-            return jsonify({"items": [ensure_metadata_keys(base)]}), 200
-        # 3️⃣ oEmbed fallback when all else failed
-        resp = oembed_fallback(vid)
-        if resp:
-            # engagement info will be missing, log this
-            app.logger.debug(f"Metadata fallback: oEmbed used after yt-dlp/Piped failure for video {vid} (engagement info missing).")
-            return resp
-        return jsonify({"error": "SmartProxy unavailable and no fallback available"}), 503
-
-    # SmartProxy enabled: try oEmbed first, then Piped, then yt-dlp, then oEmbed fallback after SmartProxy attempt fails
-    # 1) oEmbed
-    try:
-        m = session.get("https://www.youtube.com/oembed",
-                        params={"url": f"https://youtu.be/{vid}",
-                                "format": "json"}, timeout=4).json()
-        base = {
-            "title"        : m.get("title"),
-            "channelTitle" : m.get("author_name"),
-            "thumbnail"    : m.get("thumbnail_url"),
-            "thumbnailUrl" : m.get("thumbnail_url"),
-            "duration"     : None,
-            "viewCount"    : None,
-            "likeCount"    : None,
-            "videoId"      : vid,
-        }
-        base = ensure_metadata_keys(base)
-        app.logger.debug(f"Metadata fallback: oEmbed (SmartProxy branch) used for video {vid} (engagement info missing).")
-        return jsonify({"items": [base]}), 200
-    except Exception as e:
-        app.logger.info("oEmbed failed: %s", e)
-
-    # 2) Piped
-    # js = _fetch_json(PIPED_HOSTS, f"/streams/{vid}", _PIPE_COOLDOWN)
-    # if js:
-    #     base = {
-    #         "title"        : js.get("title"),
-    #         "channelTitle" : js.get("uploader"),
-    #         "thumbnail"    : js.get("thumbnailUrl"),
-    #         "thumbnailUrl" : js.get("thumbnailUrl"),
-    #         "duration"     : js.get("duration"),
-    #         "viewCount"    : js.get("views"),
-    #         "likeCount"    : js.get("likes"),
-    #         "videoId"      : vid,
-    #     }
-    #     base = ensure_metadata_keys(base)
-    #     return jsonify({"items": [base]}), 200
-
-    # 2) yt-dlp
+    # Step 1: Try yt-dlp first
     try:
         yt = yt_dlp_info(vid)
-        base = {
-            "title"        : yt.get("title"),
-            "channelTitle" : yt.get("uploader"),
-            "thumbnail"    : yt.get("thumbnail"),
-            "thumbnailUrl" : yt.get("thumbnail"),
-            "duration"     : yt.get("duration"),
-            "viewCount"    : yt.get("view_count"),
-            "likeCount"    : yt.get("like_count"),
-            "videoId"      : vid,
-        }
-        base = ensure_metadata_keys(base)
-        return jsonify({"items": [base]}), 200
-    except Exception:
-        # Fallback to oEmbed after SmartProxy branch fails all
-        # This ensures we get title/thumbnail/channel even if yt-dlp fails or returns empty/HTML
-        resp = oembed_fallback(vid)
-        if resp:
-            app.logger.debug(f"Metadata fallback: oEmbed used after SmartProxy and yt-dlp failure for video {vid} (engagement info missing).")
-            return resp
-        app.logger.warning("All metadata fallbacks failed for video %s — returning stub.", vid)
-        return jsonify({"items":[{
-            "title": "Unknown Title",
-            "channelTitle": "Unknown Channel",
-            "thumbnail": None,
-            "thumbnailUrl": None,
-            "duration": None,
-            "viewCount": None,
-            "likeCount": None,
-            "videoId": vid
-        }]}), 200
+    except Exception as e:
+        yt = {}
+
+    duration   = yt.get("duration")
+    view_count = yt.get("view_count")
+    like_count = yt.get("like_count")
+    title      = yt.get("title")
+    channel    = yt.get("uploader")
+    thumbnail  = yt.get("thumbnail") or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+    thumbnail_url = thumbnail
+
+    # Step 2: If yt-dlp missing any numeric field, pull from Piped API
+    if duration is None or view_count is None or like_count is None:
+        piped = _fetch_json(
+            PIPED_HOSTS,
+            f"/api/v1/videos/{vid}",
+            _PIPE_COOLDOWN,
+            proxy_aware=False
+        )
+        if piped:
+            # lengthSeconds, viewCount, likeCount are strings in Piped
+            try:
+                if duration is None:
+                    duration = int(piped.get("lengthSeconds", 0))
+            except Exception:
+                pass
+            try:
+                if view_count is None:
+                    view_count = int(piped.get("viewCount", 0))
+            except Exception:
+                pass
+            try:
+                if like_count is None:
+                    like_count = int(piped.get("likeCount", 0))
+            except Exception:
+                pass
+
+    # Step 3: Build and return the metadata response
+    item = {
+        "videoId":      vid,
+        "title":        title,
+        "channelTitle": channel,
+        "duration":     duration,
+        "viewCount":    view_count,
+        "likeCount":    like_count,
+        "thumbnail":    thumbnail,
+        "thumbnailUrl": thumbnail_url,
+    }
+    item = ensure_metadata_keys(item)
+    return jsonify({"items": [item]})
 
 
 # ---------------- OpenAI RESPONSES POST (with Enhanced Logging) -----------
