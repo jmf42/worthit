@@ -134,14 +134,20 @@ _YDL_OPTS = {
     "extract_flat": False,  # fetch complete info (still skip download)
     "no_warnings": True,
     "restrict_filenames": True,  # lighter metadata (no formats array)
+    "nocheckcertificate": True,
+    "ignore_no_formats_error": True,
     "innertube_key": "AIzaSyA-DkzGi-tv79Q",
     **({"cookiefile": YTDL_COOKIE_FILE} if YTDL_COOKIE_FILE else {}),
 }
 
 def yt_dlp_info(video_id: str):
     with YoutubeDL(_YDL_OPTS) as ydl:
-        # Let yt‑dlp fully process the video so we get view_count, like_count, title, etc.
-        return ydl.extract_info(video_id, download=False)
+        video_url = f"https://www.youtube.com/watch?v={video_id}"
+        try:
+            return ydl.extract_info(video_url, download=False)
+        except Exception as e:
+            app.logger.warning("yt-dlp info failed for %s: %s", video_id, e)
+            return {}
 
 
 # --------------------------------------------------
@@ -560,7 +566,56 @@ def video_metadata():
             except Exception:
                 pass
 
-    # Step 3: Build and return the metadata response
+    # Step 3: If still missing, try Invidious API fallback
+    if duration is None or view_count is None or like_count is None or channel is None or title is None:
+        inv = _fetch_json(
+            INVIDIOUS_HOSTS,
+            f"/api/v1/videos/{vid}",
+            _IV_COOLDOWN,
+            proxy_aware=bool(SMARTPROXY_USER)
+        )
+        if inv:
+            try:
+                if duration is None:
+                    duration = int(inv.get("lengthSeconds", 0))
+            except Exception:
+                pass
+            try:
+                if view_count is None:
+                    view_count = int(inv.get("viewCount", 0))
+            except Exception:
+                pass
+            try:
+                if like_count is None:
+                    like_count = int(inv.get("likeCount", 0))
+            except Exception:
+                pass
+            if title is None:
+                title = inv.get("title")
+            if channel is None:
+                channel = inv.get("author")
+            # use the highest resolution thumbnail available
+            thumbs = inv.get("videoThumbnails") or []
+            if thumbs:
+                thumbnail = thumbs[-1].get("url") or thumbnail
+                thumbnail_url = thumbnail
+
+    # Step 4: As a last resort, use YouTube oEmbed for title and channel
+    if title is None or channel is None:
+        try:
+            o = session.get(
+                "https://www.youtube.com/oembed",
+                params={"url": f"https://www.youtube.com/watch?v={vid}", "format": "json"},
+                timeout=5
+            ).json()
+            title = title or o.get("title")
+            channel = channel or o.get("author_name")
+            thumbnail = thumbnail or o.get("thumbnail_url")
+            thumbnail_url = thumbnail_url or o.get("thumbnail_url")
+        except Exception:
+            pass
+
+    # Step 5: Build and return the metadata response
     item = {
         "videoId":      vid,
         "title":        title,
