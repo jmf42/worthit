@@ -131,7 +131,9 @@ def _fetch_json(hosts: deque, path: str,
 _YDL_OPTS = {
     "quiet": True,
     "skip_download": True,
-    "extract_flat": True,  # lighter metadata (no formats array)
+    "extract_flat": False,  # fetch complete info (still skip download)
+    "no_warnings": True,
+    "restrict_filenames": True,  # lighter metadata (no formats array)
     "innertube_key": "AIzaSyA-DkzGi-tv79Q",
     **({"cookiefile": YTDL_COOKIE_FILE} if YTDL_COOKIE_FILE else {}),
 }
