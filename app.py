@@ -140,7 +140,8 @@ _YDL_OPTS = {
 
 def yt_dlp_info(video_id: str):
     with YoutubeDL(_YDL_OPTS) as ydl:
-        return ydl.extract_info(video_id, download=False, process=False)
+        # Let yt‑dlp fully process the video so we get view_count, like_count, title, etc.
+        return ydl.extract_info(video_id, download=False)
 
 
 # --------------------------------------------------
