@@ -338,22 +338,21 @@ def _fetch_comments_downloader(video_id: str) -> list[str] | None:
     logger.debug("Attempting comments via youtube-comment-downloader for %s", video_id)
     try:
         # Using a new downloader instance per call to avoid state issues if any
-        downloader = YoutubeCommentDownloader() 
-        comments_data = downloader.get_comments_from_url(f"https://www.youtube.com/watch?v={video_id}", sort_by=0, language='en') # 0 for top comments
-        
+        downloader = YoutubeCommentDownloader()
+        # Fetch comments as a flat sequence
+        comments_generator = downloader.get_comments_from_url(
+            f"https://www.youtube.com/watch?v={video_id}",
+            sort_by=0,    # 0 for top (popular) comments
+            language='en' # English comments
+        )
         comments_text: list[str] = []
-        count = 0
-        for comment_page in comments_data: # Generator yields pages of comments
-            for c_item in comment_page['comments']:
-                text = c_item.get("text")
-                if text:
-                    comments_text.append(text)
-                    count += 1
-                if count >= COMMENT_LIMIT:
-                    break
-            if count >= COMMENT_LIMIT:
+        for item in comments_generator:
+            text = item.get("text")
+            if text:
+                comments_text.append(text)
+            if len(comments_text) >= COMMENT_LIMIT:
                 break
-        
+
         if comments_text:
             logger.info("Fetched %d comments via youtube-comment-downloader for %s", len(comments_text), video_id)
             return comments_text
@@ -365,8 +364,9 @@ def _fetch_comments_downloader(video_id: str) -> list[str] | None:
 
 def _fetch_comments_yt_dlp(video_id: str) -> list[str] | None:
     if not YTDL_COOKIE_FILE:
-        logger.debug("yt-dlp comments skipped: No cookie file configured.")
-        return None
+        # Since 2024‑05 yt-dlp can pull the first batch of public comments
+        # without authentication; proceed even if no cookie file is configured.
+        logger.debug("yt-dlp comments: proceeding without cookies (public endpoints only).")
     
     logger.debug("Attempting comments via yt-dlp for %s", video_id)
     info = yt_dlp_extract_info(video_id, extract_comments=True)
@@ -381,22 +381,28 @@ def _fetch_comments_yt_dlp(video_id: str) -> list[str] | None:
 def _fetch_comments_resilient(video_id: str) -> list[str]:
     logger.info("Initiating resilient comment fetch for %s", video_id)
     
-    # Priority 1: youtube-comment-downloader
-    comments = _fetch_comments_downloader(video_id)
-    if comments: return comments
-
-    # Priority 2: yt-dlp (if cookies provided, as it's more likely to succeed with auth)
+    # Priority 1: yt-dlp (works with or without cookies on public endpoints)
     comments = _fetch_comments_yt_dlp(video_id)
-    if comments: return comments
+    if comments:
+        return comments
 
-    # Priority 3: Piped API (as a public, less rate-limited option)
-    # This might require adjustments if Piped API structure changes
-    # piped_data = _fetch_from_alternative_api(PIPED_HOSTS, f"/comments/{video_id}", _PIPE_COOLDOWN)
-    # if piped_data and "comments" in piped_data:
-    #     comments_text = [c.get("commentText") for c in piped_data["comments"] if c.get("commentText")]
-    #     if comments_text:
-    #         logger.info("Fetched %d comments via Piped for %s", len(comments_text), video_id)
-    #         return comments_text[:COMMENT_LIMIT]
+    # Priority 2: youtube-comment-downloader (older library, may fail on new layouts)
+    comments = _fetch_comments_downloader(video_id)
+    if comments:
+        return comments
+
+    # Priority 3: Piped API (public, low‑rate‑limit)
+    piped_data = _fetch_from_alternative_api(
+        PIPED_HOSTS, f"/comments/{video_id}", _PIPE_COOLDOWN)
+    if piped_data and "comments" in piped_data:
+        comments_text = [
+            c.get("commentText") for c in piped_data["comments"] if c.get("commentText")
+        ]
+        if comments_text:
+            logger.info(
+                "Fetched %d comments via Piped for %s", len(comments_text), video_id
+            )
+            return comments_text[:COMMENT_LIMIT]
 
     logger.warning("All comment sources failed for video %s. Returning empty list.", video_id)
     return []
