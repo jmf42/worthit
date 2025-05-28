@@ -212,8 +212,15 @@ _YDL_OPTS_BASE = {
     **({"cookiefile": YTDL_COOKIE_FILE} if YTDL_COOKIE_FILE else {}),
 }
 
-def yt_dlp_extract_info(video_id: str, extract_comments: bool = False) -> dict | None:
+def yt_dlp_extract_info(video_id: str, extract_comments: bool = False, use_proxy: bool = False) -> dict | None:
     opts = _YDL_OPTS_BASE.copy()
+    # Apply Smartproxy if requested
+    if use_proxy and PROXY_ROTATION and PROXY_ROTATION[0]:
+        proxy_dict = rnd_proxy()
+        proxy_url = proxy_dict.get("https")
+        if proxy_url:
+            opts["proxy"] = proxy_url
+            logger.debug("yt-dlp: using proxy %s for %s", proxy_url, video_id)
     if extract_comments:
         opts["getcomments"] = True
         opts["max_comments"] = COMMENT_LIMIT # yt-dlp specific max comments for this call
@@ -334,11 +341,13 @@ def _get_or_spawn_transcript(video_id: str, timeout: float = 30.0) -> str:
             _pending_futures.pop(video_id, None)
 
 # --- Comment Fetching Logic ---
-def _fetch_comments_downloader(video_id: str) -> list[str] | None:
+def _fetch_comments_downloader(video_id: str, use_proxy: bool = False) -> list[str] | None:
     logger.debug("Attempting comments via youtube-comment-downloader for %s", video_id)
     try:
+        # Determine proxy for this call
+        current_proxy = rnd_proxy() if use_proxy and PROXY_ROTATION and PROXY_ROTATION[0] else {}
         # Using a new downloader instance per call to avoid state issues if any
-        downloader = YoutubeCommentDownloader()
+        downloader = YoutubeCommentDownloader(proxies=current_proxy)
         # Fetch comments as a flat sequence
         comments_generator = downloader.get_comments_from_url(
             f"https://www.youtube.com/watch?v={video_id}",
@@ -362,14 +371,15 @@ def _fetch_comments_downloader(video_id: str) -> list[str] | None:
         logger.error("youtube-comment-downloader failed for %s: %s", video_id, str(e), exc_info=LOG_LEVEL=="DEBUG")
         return None
 
-def _fetch_comments_yt_dlp(video_id: str) -> list[str] | None:
+def _fetch_comments_yt_dlp(video_id: str, use_proxy: bool = False) -> list[str] | None:
     if not YTDL_COOKIE_FILE:
         # Since 2024‑05 yt-dlp can pull the first batch of public comments
         # without authentication; proceed even if no cookie file is configured.
         logger.debug("yt-dlp comments: proceeding without cookies (public endpoints only).")
     
     logger.debug("Attempting comments via yt-dlp for %s", video_id)
-    info = yt_dlp_extract_info(video_id, extract_comments=True)
+    # Try with or without proxy based on use_proxy flag
+    info = yt_dlp_extract_info(video_id, extract_comments=True, use_proxy=use_proxy)
     if info and "comments" in info and info["comments"]:
         comments_text = [c["text"] for c in info["comments"] if c.get("text")]
         if comments_text:
@@ -380,18 +390,28 @@ def _fetch_comments_yt_dlp(video_id: str) -> list[str] | None:
 
 def _fetch_comments_resilient(video_id: str) -> list[str]:
     logger.info("Initiating resilient comment fetch for %s", video_id)
-    
-    # Priority 1: yt-dlp (works with or without cookies on public endpoints)
-    comments = _fetch_comments_yt_dlp(video_id)
+
+    # Tier 1: yt-dlp without proxy
+    comments = _fetch_comments_yt_dlp(video_id, use_proxy=False)
     if comments:
         return comments
 
-    # Priority 2: youtube-comment-downloader (older library, may fail on new layouts)
-    comments = _fetch_comments_downloader(video_id)
+    # Tier 2: youtube-comment-downloader without proxy
+    comments = _fetch_comments_downloader(video_id, use_proxy=False)
     if comments:
         return comments
 
-    # Priority 3: Piped API (public, low‑rate‑limit)
+    # Tier 3: yt-dlp with proxy
+    comments = _fetch_comments_yt_dlp(video_id, use_proxy=True)
+    if comments:
+        return comments
+
+    # Tier 4: youtube-comment-downloader with proxy
+    comments = _fetch_comments_downloader(video_id, use_proxy=True)
+    if comments:
+        return comments
+
+    # Tier 5: Piped API fallback
     piped_data = _fetch_from_alternative_api(
         PIPED_HOSTS, f"/comments/{video_id}", _PIPE_COOLDOWN)
     if piped_data and "comments" in piped_data:
@@ -400,7 +420,7 @@ def _fetch_comments_resilient(video_id: str) -> list[str]:
         ]
         if comments_text:
             logger.info(
-                "Fetched %d comments via Piped for %s", len(comments_text), video_id
+                "Fetched %d comments via Piped API for %s", len(comments_text), video_id
             )
             return comments_text[:COMMENT_LIMIT]
 
