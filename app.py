@@ -302,7 +302,7 @@ def _fetch_transcript_resilient(video_id: str) -> str:
     # if info and info.get("automatic_captions"): ...
     
     logger.error("All transcript sources failed for video %s", video_id)
-    raise NoTranscriptFound(video_id, [], None, None) # Use a specific error
+    raise NoTranscriptFound(video_id, [], None) # Use a specific error
 
 def _get_or_spawn_transcript(video_id: str, timeout: float = 30.0) -> str:
     with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
@@ -344,10 +344,8 @@ def _get_or_spawn_transcript(video_id: str, timeout: float = 30.0) -> str:
 def _fetch_comments_downloader(video_id: str, use_proxy: bool = False) -> list[str] | None:
     logger.debug("Attempting comments via youtube-comment-downloader for %s", video_id)
     try:
-        # Determine proxy for this call
-        current_proxy = rnd_proxy() if use_proxy and PROXY_ROTATION and PROXY_ROTATION[0] else {}
         # Using a new downloader instance per call to avoid state issues if any
-        downloader = YoutubeCommentDownloader(proxies=current_proxy)
+        downloader = YoutubeCommentDownloader()
         # Fetch comments as a flat sequence
         comments_generator = downloader.get_comments_from_url(
             f"https://www.youtube.com/watch?v={video_id}",
