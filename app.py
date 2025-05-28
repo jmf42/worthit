@@ -7,7 +7,7 @@ import time
 import itertools
 from functools import lru_cache
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future, wait, FIRST_COMPLETED
 
 from flask import Flask, request, jsonify
 from youtube_transcript_api import (
@@ -391,15 +391,35 @@ def _fetch_comments_yt_dlp(video_id: str, use_proxy: bool = False) -> list[str] 
 def _fetch_comments_resilient(video_id: str) -> list[str]:
     logger.info("Initiating resilient comment fetch for %s", video_id)
 
-    # Tier 1: yt-dlp without proxy
-    comments = _fetch_comments_yt_dlp(video_id, use_proxy=False)
-    if comments:
-        return comments
+    # Race Tier 1 & Tier 2 (no proxy) in parallel to reduce latency
+    timeout = 5.0  # seconds to wait for the first completer
+    with ThreadPoolExecutor(max_workers=2) as race_executor:
+        future_yt = race_executor.submit(_fetch_comments_yt_dlp, video_id, False)
+        future_dl = race_executor.submit(_fetch_comments_downloader, video_id, False)
+        done, pending = wait({future_yt, future_dl}, timeout=timeout, return_when=FIRST_COMPLETED)
 
-    # Tier 2: youtube-comment-downloader without proxy
-    comments = _fetch_comments_downloader(video_id, use_proxy=False)
-    if comments:
-        return comments
+        # Check whichever completed first
+        for fut in done:
+            try:
+                comments = fut.result()
+                if comments:
+                    source = "yt-dlp" if fut is future_yt else "downloader"
+                    logger.info("Fetched %d comments via %s (raced no-proxy)", len(comments), source)
+                    return comments
+            except Exception as e:
+                logger.debug("Error in raced fetcher %s: %s",
+                             "yt-dlp" if fut is future_yt else "downloader", str(e))
+
+        # If first completed returned no comments, check the other immediately
+        for fut in pending:
+            try:
+                comments = fut.result(timeout=0)
+                if comments:
+                    source = "yt-dlp" if fut is future_yt else "downloader"
+                    logger.info("Fetched %d comments via %s (raced no-proxy)", len(comments), source)
+                    return comments
+            except Exception:
+                pass
 
     # Tier 3: yt-dlp with proxy
     comments = _fetch_comments_yt_dlp(video_id, use_proxy=True)
