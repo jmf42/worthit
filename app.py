@@ -382,72 +382,64 @@ def _fetch_comments_yt_dlp(video_id: str, use_proxy: bool = False) -> list[str] 
     logger.warning("No comments found via yt-dlp for %s", video_id)
     return None
 
+# --- Comment Fetching Logic (improved racer) ---
+
 def _fetch_comments_resilient(video_id: str) -> list[str]:
+    """Fetch comments with the fastest available no‑proxy source first.
+
+    * Launch yt‑dlp and youtube‑comment‑downloader concurrently.
+    * Wait up to RACE_TIMEOUT seconds for *either* job to deliver a
+      non‑empty list.
+    * If neither delivers in time, fall back to the proxy tiers and
+      finally Piped.
+    """
     logger.info("Initiating resilient comment fetch for %s", video_id)
 
-    # Tier 1 & Tier 2: race no-proxy fetch strategies
-    timeout = 2.0  # race timeout: seconds to wait for fastest no-proxy fetch
+    RACE_TIMEOUT = 5.0  # seconds allowed for the initial race
+
+    # Kick off the two primary fetchers (no proxy)
     with ThreadPoolExecutor(max_workers=2) as race_executor:
         future_yt = race_executor.submit(_fetch_comments_yt_dlp, video_id, False)
         future_dl = race_executor.submit(_fetch_comments_downloader, video_id, False)
-        done, pending = wait({future_yt, future_dl}, timeout=timeout, return_when=FIRST_COMPLETED)
+        pending: set[Future] = {future_yt, future_dl}
+        start_time = time.time()
 
-        # Check whichever task completed first
-        for fut in done:
-            try:
-                comments = fut.result()
-                if comments:
-                    source = "yt-dlp" if fut is future_yt else "downloader"
-                    # Cancel slower task(s)
-                    for p in pending:
-                        p.cancel()
-                    logger.info("Fetched %d comments via %s (no-proxy race)", len(comments), source)
-                    return comments
-            except Exception as e:
-                logger.debug(
-                    "Error in raced fetcher %s: %s",
-                    "yt-dlp" if fut is future_yt else "downloader",
-                    str(e)
-                )
+        # Poll in a short loop so we can break as soon as we have data
+        while pending and (time.time() - start_time) < RACE_TIMEOUT:
+            done, pending = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
+            for fut in done:
+                try:
+                    comments = fut.result()
+                    if comments:
+                        src = "yt-dlp" if fut is future_yt else "downloader"
+                        logger.info("Fetched %d comments via %s (race win)", len(comments), src)
+                        # Cancel any still‑running task and return immediately
+                        for p in pending:
+                            p.cancel()
+                        return comments[:COMMENT_LIMIT]
+                except Exception as e:
+                    logger.debug("Race future failure (%s): %s", "yt-dlp" if fut is future_yt else "downloader", e)
 
-        # If the first completed returned no comments or failed, try the other
-        for fut in pending:
-            try:
-                comments = fut.result(timeout=0)
-                if comments:
-                    source = "yt-dlp" if fut is future_yt else "downloader"
-                    logger.info("Fetched %d comments via %s (no-proxy fallback)", len(comments), source)
-                    return comments
-            except Exception:
-                pass
+    # Tier 3 & 4: proxy‑enabled attempts (only if race failed)
+    proxy_timeout = 2.0  # seconds for each proxy attempt
 
-    # Tier 3 & 4: proxy-enabled fetches with per-call timeouts
-    proxy_timeout = 2.0  # seconds for proxy fetch
-    # 3a: yt-dlp with proxy
     try:
-        future_proxy_yt = executor.submit(_fetch_comments_yt_dlp, video_id, True)
-        comments = future_proxy_yt.result(timeout=proxy_timeout)
+        comments = executor.submit(_fetch_comments_yt_dlp, video_id, True).result(timeout=proxy_timeout)
         if comments:
             logger.info("Fetched %d comments via yt-dlp (proxy) for %s", len(comments), video_id)
-            return comments
-    except TimeoutError:
-        logger.warning("Proxy yt-dlp timed out for %s after %.1f s", video_id, proxy_timeout)
+            return comments[:COMMENT_LIMIT]
     except Exception as e:
-        logger.warning("Proxy yt-dlp failed early for %s: %s", video_id, str(e))
+        logger.debug("Proxy yt-dlp attempt failed for %s: %s", video_id, e)
 
-    # 3b: downloader with proxy
     try:
-        future_proxy_dl = executor.submit(_fetch_comments_downloader, video_id, True)
-        comments = future_proxy_dl.result(timeout=proxy_timeout)
+        comments = executor.submit(_fetch_comments_downloader, video_id, True).result(timeout=proxy_timeout)
         if comments:
             logger.info("Fetched %d comments via downloader (proxy) for %s", len(comments), video_id)
-            return comments
-    except TimeoutError:
-        logger.warning("Proxy downloader timed out for %s after %.1f s", video_id, proxy_timeout)
+            return comments[:COMMENT_LIMIT]
     except Exception as e:
-        logger.warning("Proxy downloader failed early for %s: %s", video_id, str(e))
+        logger.debug("Proxy downloader attempt failed for %s: %s", video_id, e)
 
-    # Tier 5: Piped API fallback
+    # Tier 5: Piped API
     piped_data = _fetch_from_alternative_api(PIPED_HOSTS, f"/comments/{video_id}", _PIPE_COOLDOWN)
     if piped_data and "comments" in piped_data:
         comments_text = [c.get("commentText") for c in piped_data["comments"] if c.get("commentText")]
