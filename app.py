@@ -243,45 +243,55 @@ def yt_dlp_extract_info(video_id: str, extract_comments: bool = False, use_proxy
 FALLBACK_LANGUAGES = ['en', 'es', 'fr', 'de', 'pt', 'ru', 'it', 'nl', 'hi', 'ja', 'ko', 'ar', 'zh-Hans']
 
 def _fetch_transcript_api(video_id: str, languages: list[str]) -> str | None:
-    try:
-        logger.debug("Attempting youtube_transcript_api for %s, langs: %s", video_id, languages)
-        current_proxy = rnd_proxy() if PROXY_ROTATION[0] else None
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, proxies=current_proxy)
-        
-        # Try specified languages first
-        for lang_code in languages:
+    """Fetch transcript through Smartproxy, rotating proxies on CAPTCHA/SSL errors."""
+    max_attempts = min(3, max(1, len(PROXY_ROTATION)))
+    last_exc = None
+
+    for attempt in range(max_attempts):
+        proxy_cfg = rnd_proxy() if PROXY_ROTATION and PROXY_ROTATION[0] else None
+        try:
+            logger.debug("[transcript] attempt %d for %s via %s",
+                         attempt+1, video_id,
+                         proxy_cfg.get("https") if proxy_cfg else "direct")
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, proxies=proxy_cfg)
+
+            for finder in (transcript_list.find_transcript, transcript_list.find_generated_transcript):
+                try:
+                    tr = finder(languages)
+                    segments = tr.fetch()
+                    text = " ".join(seg["text"] for seg in segments).strip()
+                    if text:
+                        logger.info("Transcript fetched for %s on attempt %d", video_id, attempt+1)
+                        return text
+                except NoTranscriptFound:
+                    continue
+
+            logger.warning("No transcript for %s in %s (attempt %d)", video_id, languages, attempt+1)
+            return None
+
+        except Exception as e:
+            last_exc = e
             try:
-                transcript = transcript_list.find_transcript([lang_code])
-                fetched_segments = transcript.fetch()
-                text = " ".join(s["text"] for s in fetched_segments).strip()
-                if text:
-                    logger.info("Transcript found via API for %s (lang: %s)", video_id, lang_code)
-                    return text
-            except NoTranscriptFound:
-                continue # Try next language in the list
-        
-        # If not found in specified, try generated for those languages
-        for lang_code in languages:
-            try:
-                transcript = transcript_list.find_generated_transcript([lang_code])
-                fetched_segments = transcript.fetch()
-                text = " ".join(s["text"] for s in fetched_segments).strip()
-                if text:
-                    logger.info("Generated transcript found via API for %s (lang: %s)", video_id, lang_code)
-                    return text
-            except NoTranscriptFound:
-                continue
-        logger.warning("No transcript found with youtube_transcript_api for %s in langs: %s", video_id, languages)
-        return None
-    except TranscriptsDisabled:
-        logger.warning("Transcripts disabled for video %s", video_id)
-        return None
-    except CouldNotRetrieveTranscript as e: # More specific error
-        logger.warning("Could not retrieve transcript for %s via API: %s", video_id, str(e))
-        return None
-    except Exception as e:
-        logger.error("Unexpected error in _fetch_transcript_api for %s: %s", video_id, str(e), exc_info=LOG_LEVEL=="DEBUG")
-        return None
+                body = getattr(e, "response", None).text[:500] if hasattr(e, "response") and e.response else ""
+                if _is_captcha_response(body):
+                    logger.warning("CAPTCHA detected, rotating proxy (attempt %d)", attempt+1)
+                    continue
+            except Exception:
+                pass
+            logger.debug("Transcript attempt %d failed: %s", attempt+1, e)
+
+    if last_exc:
+        logger.error("All proxy attempts exhausted for %s: %s", video_id, last_exc)
+    return None
+# --- Helper for CAPTCHA detection ---
+def _is_captcha_response(text: str) -> bool:
+    if not text:
+        return False
+    lower = text.lower()
+    return any(marker in lower for marker in (
+        "captcha", "recaptcha", "i am not a robot",
+        "confirm you’re not a robot", "why did this happen"
+    ))
 
 def _fetch_transcript_resilient(video_id: str) -> str:
     logger.info("Initiating resilient transcript fetch for %s", video_id)
@@ -298,7 +308,7 @@ def _fetch_transcript_resilient(video_id: str) -> str:
     # This is a deeper fallback and might return XML/VTT, needs careful handling if used.
     # For now, we rely on youtube_transcript_api which handles parsing.
     # If yt-dlp is enhanced to directly provide plain text, it could be added here.
-    # info = yt_dlp_extract_info(video_id)
+    # info = yt_dlp_extract_info(video_id, use_proxy=True)
     # if info and info.get("automatic_captions"): ...
     
     logger.error("All transcript sources failed for video %s", video_id)
@@ -306,11 +316,16 @@ def _fetch_transcript_resilient(video_id: str) -> str:
 
 def _get_or_spawn_transcript(video_id: str, timeout: float = 30.0) -> str:
     with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
-        if video_id in db:
+        cached_persist = db.get(video_id)
+        if cached_persist == "__NOT_AVAILABLE__":
+            raise NoTranscriptFound(video_id, [], None)
+        if cached_persist is not None:
             logger.debug("Transcript cache HIT (persistent) for %s", video_id)
-            return db[video_id]
+            return cached_persist
             
     if (cached := transcript_cache.get(video_id)):
+        if cached == "__NOT_AVAILABLE__":
+            raise NoTranscriptFound(video_id, [], None)
         logger.debug("Transcript cache HIT (in-memory) for %s", video_id)
         return cached
 
@@ -332,6 +347,11 @@ def _get_or_spawn_transcript(video_id: str, timeout: float = 30.0) -> str:
     except TimeoutError:
         logger.warning("Transcript fetch timed out for %s after %s s", video_id, timeout)
         raise # Re-raise to be handled by endpoint
+    except NoTranscriptFound:
+        transcript_cache[video_id] = "__NOT_AVAILABLE__"
+        with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
+            db[video_id] = "__NOT_AVAILABLE__"
+        raise
     except Exception as e:
         logger.error("Transcript fetch failed for %s: %s", video_id, str(e), exc_info=LOG_LEVEL=="DEBUG")
         raise # Re-raise
@@ -363,10 +383,10 @@ def _fetch_comments_downloader(video_id: str, use_proxy: bool = False) -> list[s
             logger.info("Fetched %d comments via youtube-comment-downloader for %s", len(comments_text), video_id)
             return comments_text
         logger.warning("No comments returned by youtube-comment-downloader for %s", video_id)
-        return None
+        return []
     except Exception as e:
         logger.error("youtube-comment-downloader failed for %s: %s", video_id, str(e), exc_info=LOG_LEVEL=="DEBUG")
-        return None
+        return []
 
 def _fetch_comments_yt_dlp(video_id: str, use_proxy: bool = False) -> list[str] | None:
     if not YTDL_COOKIE_FILE:
@@ -374,6 +394,9 @@ def _fetch_comments_yt_dlp(video_id: str, use_proxy: bool = False) -> list[str] 
         logger.debug("yt-dlp comments: proceeding without cookies (public endpoints only).")
     logger.debug("Attempting comments via yt-dlp for %s", video_id)
     info = yt_dlp_extract_info(video_id, extract_comments=True, use_proxy=use_proxy)
+    if info and info.get("comment_count", 1) == 0:
+        logger.info("Comments disabled for %s – skipping proxy tiers", video_id)
+        return []
     if info and "comments" in info and info["comments"]:
         comments_text = [c["text"] for c in info["comments"] if c.get("text")]
         if comments_text:
@@ -522,6 +545,9 @@ def get_transcript_endpoint():
         logger.warning("Transcript request for %s returned 202 (pending due to timeout)", video_id)
         return jsonify({"status": "pending", "message": "Transcript processing timed out, please try again shortly."}), 202
     except NoTranscriptFound:
+        transcript_cache[video_id] = "__NOT_AVAILABLE__"
+        with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
+            db[video_id] = "__NOT_AVAILABLE__"
         logger.warning("No transcript found for %s after all fallbacks.", video_id)
         return jsonify({"error": "Transcript not available for this video"}), 404
     except Exception as e:
