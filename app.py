@@ -22,7 +22,7 @@ import shutil
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future, wait, FIRST_COMPLETED
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -609,7 +609,9 @@ def get_transcript_endpoint():
 
 
     try:
-        transcript_text = _get_or_spawn_transcript(video_id, timeout=3.0)
+        # Allow a longer wait so the background fetch has enough time,
+        # but still return quickly under heavy load.
+        transcript_text = _get_or_spawn_transcript(video_id, timeout=8.0)
         return jsonify({"video_id": video_id, "text": transcript_text}), 200
     except TimeoutError: # Raised by _get_or_spawn_transcript if its own timeout hits
         logger.warning("Transcript request for %s returned 202 (pending due to timeout)", video_id)
