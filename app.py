@@ -1,10 +1,13 @@
 import os
 import random
-import shelve
 import re
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import time
+from cachetools import TTLCache
+from diskcache import Cache
+import shelve
 import itertools
 from functools import lru_cache
 from collections import deque
@@ -14,7 +17,7 @@ import shutil
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -29,9 +32,6 @@ try:
 except ImportError:
     GenericProxyConfig = None
 # Negative cache for unavailable transcripts
-import time
-NEGATIVE_CACHE = {}
-NEGATIVE_CACHE_TTL = 24 * 3600  # 24 hours
 from yt_dlp import YoutubeDL
 from youtube_comment_downloader import YoutubeCommentDownloader
 
@@ -246,7 +246,10 @@ def yt_dlp_extract_info(video_id: str, extract_comments: bool = False, use_proxy
         return None
 
 # --- Transcript Fetching Logic ---
-FALLBACK_LANGUAGES = ['en', 'es', 'fr', 'de', 'pt', 'ru', 'it', 'nl', 'hi', 'ja', 'ko', 'ar', 'zh-Hans']
+fallback_langs_env = os.getenv("TRANSCRIPT_LANGS", "en,es,fr,de,pt,ru,it,nl,hi,ja,ko,ar,zh-Hans")
+FALLBACK_LANGUAGES = [lang.strip() for lang in fallback_langs_env.split(",") if lang.strip()]
+# Persistent cache using diskcache
+persistent_transcript_cache = Cache(PERSISTENT_TRANSCRIPT_DB)
 
 def _fetch_transcript_api(video_id: str, languages: list[str]) -> str | None:
     try:
@@ -258,28 +261,23 @@ def _fetch_transcript_api(video_id: str, languages: list[str]) -> str | None:
             if proxy_url:
                 proxy_config = GenericProxyConfig(http_proxy=proxy_url)
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, proxies=proxy_config)
-        # Try specified languages first
-        for lang_code in languages:
+        try:
+            transcript = transcript_list.find_transcript(languages)
+            fetched_segments = transcript.fetch()
+            text = " ".join(s["text"] for s in fetched_segments).strip()
+            if text:
+                logger.info("Transcript found via API for %s (langs: %s)", video_id, languages)
+                return text
+        except NoTranscriptFound:
             try:
-                transcript = transcript_list.find_transcript([lang_code])
+                transcript = transcript_list.find_generated_transcript(languages)
                 fetched_segments = transcript.fetch()
                 text = " ".join(s["text"] for s in fetched_segments).strip()
                 if text:
-                    logger.info("Transcript found via API for %s (lang: %s)", video_id, lang_code)
+                    logger.info("Generated transcript found via API for %s (langs: %s)", video_id, languages)
                     return text
             except NoTranscriptFound:
-                continue # Try next language in the list
-        # If not found in specified, try generated for those languages
-        for lang_code in languages:
-            try:
-                transcript = transcript_list.find_generated_transcript([lang_code])
-                fetched_segments = transcript.fetch()
-                text = " ".join(s["text"] for s in fetched_segments).strip()
-                if text:
-                    logger.info("Generated transcript found via API for %s (lang: %s)", video_id, lang_code)
-                    return text
-            except NoTranscriptFound:
-                continue
+                pass
         logger.warning("No transcript found with youtube_transcript_api for %s in langs: %s", video_id, languages)
         return None
     except TranscriptsDisabled:
@@ -330,17 +328,25 @@ def _fetch_transcript_resilient(video_id: str) -> str:
         except Exception as e:
             logger.debug("%s failed for %s: %s", method, video_id, str(e))
 
-    # Phase 3: Sequential fallback languages with timeouts
-    for lang in FALLBACK_LANGUAGES:
-        try:
-            with ThreadPoolExecutor(max_workers=1) as fetch_exec:
-                future = fetch_exec.submit(lambda l=lang: transcript_list.find_transcript([l]).fetch())
-                segments = future.result(timeout=2.0)
-            if segments:
-                logger.info("Fetched transcript (%s) for %s", lang, video_id)
-                return " ".join(seg["text"] for seg in segments)
-        except Exception:
-            continue
+    # Phase 3: Fallback to any configured languages in one go
+    try:
+        with ThreadPoolExecutor(max_workers=1) as fetch_exec:
+            future = fetch_exec.submit(lambda: transcript_list.find_transcript(FALLBACK_LANGUAGES).fetch())
+            segments = future.result(timeout=2.0)
+        if segments:
+            logger.info("Fetched transcript via list fallback for %s", video_id)
+            return " ".join(seg["text"] for seg in segments)
+    except Exception:
+        pass
+    try:
+        with ThreadPoolExecutor(max_workers=1) as fetch_exec:
+            future = fetch_exec.submit(lambda: transcript_list.find_generated_transcript(FALLBACK_LANGUAGES).fetch())
+            segments = future.result(timeout=2.0)
+        if segments:
+            logger.info("Fetched generated transcript via list fallback for %s", video_id)
+            return " ".join(seg["text"] for seg in segments)
+    except Exception:
+        pass
 
     # Phase 4: yt-dlp subtitle fallback
     info = yt_dlp_extract_info(video_id)
@@ -359,11 +365,10 @@ def _fetch_transcript_resilient(video_id: str) -> str:
     raise NoTranscriptFound(video_id, [], None)
 
 def _get_or_spawn_transcript(video_id: str, timeout: float = 30.0) -> str:
-    with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
-        if video_id in db:
-            logger.debug("Transcript cache HIT (persistent) for %s", video_id)
-            return db[video_id]
-            
+    cached_persist = persistent_transcript_cache.get(video_id)
+    if cached_persist is not None:
+        logger.debug("Transcript cache HIT (persistent) for %s", video_id)
+        return cached_persist
     if (cached := transcript_cache.get(video_id)):
         logger.debug("Transcript cache HIT (in-memory) for %s", video_id)
         return cached
@@ -379,8 +384,7 @@ def _get_or_spawn_transcript(video_id: str, timeout: float = 30.0) -> str:
     try:
         result = future.result(timeout=timeout)
         transcript_cache[video_id] = result
-        with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
-            db[video_id] = result
+        persistent_transcript_cache.set(video_id, result, expire=TRANSCRIPT_CACHE_TTL)
         logger.info("Transcript processing complete for %s", video_id)
         return result
     except TimeoutError:
@@ -584,21 +588,15 @@ def get_transcript_endpoint():
     if not video_id:
         return jsonify({"error": "Invalid videoId format or URL"}), 400
 
-    # Short-circuit for known unavailable videos
-    now = time.time()
-    expiry = NEGATIVE_CACHE.get(video_id)
-    if expiry and now < expiry:
-        return make_response(jsonify({"error": "Transcript not available for this video"}), 404)
 
     try:
-        transcript_text = _get_or_spawn_transcript(video_id)
+        transcript_text = _get_or_spawn_transcript(video_id, timeout=3.0)
         return jsonify({"video_id": video_id, "text": transcript_text}), 200
     except TimeoutError: # Raised by _get_or_spawn_transcript if its own timeout hits
         logger.warning("Transcript request for %s returned 202 (pending due to timeout)", video_id)
         return jsonify({"status": "pending", "message": "Transcript processing timed out, please try again shortly."}), 202
     except NoTranscriptFound:
         logger.warning("No transcript found for %s after all fallbacks.", video_id)
-        NEGATIVE_CACHE[video_id] = time.time() + NEGATIVE_CACHE_TTL
         return jsonify({"error": "Transcript not available for this video"}), 404
     except Exception as e:
         logger.error("Unhandled error in transcript endpoint for %s: %s", video_id, str(e), exc_info=True)
