@@ -13,6 +13,7 @@ try:
 except ImportError:
     diskcache_available = False
 import itertools
+import functools
 from functools import lru_cache
 from collections import deque
 
