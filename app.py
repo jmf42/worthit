@@ -22,7 +22,16 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
-from youtube_transcript_api.proxies import GenericProxyConfig
+# Alias for fallback resilience
+ytt_api = YouTubeTranscriptApi
+try:
+    from youtube_transcript_api.proxies import GenericProxyConfig
+except ImportError:
+    GenericProxyConfig = None
+# Negative cache for unavailable transcripts
+import time
+NEGATIVE_CACHE = {}
+NEGATIVE_CACHE_TTL = 24 * 3600  # 24 hours
 from yt_dlp import YoutubeDL
 from youtube_comment_downloader import YoutubeCommentDownloader
 
@@ -242,9 +251,13 @@ FALLBACK_LANGUAGES = ['en', 'es', 'fr', 'de', 'pt', 'ru', 'it', 'nl', 'hi', 'ja'
 def _fetch_transcript_api(video_id: str, languages: list[str]) -> str | None:
     try:
         logger.debug("Attempting youtube_transcript_api for %s, langs: %s", video_id, languages)
-        current_proxy = rnd_proxy() if PROXY_ROTATION[0] else None
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, proxies=current_proxy)
-        
+        # Configure smartproxy for transcript API if available
+        proxy_config = None
+        if GenericProxyConfig and SMARTPROXY_USER and SMARTPROXY_PASS:
+            proxy_url = rnd_proxy().get("https")
+            if proxy_url:
+                proxy_config = GenericProxyConfig(http_proxy=proxy_url)
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, proxies=proxy_config)
         # Try specified languages first
         for lang_code in languages:
             try:
@@ -256,7 +269,6 @@ def _fetch_transcript_api(video_id: str, languages: list[str]) -> str | None:
                     return text
             except NoTranscriptFound:
                 continue # Try next language in the list
-        
         # If not found in specified, try generated for those languages
         for lang_code in languages:
             try:
@@ -273,9 +285,6 @@ def _fetch_transcript_api(video_id: str, languages: list[str]) -> str | None:
     except TranscriptsDisabled:
         logger.warning("Transcripts disabled for video %s", video_id)
         return None
-    except CouldNotRetrieveTranscript as e: # More specific error
-        logger.warning("Could not retrieve transcript for %s via API: %s", video_id, str(e))
-        return None
     except Exception as e:
         logger.error("Unexpected error in _fetch_transcript_api for %s: %s", video_id, str(e), exc_info=LOG_LEVEL=="DEBUG")
         return None
@@ -285,7 +294,13 @@ def _fetch_transcript_resilient(video_id: str) -> str:
 
     # Phase 1: Load transcript list via Smartproxy-enabled client
     try:
-        transcript_list = ytt_api.list_transcripts(video_id)
+        # Use smartproxy for resilient transcript fetch if configured
+        proxy_config = None
+        if GenericProxyConfig and SMARTPROXY_USER and SMARTPROXY_PASS:
+            proxy_url = rnd_proxy().get("https")
+            if proxy_url:
+                proxy_config = GenericProxyConfig(http_proxy=proxy_url)
+        transcript_list = ytt_api.list_transcripts(video_id, proxies=proxy_config)
     except Exception as e:
         logger.warning("Transcript list fetch failed for %s: %s", video_id, str(e))
         # Last resort: yt-dlp subtitle fallback
@@ -569,6 +584,12 @@ def get_transcript_endpoint():
     if not video_id:
         return jsonify({"error": "Invalid videoId format or URL"}), 400
 
+    # Short-circuit for known unavailable videos
+    now = time.time()
+    expiry = NEGATIVE_CACHE.get(video_id)
+    if expiry and now < expiry:
+        return make_response(jsonify({"error": "Transcript not available for this video"}), 404)
+
     try:
         transcript_text = _get_or_spawn_transcript(video_id)
         return jsonify({"video_id": video_id, "text": transcript_text}), 200
@@ -577,6 +598,7 @@ def get_transcript_endpoint():
         return jsonify({"status": "pending", "message": "Transcript processing timed out, please try again shortly."}), 202
     except NoTranscriptFound:
         logger.warning("No transcript found for %s after all fallbacks.", video_id)
+        NEGATIVE_CACHE[video_id] = time.time() + NEGATIVE_CACHE_TTL
         return jsonify({"error": "Transcript not available for this video"}), 404
     except Exception as e:
         logger.error("Unhandled error in transcript endpoint for %s: %s", video_id, str(e), exc_info=True)
@@ -591,7 +613,9 @@ def get_comments_endpoint():
 
     video_id = extract_video_id(video_url_or_id)
     if not video_id:
-        return jsonify({"error": "Invalid videoId format or URL"}), 400
+        # Remove Retry-After header if present (do not set it)
+        response = jsonify({"error": "Invalid videoId format or URL"})
+        return response, 400
     
     try:
         comments_list = _get_or_spawn_comments(video_id)
