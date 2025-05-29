@@ -6,8 +6,12 @@ import logging
 from logging.handlers import RotatingFileHandler
 import time
 from cachetools import TTLCache
-from diskcache import Cache
 import shelve
+try:
+    from diskcache import Cache
+    diskcache_available = True
+except ImportError:
+    diskcache_available = False
 import itertools
 from functools import lru_cache
 from collections import deque
@@ -248,8 +252,22 @@ def yt_dlp_extract_info(video_id: str, extract_comments: bool = False, use_proxy
 # --- Transcript Fetching Logic ---
 fallback_langs_env = os.getenv("TRANSCRIPT_LANGS", "en,es,fr,de,pt,ru,it,nl,hi,ja,ko,ar,zh-Hans")
 FALLBACK_LANGUAGES = [lang.strip() for lang in fallback_langs_env.split(",") if lang.strip()]
-# Persistent cache using diskcache
-persistent_transcript_cache = Cache(PERSISTENT_TRANSCRIPT_DB)
+# Persistent cache for transcripts
+if diskcache_available:
+    # Use diskcache if installed
+    persistent_transcript_cache = Cache(PERSISTENT_TRANSCRIPT_DB)
+else:
+    # Fallback to shelve-based cache
+    class ShelveCache:
+        def __init__(self, path):
+            self.path = path
+        def get(self, key):
+            with shelve.open(self.path) as db:
+                return db.get(key)
+        def set(self, key, value, expire=None):
+            with shelve.open(self.path) as db:
+                db[key] = value
+    persistent_transcript_cache = ShelveCache(PERSISTENT_TRANSCRIPT_DB)
 
 def _fetch_transcript_api(video_id: str, languages: list[str]) -> str | None:
     try:
