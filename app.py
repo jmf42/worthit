@@ -637,6 +637,35 @@ def openai_proxy():
         logger.error(f"Unexpected error in OpenAI proxy: {e}", exc_info=True)
         return jsonify({'error': 'Internal server error during OpenAI proxy'}), 500
 
+# --- Retrieve a stored OpenAI response by ID ---------------------------------
+@app.route('/openai/responses/<response_id>', methods=['GET'])
+@limiter.limit("200 per hour;50 per minute")
+def get_openai_response(response_id):
+    """
+    Pass-through helper to pull a stored Response object directly from OpenAI.
+    """
+    if not OPENAI_API_KEY:
+        logger.error("OpenAI API key not configured – cannot fetch stored response.")
+        return jsonify({'error': 'OpenAI API key not configured'}), 500
+
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+
+    try:
+        resp = session.get(
+            f"https://api.openai.com/v1/responses/{response_id}",
+            headers=headers,
+            timeout=10
+        )
+        resp.raise_for_status()
+        return jsonify(resp.json()), resp.status_code
+    except requests.HTTPError as http_err:
+        logger.error("OpenAI GET /responses error: %s – %s", http_err, resp.text)
+        return jsonify({'error': 'OpenAI API error',
+                        'details': resp.text}), resp.status_code
+    except Exception as e:
+        logger.error("Error fetching OpenAI response: %s", str(e))
+        return jsonify({'error': 'OpenAI service unavailable'}), 503
+
 # --- Health Checks ---
 @app.route("/health", methods=["GET"])
 @limiter.exempt
