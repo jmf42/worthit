@@ -1,4 +1,5 @@
 import os
+import random
 import shelve
 import re
 import json
@@ -7,26 +8,22 @@ import time
 import itertools
 from functools import lru_cache
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future, wait, FIRST_COMPLETED
 
-from flask import Flask, request, jsonify
-from youtube_transcript_api import (
-    YouTubeTranscriptApi,
-    TranscriptsDisabled,
-    NoTranscriptFound
-)
-from youtube_transcript_api._errors import CouldNotRetrieveTranscript
-from cachetools import TTLCache
-from logging.handlers import RotatingFileHandler
-from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 import requests
 import shutil
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
+from youtube_transcript_api.proxies import GenericProxyConfig
 from yt_dlp import YoutubeDL
-import functools
 from youtube_comment_downloader import YoutubeCommentDownloader
 
 # --- Configuration ---
@@ -284,25 +281,67 @@ def _fetch_transcript_api(video_id: str, languages: list[str]) -> str | None:
         return None
 
 def _fetch_transcript_resilient(video_id: str) -> str:
-    logger.info("Initiating resilient transcript fetch for %s", video_id)
-    
-    # Priority 1: English (official then generated)
-    transcript = _fetch_transcript_api(video_id, ["en"])
-    if transcript: return transcript
+    logger.info("Fetching transcript for %s", video_id)
 
-    # Priority 2: Common fallback languages (official then generated)
-    transcript = _fetch_transcript_api(video_id, FALLBACK_LANGUAGES)
-    if transcript: return transcript
-    
-    # Priority 3: yt-dlp subtitles (if available, less reliable for clean text)
-    # This is a deeper fallback and might return XML/VTT, needs careful handling if used.
-    # For now, we rely on youtube_transcript_api which handles parsing.
-    # If yt-dlp is enhanced to directly provide plain text, it could be added here.
-    # info = yt_dlp_extract_info(video_id)
-    # if info and info.get("automatic_captions"): ...
-    
-    logger.error("All transcript sources failed for video %s", video_id)
-    raise NoTranscriptFound(video_id, [], None) # Use a specific error
+    # Phase 1: Load transcript list via Smartproxy-enabled client
+    try:
+        transcript_list = ytt_api.list_transcripts(video_id)
+    except Exception as e:
+        logger.warning("Transcript list fetch failed for %s: %s", video_id, str(e))
+        # Last resort: yt-dlp subtitle fallback
+        info = yt_dlp_extract_info(video_id)
+        if info and info.get("automatic_captions"):
+            texts = []
+            for entries in info["automatic_captions"].values():
+                for entry in entries:
+                    text = entry.get("text")
+                    if text:
+                        texts.append(text)
+            if texts:
+                return " ".join(texts)
+        raise NoTranscriptFound(video_id, [], None)
+
+    # Phase 2: Try English transcripts with per-call timeout
+    for method in ("find_transcript", "find_generated_transcript"):
+        try:
+            with ThreadPoolExecutor(max_workers=1) as fetch_exec:
+                future = fetch_exec.submit(lambda: getattr(transcript_list, method)(["en"]).fetch())
+                segments = future.result(timeout=2.0)
+            if segments:
+                logger.info("Fetched %s (en) for %s", method, video_id)
+                return " ".join(seg["text"] for seg in segments)
+        except TimeoutError:
+            logger.warning("%s timed out for %s", method, video_id)
+        except Exception as e:
+            logger.debug("%s failed for %s: %s", method, video_id, str(e))
+
+    # Phase 3: Sequential fallback languages with timeouts
+    for lang in FALLBACK_LANGUAGES:
+        try:
+            with ThreadPoolExecutor(max_workers=1) as fetch_exec:
+                future = fetch_exec.submit(lambda l=lang: transcript_list.find_transcript([l]).fetch())
+                segments = future.result(timeout=2.0)
+            if segments:
+                logger.info("Fetched transcript (%s) for %s", lang, video_id)
+                return " ".join(seg["text"] for seg in segments)
+        except Exception:
+            continue
+
+    # Phase 4: yt-dlp subtitle fallback
+    info = yt_dlp_extract_info(video_id)
+    if info and info.get("automatic_captions"):
+        texts = []
+        for entries in info["automatic_captions"].values():
+            for entry in entries:
+                text = entry.get("text")
+                if text:
+                    texts.append(text)
+        if texts:
+            logger.info("Fetched subtitles via yt-dlp for %s", video_id)
+            return " ".join(texts)
+
+    logger.error("All transcript sources failed for %s", video_id)
+    raise NoTranscriptFound(video_id, [], None)
 
 def _get_or_spawn_transcript(video_id: str, timeout: float = 30.0) -> str:
     with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
@@ -389,57 +428,76 @@ def _fetch_comments_yt_dlp(video_id: str, use_proxy: bool = False) -> list[str] 
 def _fetch_comments_resilient(video_id: str) -> list[str]:
     logger.info("Initiating resilient comment fetch for %s", video_id)
 
-    # Race Tier 1 & Tier 2 (no proxy) in parallel to reduce latency
-    timeout = 5.0  # seconds to wait for the first completer
+    # Tier 1 & Tier 2: race no-proxy fetch strategies
+    timeout = 2.0  # race timeout: seconds to wait for fastest no-proxy fetch
     with ThreadPoolExecutor(max_workers=2) as race_executor:
         future_yt = race_executor.submit(_fetch_comments_yt_dlp, video_id, False)
         future_dl = race_executor.submit(_fetch_comments_downloader, video_id, False)
         done, pending = wait({future_yt, future_dl}, timeout=timeout, return_when=FIRST_COMPLETED)
 
-        # Check whichever completed first
+        # Check whichever task completed first
         for fut in done:
             try:
                 comments = fut.result()
                 if comments:
                     source = "yt-dlp" if fut is future_yt else "downloader"
-                    logger.info("Fetched %d comments via %s (raced no-proxy)", len(comments), source)
+                    # Cancel slower task(s)
+                    for p in pending:
+                        p.cancel()
+                    logger.info("Fetched %d comments via %s (no-proxy race)", len(comments), source)
                     return comments
             except Exception as e:
-                logger.debug("Error in raced fetcher %s: %s",
-                             "yt-dlp" if fut is future_yt else "downloader", str(e))
+                logger.debug(
+                    "Error in raced fetcher %s: %s",
+                    "yt-dlp" if fut is future_yt else "downloader",
+                    str(e)
+                )
 
-        # If first completed returned no comments, check the other immediately
+        # If the first completed returned no comments or failed, try the other
         for fut in pending:
             try:
                 comments = fut.result(timeout=0)
                 if comments:
                     source = "yt-dlp" if fut is future_yt else "downloader"
-                    logger.info("Fetched %d comments via %s (raced no-proxy)", len(comments), source)
+                    logger.info("Fetched %d comments via %s (no-proxy fallback)", len(comments), source)
                     return comments
             except Exception:
                 pass
 
-    # Tier 3: yt-dlp with proxy
-    comments = _fetch_comments_yt_dlp(video_id, use_proxy=True)
-    if comments:
-        return comments
+    # Tier 3 & 4: proxy-enabled fetches with per-call timeouts
+    proxy_timeout = 2.0  # seconds for proxy fetch
+    # 3a: yt-dlp with proxy
+    try:
+        future_proxy_yt = executor.submit(_fetch_comments_yt_dlp, video_id, True)
+        comments = future_proxy_yt.result(timeout=proxy_timeout)
+        if comments:
+            logger.info("Fetched %d comments via yt-dlp (proxy) for %s", len(comments), video_id)
+            return comments
+    except TimeoutError:
+        logger.warning("Proxy yt-dlp timed out for %s after %.1f s", video_id, proxy_timeout)
+    except Exception as e:
+        logger.warning("Proxy yt-dlp failed early for %s: %s", video_id, str(e))
 
-    # Tier 4: youtube-comment-downloader with proxy
-    comments = _fetch_comments_downloader(video_id, use_proxy=True)
-    if comments:
-        return comments
+    # 3b: downloader with proxy
+    try:
+        future_proxy_dl = executor.submit(_fetch_comments_downloader, video_id, True)
+        comments = future_proxy_dl.result(timeout=proxy_timeout)
+        if comments:
+            logger.info("Fetched %d comments via downloader (proxy) for %s", len(comments), video_id)
+            return comments
+    except TimeoutError:
+        logger.warning("Proxy downloader timed out for %s after %.1f s", video_id, proxy_timeout)
+    except Exception as e:
+        logger.warning("Proxy downloader failed early for %s: %s", video_id, str(e))
 
     # Tier 5: Piped API fallback
-    piped_data = _fetch_from_alternative_api(
-        PIPED_HOSTS, f"/comments/{video_id}", _PIPE_COOLDOWN)
+    piped_data = _fetch_from_alternative_api(PIPED_HOSTS, f"/comments/{video_id}", _PIPE_COOLDOWN)
     if piped_data and "comments" in piped_data:
         comments_text = [
             c.get("commentText") for c in piped_data["comments"] if c.get("commentText")
         ]
         if comments_text:
-            logger.info(
-                "Fetched %d comments via Piped API for %s", len(comments_text), video_id
-            )
+            logger.info("Fetched %d comments via Piped API for %s", len(comments_text), video_id)
             return comments_text[:COMMENT_LIMIT]
 
     logger.warning("All comment sources failed for video %s. Returning empty list.", video_id)
