@@ -169,7 +169,7 @@ PIPED_HOSTS = deque([
 ])
 _PIPE_COOLDOWN: dict[str, float] = {}
 
-def _fetch_from_alternative_api(hosts: deque, path: str, cooldown_map: dict[str, float], timeout: float = 5.0) -> dict | None:
+def _fetch_from_alternative_api(hosts: deque, path: str, cooldown_map: dict[str, float], timeout: float = 2.0) -> dict | None:
     deadline = time.time() + timeout
     # Simple round-robin with cooldown
     for _ in range(len(hosts)):
