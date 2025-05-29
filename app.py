@@ -1,43 +1,32 @@
 import os
-import random
+import shelve
 import re
 import json
 import logging
-from logging.handlers import RotatingFileHandler
 import time
-from cachetools import TTLCache
-import shelve
-try:
-    from diskcache import Cache
-    diskcache_available = True
-except ImportError:
-    diskcache_available = False
 import itertools
-import functools
 from functools import lru_cache
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future, wait, FIRST_COMPLETED
 
+from flask import Flask, request, jsonify
+from youtube_transcript_api import (
+    YouTubeTranscriptApi,
+    TranscriptsDisabled,
+    NoTranscriptFound
+)
+from youtube_transcript_api._errors import CouldNotRetrieveTranscript
+from cachetools import TTLCache
+from logging.handlers import RotatingFileHandler
+from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import requests
 import shutil
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
-from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future, wait, FIRST_COMPLETED
-
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-
-from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
-# Alias for fallback resilience
-ytt_api = YouTubeTranscriptApi
-try:
-    from youtube_transcript_api.proxies import GenericProxyConfig
-except ImportError:
-    GenericProxyConfig = None
-# Negative cache for unavailable transcripts
 from yt_dlp import YoutubeDL
+import functools
 from youtube_comment_downloader import YoutubeCommentDownloader
 
 # --- Configuration ---
@@ -251,143 +240,76 @@ def yt_dlp_extract_info(video_id: str, extract_comments: bool = False, use_proxy
         return None
 
 # --- Transcript Fetching Logic ---
-fallback_langs_env = os.getenv("TRANSCRIPT_LANGS", "en,es,fr,de,pt,ru,it,nl,hi,ja,ko,ar,zh-Hans")
-FALLBACK_LANGUAGES = [lang.strip() for lang in fallback_langs_env.split(",") if lang.strip()]
-# Persistent cache for transcripts
-if diskcache_available:
-    # Use diskcache if installed
-    persistent_transcript_cache = Cache(PERSISTENT_TRANSCRIPT_DB)
-else:
-    # Fallback to shelve-based cache
-    class ShelveCache:
-        def __init__(self, path):
-            self.path = path
-        def get(self, key):
-            with shelve.open(self.path) as db:
-                return db.get(key)
-        def set(self, key, value, expire=None):
-            with shelve.open(self.path) as db:
-                db[key] = value
-    persistent_transcript_cache = ShelveCache(PERSISTENT_TRANSCRIPT_DB)
+FALLBACK_LANGUAGES = ['en', 'es', 'fr', 'de', 'pt', 'ru', 'it', 'nl', 'hi', 'ja', 'ko', 'ar', 'zh-Hans']
 
 def _fetch_transcript_api(video_id: str, languages: list[str]) -> str | None:
     try:
         logger.debug("Attempting youtube_transcript_api for %s, langs: %s", video_id, languages)
-        # Configure smartproxy for transcript API if available
-        proxy_config = None
-        if GenericProxyConfig and SMARTPROXY_USER and SMARTPROXY_PASS:
-            proxy_url = rnd_proxy().get("https")
-            if proxy_url:
-                proxy_config = GenericProxyConfig(http_proxy=proxy_url)
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, proxies=proxy_config)
-        try:
-            transcript = transcript_list.find_transcript(languages)
-            fetched_segments = transcript.fetch()
-            text = " ".join(s["text"] for s in fetched_segments).strip()
-            if text:
-                logger.info("Transcript found via API for %s (langs: %s)", video_id, languages)
-                return text
-        except NoTranscriptFound:
+        current_proxy = rnd_proxy() if PROXY_ROTATION[0] else None
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, proxies=current_proxy)
+        
+        # Try specified languages first
+        for lang_code in languages:
             try:
-                transcript = transcript_list.find_generated_transcript(languages)
+                transcript = transcript_list.find_transcript([lang_code])
                 fetched_segments = transcript.fetch()
                 text = " ".join(s["text"] for s in fetched_segments).strip()
                 if text:
-                    logger.info("Generated transcript found via API for %s (langs: %s)", video_id, languages)
+                    logger.info("Transcript found via API for %s (lang: %s)", video_id, lang_code)
                     return text
             except NoTranscriptFound:
-                pass
+                continue # Try next language in the list
+        
+        # If not found in specified, try generated for those languages
+        for lang_code in languages:
+            try:
+                transcript = transcript_list.find_generated_transcript([lang_code])
+                fetched_segments = transcript.fetch()
+                text = " ".join(s["text"] for s in fetched_segments).strip()
+                if text:
+                    logger.info("Generated transcript found via API for %s (lang: %s)", video_id, lang_code)
+                    return text
+            except NoTranscriptFound:
+                continue
         logger.warning("No transcript found with youtube_transcript_api for %s in langs: %s", video_id, languages)
         return None
     except TranscriptsDisabled:
         logger.warning("Transcripts disabled for video %s", video_id)
+        return None
+    except CouldNotRetrieveTranscript as e: # More specific error
+        logger.warning("Could not retrieve transcript for %s via API: %s", video_id, str(e))
         return None
     except Exception as e:
         logger.error("Unexpected error in _fetch_transcript_api for %s: %s", video_id, str(e), exc_info=LOG_LEVEL=="DEBUG")
         return None
 
 def _fetch_transcript_resilient(video_id: str) -> str:
-    logger.info("Fetching transcript for %s", video_id)
+    logger.info("Initiating resilient transcript fetch for %s", video_id)
+    
+    # Priority 1: English (official then generated)
+    transcript = _fetch_transcript_api(video_id, ["en"])
+    if transcript: return transcript
 
-    # Phase 1: Load transcript list via Smartproxy-enabled client
-    try:
-        # Use smartproxy for resilient transcript fetch if configured
-        proxy_config = None
-        if GenericProxyConfig and SMARTPROXY_USER and SMARTPROXY_PASS:
-            proxy_url = rnd_proxy().get("https")
-            if proxy_url:
-                proxy_config = GenericProxyConfig(http_proxy=proxy_url)
-        transcript_list = ytt_api.list_transcripts(video_id, proxies=proxy_config)
-    except Exception as e:
-        logger.warning("Transcript list fetch failed for %s: %s", video_id, str(e))
-        # Last resort: yt-dlp subtitle fallback
-        info = yt_dlp_extract_info(video_id)
-        if info and info.get("automatic_captions"):
-            texts = []
-            for entries in info["automatic_captions"].values():
-                for entry in entries:
-                    text = entry.get("text")
-                    if text:
-                        texts.append(text)
-            if texts:
-                return " ".join(texts)
-        raise NoTranscriptFound(video_id, [], None)
-
-    # Phase 2: Try English transcripts with per-call timeout
-    for method in ("find_transcript", "find_generated_transcript"):
-        try:
-            with ThreadPoolExecutor(max_workers=1) as fetch_exec:
-                future = fetch_exec.submit(lambda: getattr(transcript_list, method)(["en"]).fetch())
-                segments = future.result(timeout=2.0)
-            if segments:
-                logger.info("Fetched %s (en) for %s", method, video_id)
-                return " ".join(seg["text"] for seg in segments)
-        except TimeoutError:
-            logger.warning("%s timed out for %s", method, video_id)
-        except Exception as e:
-            logger.debug("%s failed for %s: %s", method, video_id, str(e))
-
-    # Phase 3: Fallback to any configured languages in one go
-    try:
-        with ThreadPoolExecutor(max_workers=1) as fetch_exec:
-            future = fetch_exec.submit(lambda: transcript_list.find_transcript(FALLBACK_LANGUAGES).fetch())
-            segments = future.result(timeout=2.0)
-        if segments:
-            logger.info("Fetched transcript via list fallback for %s", video_id)
-            return " ".join(seg["text"] for seg in segments)
-    except Exception:
-        pass
-    try:
-        with ThreadPoolExecutor(max_workers=1) as fetch_exec:
-            future = fetch_exec.submit(lambda: transcript_list.find_generated_transcript(FALLBACK_LANGUAGES).fetch())
-            segments = future.result(timeout=2.0)
-        if segments:
-            logger.info("Fetched generated transcript via list fallback for %s", video_id)
-            return " ".join(seg["text"] for seg in segments)
-    except Exception:
-        pass
-
-    # Phase 4: yt-dlp subtitle fallback
-    info = yt_dlp_extract_info(video_id)
-    if info and info.get("automatic_captions"):
-        texts = []
-        for entries in info["automatic_captions"].values():
-            for entry in entries:
-                text = entry.get("text")
-                if text:
-                    texts.append(text)
-        if texts:
-            logger.info("Fetched subtitles via yt-dlp for %s", video_id)
-            return " ".join(texts)
-
-    logger.error("All transcript sources failed for %s", video_id)
-    raise NoTranscriptFound(video_id, [], None)
+    # Priority 2: Common fallback languages (official then generated)
+    transcript = _fetch_transcript_api(video_id, FALLBACK_LANGUAGES)
+    if transcript: return transcript
+    
+    # Priority 3: yt-dlp subtitles (if available, less reliable for clean text)
+    # This is a deeper fallback and might return XML/VTT, needs careful handling if used.
+    # For now, we rely on youtube_transcript_api which handles parsing.
+    # If yt-dlp is enhanced to directly provide plain text, it could be added here.
+    # info = yt_dlp_extract_info(video_id)
+    # if info and info.get("automatic_captions"): ...
+    
+    logger.error("All transcript sources failed for video %s", video_id)
+    raise NoTranscriptFound(video_id, [], None) # Use a specific error
 
 def _get_or_spawn_transcript(video_id: str, timeout: float = 30.0) -> str:
-    cached_persist = persistent_transcript_cache.get(video_id)
-    if cached_persist is not None:
-        logger.debug("Transcript cache HIT (persistent) for %s", video_id)
-        return cached_persist
+    with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
+        if video_id in db:
+            logger.debug("Transcript cache HIT (persistent) for %s", video_id)
+            return db[video_id]
+            
     if (cached := transcript_cache.get(video_id)):
         logger.debug("Transcript cache HIT (in-memory) for %s", video_id)
         return cached
@@ -403,7 +325,8 @@ def _get_or_spawn_transcript(video_id: str, timeout: float = 30.0) -> str:
     try:
         result = future.result(timeout=timeout)
         transcript_cache[video_id] = result
-        persistent_transcript_cache.set(video_id, result, expire=TRANSCRIPT_CACHE_TTL)
+        with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
+            db[video_id] = result
         logger.info("Transcript processing complete for %s", video_id)
         return result
     except TimeoutError:
@@ -423,7 +346,6 @@ def _fetch_comments_downloader(video_id: str, use_proxy: bool = False) -> list[s
     try:
         # Using a new downloader instance per call to avoid state issues if any
         downloader = YoutubeCommentDownloader()
-        # Fetch comments as a flat sequence
         comments_generator = downloader.get_comments_from_url(
             f"https://www.youtube.com/watch?v={video_id}",
             sort_by=0,    # 0 for top (popular) comments
@@ -448,18 +370,15 @@ def _fetch_comments_downloader(video_id: str, use_proxy: bool = False) -> list[s
 
 def _fetch_comments_yt_dlp(video_id: str, use_proxy: bool = False) -> list[str] | None:
     if not YTDL_COOKIE_FILE:
-        # Since 2024‑05 yt-dlp can pull the first batch of public comments
-        # without authentication; proceed even if no cookie file is configured.
+        # Since 2024‑05 yt-dlp can pull the first batch of public comments without authentication
         logger.debug("yt-dlp comments: proceeding without cookies (public endpoints only).")
-    
     logger.debug("Attempting comments via yt-dlp for %s", video_id)
-    # Try with or without proxy based on use_proxy flag
     info = yt_dlp_extract_info(video_id, extract_comments=True, use_proxy=use_proxy)
     if info and "comments" in info and info["comments"]:
         comments_text = [c["text"] for c in info["comments"] if c.get("text")]
         if comments_text:
             logger.info("Fetched %d comments via yt-dlp for %s", len(comments_text), video_id)
-            return comments_text[:COMMENT_LIMIT] # Ensure limit
+            return comments_text[:COMMENT_LIMIT]
     logger.warning("No comments found via yt-dlp for %s", video_id)
     return None
 
@@ -531,16 +450,13 @@ def _fetch_comments_resilient(video_id: str) -> list[str]:
     # Tier 5: Piped API fallback
     piped_data = _fetch_from_alternative_api(PIPED_HOSTS, f"/comments/{video_id}", _PIPE_COOLDOWN)
     if piped_data and "comments" in piped_data:
-        comments_text = [
-            c.get("commentText") for c in piped_data["comments"] if c.get("commentText")
-        ]
+        comments_text = [c.get("commentText") for c in piped_data["comments"] if c.get("commentText")]
         if comments_text:
             logger.info("Fetched %d comments via Piped API for %s", len(comments_text), video_id)
             return comments_text[:COMMENT_LIMIT]
 
     logger.warning("All comment sources failed for video %s. Returning empty list.", video_id)
     return []
-
 
 def _get_or_spawn_comments(video_id: str, timeout: float = 45.0) -> list[str]:
     with shelve.open(PERSISTENT_COMMENT_DB) as db:
@@ -563,17 +479,17 @@ def _get_or_spawn_comments(video_id: str, timeout: float = 45.0) -> list[str]:
 
     try:
         result = future.result(timeout=timeout)
-        comment_cache[video_id] = result # Use video_id for TTLCache key consistency
+        comment_cache[video_id] = result
         with shelve.open(PERSISTENT_COMMENT_DB) as db:
             db[video_id] = result
         logger.info("Comment processing complete for %s", video_id)
         return result
     except TimeoutError:
         logger.warning("Comment fetch timed out for %s after %s s", video_id, timeout)
-        return [] # Return empty on timeout to not block analysis
+        return []
     except Exception as e:
         logger.error("Comment fetch failed for %s: %s", video_id, str(e), exc_info=LOG_LEVEL=="DEBUG")
-        return [] # Return empty on error
+        return []
     finally:
         if cache_key in _pending_futures and (_pending_futures[cache_key] == future and future.done()):
             _pending_futures.pop(cache_key, None)
@@ -607,11 +523,8 @@ def get_transcript_endpoint():
     if not video_id:
         return jsonify({"error": "Invalid videoId format or URL"}), 400
 
-
     try:
-        # Allow a longer wait so the background fetch has enough time,
-        # but still return quickly under heavy load.
-        transcript_text = _get_or_spawn_transcript(video_id, timeout=8.0)
+        transcript_text = _get_or_spawn_transcript(video_id)
         return jsonify({"video_id": video_id, "text": transcript_text}), 200
     except TimeoutError: # Raised by _get_or_spawn_transcript if its own timeout hits
         logger.warning("Transcript request for %s returned 202 (pending due to timeout)", video_id)
@@ -632,9 +545,7 @@ def get_comments_endpoint():
 
     video_id = extract_video_id(video_url_or_id)
     if not video_id:
-        # Remove Retry-After header if present (do not set it)
-        response = jsonify({"error": "Invalid videoId format or URL"})
-        return response, 400
+        return jsonify({"error": "Invalid videoId format or URL"}), 400
     
     try:
         comments_list = _get_or_spawn_comments(video_id)
