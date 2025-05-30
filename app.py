@@ -417,7 +417,6 @@ def _fetch_comments_resilient(video_id: str) -> list[str]:
     5. Finally, try Piped API as the last resort.
     """
     logger.info("Initiating resilient comment fetch for %s", video_id)
-
     logger.info("Fetching comments with primary youtube-comment-downloader for %s", video_id)
     comments = _fetch_comments_downloader(video_id, False)
     if comments:
@@ -428,25 +427,6 @@ def _fetch_comments_resilient(video_id: str) -> list[str]:
     if comments:
         logger.info("Fetched %d comments via yt-dlp (fallback)", len(comments), video_id)
         return comments[:COMMENT_LIMIT]
-
-    # Tier 3 & 4: proxy-enabled attempts (only if race failed)
-    proxy_timeout = 2.0  # seconds for each proxy attempt
-
-    try:
-        comments = executor.submit(_fetch_comments_yt_dlp, video_id, True).result(timeout=proxy_timeout)
-        if comments:
-            logger.info("Fetched %d comments via yt-dlp (proxy) for %s", len(comments), video_id)
-            return comments[:COMMENT_LIMIT]
-    except Exception as e:
-        logger.debug("Proxy yt-dlp attempt failed for %s: %s", video_id, e)
-
-    try:
-        comments = executor.submit(_fetch_comments_downloader, video_id, True).result(timeout=proxy_timeout)
-        if comments:
-            logger.info("Fetched %d comments via downloader (proxy) for %s", len(comments), video_id)
-            return comments[:COMMENT_LIMIT]
-    except Exception as e:
-        logger.debug("Proxy downloader attempt failed for %s: %s", video_id, e)
 
     # Tier 5: Piped API
     piped_data = _fetch_from_alternative_api(PIPED_HOSTS, f"/comments/{video_id}", _PIPE_COOLDOWN)
