@@ -428,6 +428,20 @@ def _fetch_comments_resilient(video_id: str) -> list[str]:
         logger.info("Fetched %d comments via yt-dlp (fallback)", len(comments), video_id)
         return comments[:COMMENT_LIMIT]
 
+    # Tier 3: Try yt-dlp with proxy
+    logger.info("Fallback to yt-dlp with proxy for %s", video_id)
+    comments = _fetch_comments_yt_dlp(video_id, True)
+    if comments:
+        logger.info("Fetched %d comments via yt-dlp (proxy fallback)", len(comments), video_id)
+        return comments[:COMMENT_LIMIT]
+
+    # Tier 4: Try youtube-comment-downloader with proxy
+    logger.info("Fallback to youtube-comment-downloader with proxy for %s", video_id)
+    comments = _fetch_comments_downloader(video_id, True)
+    if comments:
+        logger.info("Fetched %d comments via youtube-comment-downloader (proxy fallback)", len(comments), video_id)
+        return comments[:COMMENT_LIMIT]
+
     # Tier 5: Piped API
     piped_data = _fetch_from_alternative_api(PIPED_HOSTS, f"/comments/{video_id}", _PIPE_COOLDOWN)
     if piped_data and "comments" in piped_data:
