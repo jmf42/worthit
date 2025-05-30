@@ -7,7 +7,7 @@ import time
 import itertools
 from functools import lru_cache
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future
 
 from flask import Flask, request, jsonify
 from youtube_transcript_api import (
@@ -408,42 +408,28 @@ def _fetch_comments_yt_dlp(video_id: str, use_proxy: bool = False) -> list[str] 
 # --- Comment Fetching Logic (improved racer) ---
 
 def _fetch_comments_resilient(video_id: str) -> list[str]:
-    """Fetch comments with the fastest available no‑proxy source first.
+    """Fetch comments in a primary→fallback→proxy→Piped sequence.
 
-    * Launch yt‑dlp and youtube‑comment‑downloader concurrently.
-    * Wait up to RACE_TIMEOUT seconds for *either* job to deliver a
-      non‑empty list.
-    * If neither delivers in time, fall back to the proxy tiers and
-      finally Piped.
+    1. Try youtube-comment-downloader without proxy.
+    2. Fallback to yt-dlp without proxy if no comments.
+    3. Try yt-dlp with proxy if still no comments.
+    4. Try youtube-comment-downloader with proxy.
+    5. Finally, try Piped API as the last resort.
     """
     logger.info("Initiating resilient comment fetch for %s", video_id)
 
-    RACE_TIMEOUT = 5.0  # seconds allowed for the initial race
+    logger.info("Fetching comments with primary youtube-comment-downloader for %s", video_id)
+    comments = _fetch_comments_downloader(video_id, False)
+    if comments:
+        logger.info("Fetched %d comments via youtube-comment-downloader (primary)", len(comments), video_id)
+        return comments[:COMMENT_LIMIT]
+    logger.info("Primary fetcher returned no comments, falling back to yt-dlp for %s", video_id)
+    comments = _fetch_comments_yt_dlp(video_id, False)
+    if comments:
+        logger.info("Fetched %d comments via yt-dlp (fallback)", len(comments), video_id)
+        return comments[:COMMENT_LIMIT]
 
-    # Kick off the two primary fetchers (no proxy)
-    with ThreadPoolExecutor(max_workers=2) as race_executor:
-        future_yt = race_executor.submit(_fetch_comments_yt_dlp, video_id, False)
-        future_dl = race_executor.submit(_fetch_comments_downloader, video_id, False)
-        pending: set[Future] = {future_yt, future_dl}
-        start_time = time.time()
-
-        # Poll in a short loop so we can break as soon as we have data
-        while pending and (time.time() - start_time) < RACE_TIMEOUT:
-            done, pending = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
-            for fut in done:
-                try:
-                    comments = fut.result()
-                    if comments:
-                        src = "yt-dlp" if fut is future_yt else "downloader"
-                        logger.info("Fetched %d comments via %s (race win)", len(comments), src)
-                        # Cancel any still‑running task and return immediately
-                        for p in pending:
-                            p.cancel()
-                        return comments[:COMMENT_LIMIT]
-                except Exception as e:
-                    logger.debug("Race future failure (%s): %s", "yt-dlp" if fut is future_yt else "downloader", e)
-
-    # Tier 3 & 4: proxy‑enabled attempts (only if race failed)
+    # Tier 3 & 4: proxy-enabled attempts (only if race failed)
     proxy_timeout = 2.0  # seconds for each proxy attempt
 
     try:
@@ -666,54 +652,6 @@ def get_openai_response(response_id):
         logger.error("Error fetching OpenAI response: %s", str(e))
         return jsonify({'error': 'OpenAI service unavailable'}), 503
 
-# --- Health Checks ---
-@app.route("/health", methods=["GET"])
-@limiter.exempt
-def health_check():
-    return jsonify({"status": "ok", "version": "2.0.0"}), 200
-
-@app.route("/health/deep", methods=["GET"])
-@limiter.exempt
-def deep_health_check():
-    checks = {}
-    # Env check
-    checks['env'] = {'OPENAI_KEY_CONFIGURED': bool(OPENAI_API_KEY)}
-    
-    # Disk space
-    try:
-        total, used, free = shutil.disk_usage('/')
-        checks['disk'] = {'free_gb': round(free / (1024**3), 2), 'ok': (free / total) > 0.05} # Check for >5% free
-    except Exception as e:
-        checks['disk'] = {'ok': False, 'error': str(e)}
-
-    # Worker pool status
-    checks['worker_pool'] = {
-        'max_workers': MAX_WORKERS,
-        'active_threads': executor._work_queue.qsize() + len(executor._threads), # Approx active
-        'pending_futures': len(_pending_futures)
-    }
-    
-    # Simple OpenAI API connectivity test (list models)
-    openai_ok = False
-    if OPENAI_API_KEY:
-        try:
-            r = session.get("https://api.openai.com/v1/models", headers={"Authorization": f"Bearer {OPENAI_API_KEY}"}, timeout=5)
-            openai_ok = r.status_code == 200
-        except Exception:
-            openai_ok = False
-    checks['external_services'] = {'openai_api_models_list': openai_ok}
-
-    # Overall status
-    all_ok = checks['env']['OPENAI_KEY_CONFIGURED'] and \
-             checks['disk']['ok'] and \
-             checks['external_services']['openai_api_models_list']
-             
-    status_code = 200 if all_ok else 503
-    return jsonify({
-        'status': 'ok' if all_ok else 'degraded',
-        'uptime_seconds': round(time.time() - app_start_time, 2),
-        'checks': checks
-    }), status_code
 
 # --- Cleanup on Exit ---
 def cleanup_on_exit():
