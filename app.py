@@ -420,7 +420,7 @@ def _fetch_comments_resilient(video_id: str) -> list[str]:
     logger.info("Fetching comments with primary youtube-comment-downloader for %s", video_id)
     comments = _fetch_comments_downloader(video_id, False)
     if comments:
-        logger.info("Fetched %d comments via youtube-comment-downloader (primary)", len(comments), video_id)
+        logger.info("Fetched %d comments via youtube-comment-downloader (primary) for %s", len(comments), video_id)
         return comments[:COMMENT_LIMIT]
     logger.info("Primary fetcher returned no comments, falling back to yt-dlp for %s", video_id)
     comments = _fetch_comments_yt_dlp(video_id, False)
