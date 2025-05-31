@@ -36,7 +36,7 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", str(min(4, (os.cpu_count() or 1)))))
 COMMENT_LIMIT = int(os.getenv("COMMENT_LIMIT", "50"))
 TRANSCRIPT_CACHE_SIZE = int(os.getenv("TRANSCRIPT_CACHE_SIZE", "200"))
 TRANSCRIPT_CACHE_TTL = int(os.getenv("TRANSCRIPT_CACHE_TTL", "7200")) # 2 hours
-TRANSCRIPT_HTTP_TIMEOUT = int(os.getenv("TRANSCRIPT_HTTP_TIMEOUT", "5"))   # seconds per HTTP call
+TRANSCRIPT_HTTP_TIMEOUT = int(os.getenv("TRANSCRIPT_HTTP_TIMEOUT", "4"))   # seconds per HTTP call
 MAX_TRANSCRIPT_ATTEMPTS = int(os.getenv("MAX_TRANSCRIPT_ATTEMPTS", "2"))   # max attempts
 COMMENT_CACHE_SIZE = int(os.getenv("COMMENT_CACHE_SIZE", "150"))
 COMMENT_CACHE_TTL = int(os.getenv("COMMENT_CACHE_TTL", "7200")) # 2 hours
@@ -280,10 +280,12 @@ def _fetch_transcript_api(video_id: str, languages: list[str]) -> str | None:
                 body = getattr(e, "response", None).text[:500] if hasattr(e, "response") and e.response else ""
                 if _is_captcha_response(body):
                     logger.warning("CAPTCHA detected, rotating proxy (attempt %d)", attempt+1)
+                    time.sleep(0.3)
                     continue
             except Exception:
                 pass
             logger.debug("Transcript attempt %d failed: %s", attempt+1, e)
+        time.sleep(0.3)
 
     if last_exc:
         logger.error("All proxy attempts exhausted for %s: %s", video_id, last_exc)
