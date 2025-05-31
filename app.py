@@ -32,7 +32,7 @@ from youtube_comment_downloader import YoutubeCommentDownloader
 # --- Configuration ---
 APP_NAME = "WorthItService"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", str(min(8, (os.cpu_count() or 1) * 2))))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", str(min(4, (os.cpu_count() or 1)))))
 COMMENT_LIMIT = int(os.getenv("COMMENT_LIMIT", "50"))
 TRANSCRIPT_CACHE_SIZE = int(os.getenv("TRANSCRIPT_CACHE_SIZE", "200"))
 TRANSCRIPT_CACHE_TTL = int(os.getenv("TRANSCRIPT_CACHE_TTL", "7200")) # 2 hours
@@ -257,7 +257,7 @@ def _fetch_transcript_api(video_id: str, languages: list[str]) -> str | None:
                          attempt+1, video_id,
                          proxy_cfg.get("https") if proxy_cfg else "direct")
             transcript_list = YouTubeTranscriptApi.list_transcripts(
-                video_id, proxies=proxy_cfg, timeout=TRANSCRIPT_HTTP_TIMEOUT
+                video_id, proxies=proxy_cfg
             )
 
             for finder in (transcript_list.find_transcript, transcript_list.find_generated_transcript):
@@ -522,14 +522,18 @@ def get_transcript_endpoint():
 
     # Check RAM cache
     cached = transcript_cache.get(video_id)
-    if cached:
+    if cached is not None:
+        if cached == "__NOT_AVAILABLE__":
+            return jsonify({"error": "Transcript not available"}), 404
         return jsonify({"video_id": video_id, "text": cached}), 200
 
     # Try persistent cache
     with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
         cached = db.get(video_id)
-        if cached:
+        if cached is not None:
             transcript_cache[video_id] = cached
+            if cached == "__NOT_AVAILABLE__":
+                return jsonify({"error": "Transcript not available"}), 404
             return jsonify({"video_id": video_id, "text": cached}), 200
 
     # Try fetch (max 7s)
@@ -560,12 +564,12 @@ def get_comments_endpoint():
         return jsonify({"error": "Invalid videoId format or URL"}), 400
 
     cached = comment_cache.get(video_id)
-    if cached:
+    if cached is not None:
         return jsonify({"video_id": video_id, "comments": cached}), 200
 
     with shelve.open(PERSISTENT_COMMENT_DB) as db:
         cached = db.get(video_id)
-        if cached:
+        if cached is not None:
             comment_cache[video_id] = cached
             return jsonify({"video_id": video_id, "comments": cached}), 200
 
