@@ -72,7 +72,8 @@ def setup_logging():
 
     logger = logging.getLogger(APP_NAME)
     logger.setLevel(LOG_LEVEL)
-    
+    if logger.hasHandlers():
+        logger.handlers.clear()
     # Console Handler
     ch = logging.StreamHandler()
     ch.setLevel(LOG_LEVEL)
@@ -94,7 +95,7 @@ app_start_time = time.time()
 
 # --- HTTP Session with Retries ---
 session = requests.Session()
-session.request = functools.partial(session.request, timeout=15) # Default timeout for requests
+session.request = functools.partial(session.request, timeout=7)  # ≤7 s per external request
 retry_cfg = Retry(
     total=3, connect=3, read=3, status=3,
     backoff_factor=0.5,
@@ -136,6 +137,7 @@ _pending_futures: dict[str, Future] = {}
 logger.info(f"App initialized. Max workers: {MAX_WORKERS}. Comment limit: {COMMENT_LIMIT}")
 logger.info(f"Transcript Cache: size={TRANSCRIPT_CACHE_SIZE}, ttl={TRANSCRIPT_CACHE_TTL}s")
 logger.info(f"Comment Cache: size={COMMENT_CACHE_SIZE}, ttl={COMMENT_CACHE_TTL}s")
+logger.info("Global timeouts → external requests: 7 s, worker hard-timeout: 7 s; UX budget ≤ 20 s")
 
 # --- Video ID Validation & Extraction ---
 VIDEO_ID_REGEX = re.compile(r'^[\w-]{11}$')
@@ -314,51 +316,31 @@ def _fetch_transcript_resilient(video_id: str) -> str:
     logger.error("All transcript sources failed for video %s", video_id)
     raise NoTranscriptFound(video_id, [], None) # Use a specific error
 
-def _get_or_spawn_transcript(video_id: str, timeout: float = 30.0) -> str:
-    with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
-        cached_persist = db.get(video_id)
-        if cached_persist == "__NOT_AVAILABLE__":
-            raise NoTranscriptFound(video_id, [], None)
-        if cached_persist is not None:
-            logger.debug("Transcript cache HIT (persistent) for %s", video_id)
-            return cached_persist
-            
-    if (cached := transcript_cache.get(video_id)):
-        if cached == "__NOT_AVAILABLE__":
+def _get_or_spawn_transcript(video_id: str) -> str:
+    """
+    Return transcript from cache (RAM or persistent). Never spawns fetch jobs.
+    Raises NoTranscriptFound if not cached.
+    """
+    # In‑memory first
+    val = transcript_cache.get(video_id)
+    if val is not None:
+        if val == "__NOT_AVAILABLE__":
             raise NoTranscriptFound(video_id, [], None)
         logger.debug("Transcript cache HIT (in-memory) for %s", video_id)
-        return cached
+        return val
 
-    future = _pending_futures.get(video_id)
-    if future is None or future.done(): # Ensure future is not already completed or cancelled
-        logger.info("Spawning new transcript fetch task for %s", video_id)
-        future = executor.submit(_fetch_transcript_resilient, video_id)
-        _pending_futures[video_id] = future
-    else:
-        logger.info("Waiting for existing transcript fetch task for %s", video_id)
+    # Persistent shelf
+    with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
+        val = db.get(video_id)
+        if val is not None:
+            if val == "__NOT_AVAILABLE__":
+                raise NoTranscriptFound(video_id, [], None)
+            logger.debug("Transcript cache HIT (persistent) for %s", video_id)
+            transcript_cache[video_id] = val
+            return val
 
-    try:
-        result = future.result(timeout=timeout)
-        transcript_cache[video_id] = result
-        with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
-            db[video_id] = result
-        logger.info("Transcript processing complete for %s", video_id)
-        return result
-    except TimeoutError:
-        logger.warning("Transcript fetch timed out for %s after %s s", video_id, timeout)
-        raise # Re-raise to be handled by endpoint
-    except NoTranscriptFound:
-        transcript_cache[video_id] = "__NOT_AVAILABLE__"
-        with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
-            db[video_id] = "__NOT_AVAILABLE__"
-        raise
-    except Exception as e:
-        logger.error("Transcript fetch failed for %s: %s", video_id, str(e), exc_info=LOG_LEVEL=="DEBUG")
-        raise # Re-raise
-    finally:
-        # Clean up future if it's completed or no longer the active one for this video_id
-        if video_id in _pending_futures and (_pending_futures[video_id] == future and future.done()):
-            _pending_futures.pop(video_id, None)
+    # Not cached
+    raise NoTranscriptFound(video_id, [], None)
 
 # --- Comment Fetching Logic ---
 def _fetch_comments_downloader(video_id: str, use_proxy: bool = False) -> list[str] | None:
@@ -453,41 +435,12 @@ def _fetch_comments_resilient(video_id: str) -> list[str]:
     logger.warning("All comment sources failed for video %s. Returning empty list.", video_id)
     return []
 
-def _get_or_spawn_comments(video_id: str, timeout: float = 45.0) -> list[str]:
-    with shelve.open(PERSISTENT_COMMENT_DB) as db:
-        if video_id in db:
-            logger.debug("Comment cache HIT (persistent) for %s", video_id)
-            return db[video_id]
-
-    if (cached := comment_cache.get(video_id)):
-        logger.debug("Comment cache HIT (in-memory) for %s", video_id)
-        return cached
-    
-    cache_key = f"comments_{video_id}"
-    future = _pending_futures.get(cache_key)
-    if future is None or future.done():
-        logger.info("Spawning new comment fetch task for %s", video_id)
-        future = executor.submit(_fetch_comments_resilient, video_id)
-        _pending_futures[cache_key] = future
-    else:
-        logger.info("Waiting for existing comment fetch task for %s", video_id)
-
-    try:
-        result = future.result(timeout=timeout)
-        comment_cache[video_id] = result
-        with shelve.open(PERSISTENT_COMMENT_DB) as db:
-            db[video_id] = result
-        logger.info("Comment processing complete for %s", video_id)
-        return result
-    except TimeoutError:
-        logger.warning("Comment fetch timed out for %s after %s s", video_id, timeout)
-        return []
-    except Exception as e:
-        logger.error("Comment fetch failed for %s: %s", video_id, str(e), exc_info=LOG_LEVEL=="DEBUG")
-        return []
-    finally:
-        if cache_key in _pending_futures and (_pending_futures[cache_key] == future and future.done()):
-            _pending_futures.pop(cache_key, None)
+def _get_or_spawn_comments(*_args, **_kwargs):
+    """
+    DEPRECATED: ya no se usa flujo bloqueante. Los comentarios se gestionan de forma
+    asíncrona con _background_comment_worker y el endpoint /comments.
+    """
+    raise RuntimeError("_get_or_spawn_comments() is deprecated – use async endpoint flow")
 
 # --- Endpoints ---
 @app.before_request
@@ -507,8 +460,53 @@ def log_request_info():
                 logger.warning(f"Could not parse/log JSON payload: {e}")
 
 
+
+# --- Background transcript worker helper ---
+def _background_transcript_worker(video_id: str):
+    """Obtiene transcript en segundo plano, guarda en caché y limpia pending."""
+    try:
+        if video_id in transcript_cache:
+            return
+
+        # Llamada real
+        result = _fetch_transcript_resilient(video_id)
+        transcript_cache[video_id] = result
+        with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
+            db[video_id] = result
+        logger.info("Transcript processing complete for %s (background)", video_id)
+
+    except NoTranscriptFound:
+        transcript_cache[video_id] = "__NOT_AVAILABLE__"
+        with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
+            db[video_id] = "__NOT_AVAILABLE__"
+        logger.warning("Transcript marked NOT AVAILABLE for %s", video_id)
+
+    except Exception as e:
+        logger.error("Background transcript worker failed for %s: %s", video_id, str(e))
+
+    finally:
+        _pending_futures.pop(video_id, None)
+
+# --- Background comment worker helper ---
+def _background_comment_worker(video_id: str):
+    """Fetch comments in background, cache result and clean pending."""
+    try:
+        if video_id in comment_cache:
+            return
+        result = _fetch_comments_resilient(video_id)
+        comment_cache[video_id] = result
+        with shelve.open(PERSISTENT_COMMENT_DB) as db:
+            db[video_id] = result
+        logger.info("Comment processing complete for %s (background)", video_id)
+    except Exception as e:
+        logger.error("Background comment worker failed for %s: %s", video_id, str(e))
+    finally:
+        _pending_futures.pop(f"comments_{video_id}", None)
+
+
+
 @app.route("/transcript", methods=["GET"])
-@limiter.limit("120/hour;20/minute") # Limits for transcript endpoint
+@limiter.limit("120/hour;20/minute")  # Limits for transcript endpoint
 def get_transcript_endpoint():
     video_url_or_id = request.args.get("videoId", "")
     if not video_url_or_id:
@@ -518,21 +516,27 @@ def get_transcript_endpoint():
     if not video_id:
         return jsonify({"error": "Invalid videoId format or URL"}), 400
 
-    try:
-        transcript_text = _get_or_spawn_transcript(video_id)
-        return jsonify({"video_id": video_id, "text": transcript_text}), 200
-    except TimeoutError: # Raised by _get_or_spawn_transcript if its own timeout hits
-        logger.warning("Transcript request for %s returned 202 (pending due to timeout)", video_id)
-        return jsonify({"status": "pending", "message": "Transcript processing timed out, please try again shortly."}), 202
-    except NoTranscriptFound:
-        transcript_cache[video_id] = "__NOT_AVAILABLE__"
-        with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
-            db[video_id] = "__NOT_AVAILABLE__"
-        logger.warning("No transcript found for %s after all fallbacks.", video_id)
-        return jsonify({"error": "Transcript not available for this video"}), 404
-    except Exception as e:
-        logger.error("Unhandled error in transcript endpoint for %s: %s", video_id, str(e), exc_info=True)
-        return jsonify({"error": "Failed to retrieve transcript due to an internal server error"}), 500
+    # 1. cached?
+    if video_id in transcript_cache:
+        return jsonify({"video_id": video_id,
+                        "text": transcript_cache[video_id]}), 200
+
+    # 2. pending?
+    future = _pending_futures.get(video_id)
+    if future and not future.done():
+        return jsonify({"video_id": video_id,
+                        "status": "pending",
+                        "retry_after": 3}), 202
+
+    # 3. throttle
+    if len(_pending_futures) >= MAX_WORKERS * 2:
+        return jsonify({"error": "Server busy, try again later"}), 429
+
+    # 4. spawn worker & respond 202
+    _pending_futures[video_id] = executor.submit(_background_transcript_worker, video_id)
+    return jsonify({"video_id": video_id,
+                    "status": "pending",
+                    "retry_after": 3}), 202
 
 @app.route("/comments", methods=["GET"])
 @limiter.limit("120/hour;20/minute") # Limits for comments endpoint
@@ -544,13 +548,25 @@ def get_comments_endpoint():
     video_id = extract_video_id(video_url_or_id)
     if not video_id:
         return jsonify({"error": "Invalid videoId format or URL"}), 400
-    
-    try:
-        comments_list = _get_or_spawn_comments(video_id)
-        return jsonify({"video_id": video_id, "comments": comments_list}), 200
-    except Exception as e: # Should ideally not happen if _get_or_spawn_comments handles its errors
-        logger.error("Unhandled error in comments endpoint for %s: %s", video_id, str(e), exc_info=True)
-        return jsonify({"error": "Failed to retrieve comments due to an internal server error"}), 500
+
+    if video_id in comment_cache:
+        return jsonify({"video_id": video_id,
+                        "comments": comment_cache[video_id]}), 200
+
+    key = f"comments_{video_id}"
+    future = _pending_futures.get(key)
+    if future and not future.done():
+        return jsonify({"video_id": video_id,
+                        "status": "pending",
+                        "retry_after": 3}), 202
+
+    if len(_pending_futures) >= MAX_WORKERS * 2:
+        return jsonify({"error": "Server busy, try again later"}), 429
+
+    _pending_futures[key] = executor.submit(_background_comment_worker, video_id)
+    return jsonify({"video_id": video_id,
+                    "status": "pending",
+                    "retry_after": 3}), 202
 
 @app.route("/openai/responses", methods=["POST"])
 @limiter.limit("200/hour;50/minute") # Limits for OpenAI proxy
@@ -586,7 +602,7 @@ def openai_proxy():
     openai_endpoint = "https://api.openai.com/v1/responses" # Keep as original
 
     try:
-        resp = session.post(openai_endpoint, headers=headers, json=payload, timeout=90) # Increased timeout for AI
+        resp = session.post(openai_endpoint, headers=headers, json=payload, timeout=15) # 15 s UX-budget
         logger.info(f"OpenAI API response status: {resp.status_code}")
 
         if resp.status_code != 200:
