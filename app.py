@@ -28,6 +28,7 @@ from urllib3.util.retry import Retry
 from yt_dlp import YoutubeDL
 import functools
 from youtube_comment_downloader import YoutubeCommentDownloader
+from flask import send_from_directory
 
 # --- Configuration ---
 APP_NAME = "WorthItService"
@@ -678,6 +679,12 @@ def get_openai_response(response_id):
     except Exception as e:
         logger.error("Error fetching OpenAI response: %s", str(e))
         return jsonify({'error': 'OpenAI service unavailable'}), 503
+
+@app.route("/privacy")
+def privacy(): return send_from_directory("static", "privacy.html")
+
+@app.route("/terms")
+def terms(): return send_from_directory("static", "terms.html")
 
 
 # --- Cleanup on Exit ---
