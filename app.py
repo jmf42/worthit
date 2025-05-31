@@ -36,6 +36,8 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", str(min(8, (os.cpu_count() or 1) * 2)
 COMMENT_LIMIT = int(os.getenv("COMMENT_LIMIT", "50"))
 TRANSCRIPT_CACHE_SIZE = int(os.getenv("TRANSCRIPT_CACHE_SIZE", "200"))
 TRANSCRIPT_CACHE_TTL = int(os.getenv("TRANSCRIPT_CACHE_TTL", "7200")) # 2 hours
+TRANSCRIPT_HTTP_TIMEOUT = int(os.getenv("TRANSCRIPT_HTTP_TIMEOUT", "5"))   # seconds per HTTP call
+MAX_TRANSCRIPT_ATTEMPTS = int(os.getenv("MAX_TRANSCRIPT_ATTEMPTS", "2"))   # max attempts
 COMMENT_CACHE_SIZE = int(os.getenv("COMMENT_CACHE_SIZE", "150"))
 COMMENT_CACHE_TTL = int(os.getenv("COMMENT_CACHE_TTL", "7200")) # 2 hours
 PERSISTENT_CACHE_DIR = os.path.join(os.getcwd(), "persistent_cache")
@@ -246,16 +248,17 @@ FALLBACK_LANGUAGES = ['en', 'es', 'fr', 'de', 'pt', 'ru', 'it', 'nl', 'hi', 'ja'
 
 def _fetch_transcript_api(video_id: str, languages: list[str]) -> str | None:
     """Fetch transcript through Smartproxy, rotating proxies on CAPTCHA/SSL errors."""
-    max_attempts = min(3, max(1, len(PROXY_ROTATION)))
     last_exc = None
 
-    for attempt in range(max_attempts):
+    for attempt in range(MAX_TRANSCRIPT_ATTEMPTS):
         proxy_cfg = rnd_proxy() if PROXY_ROTATION and PROXY_ROTATION[0] else None
         try:
             logger.debug("[transcript] attempt %d for %s via %s",
                          attempt+1, video_id,
                          proxy_cfg.get("https") if proxy_cfg else "direct")
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, proxies=proxy_cfg)
+            transcript_list = YouTubeTranscriptApi.list_transcripts(
+                video_id, proxies=proxy_cfg, timeout=TRANSCRIPT_HTTP_TIMEOUT
+            )
 
             for finder in (transcript_list.find_transcript, transcript_list.find_generated_transcript):
                 try:
@@ -297,6 +300,7 @@ def _is_captcha_response(text: str) -> bool:
 
 def _fetch_transcript_resilient(video_id: str) -> str:
     logger.info("Initiating resilient transcript fetch for %s", video_id)
+    logger.info("Transcript timeout: %ds, max attempts: %d", TRANSCRIPT_HTTP_TIMEOUT, MAX_TRANSCRIPT_ATTEMPTS)
     
     # Priority 1: English (official then generated)
     transcript = _fetch_transcript_api(video_id, ["en"])
