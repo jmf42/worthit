@@ -516,30 +516,36 @@ def get_transcript_endpoint():
     if not video_id:
         return jsonify({"error": "Invalid videoId format or URL"}), 400
 
-    # 1. cached?
-    if video_id in transcript_cache:
-        return jsonify({"video_id": video_id,
-                        "text": transcript_cache[video_id]}), 200
+    # Check RAM cache
+    cached = transcript_cache.get(video_id)
+    if cached:
+        return jsonify({"video_id": video_id, "text": cached}), 200
 
-    # 2. pending?
-    future = _pending_futures.get(video_id)
-    if future and not future.done():
-        return jsonify({"video_id": video_id,
-                        "status": "pending",
-                        "retry_after": 3}), 202
+    # Try persistent cache
+    with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
+        cached = db.get(video_id)
+        if cached:
+            transcript_cache[video_id] = cached
+            return jsonify({"video_id": video_id, "text": cached}), 200
 
-    # 3. throttle
-    if len(_pending_futures) >= MAX_WORKERS * 2:
-        return jsonify({"error": "Server busy, try again later"}), 429
-
-    # 4. spawn worker & respond 202
-    _pending_futures[video_id] = executor.submit(_background_transcript_worker, video_id)
-    return jsonify({"video_id": video_id,
-                    "status": "pending",
-                    "retry_after": 3}), 202
+    # Try fetch (max 7s)
+    try:
+        text = _fetch_transcript_resilient(video_id)
+        transcript_cache[video_id] = text
+        with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
+            db[video_id] = text
+        return jsonify({"video_id": video_id, "text": text}), 200
+    except NoTranscriptFound:
+        transcript_cache[video_id] = "__NOT_AVAILABLE__"
+        with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
+            db[video_id] = "__NOT_AVAILABLE__"
+        return jsonify({"error": "Transcript not available"}), 404
+    except Exception as e:
+        logger.error(f"Transcript fetch failed for {video_id}: {e}")
+        return jsonify({"error": "Transcript fetch failed"}), 500
 
 @app.route("/comments", methods=["GET"])
-@limiter.limit("120/hour;20/minute") # Limits for comments endpoint
+@limiter.limit("120/hour;20/minute")  # Limits for comments endpoint
 def get_comments_endpoint():
     video_url_or_id = request.args.get("videoId", "")
     if not video_url_or_id:
@@ -549,24 +555,25 @@ def get_comments_endpoint():
     if not video_id:
         return jsonify({"error": "Invalid videoId format or URL"}), 400
 
-    if video_id in comment_cache:
-        return jsonify({"video_id": video_id,
-                        "comments": comment_cache[video_id]}), 200
+    cached = comment_cache.get(video_id)
+    if cached:
+        return jsonify({"video_id": video_id, "comments": cached}), 200
 
-    key = f"comments_{video_id}"
-    future = _pending_futures.get(key)
-    if future and not future.done():
-        return jsonify({"video_id": video_id,
-                        "status": "pending",
-                        "retry_after": 3}), 202
+    with shelve.open(PERSISTENT_COMMENT_DB) as db:
+        cached = db.get(video_id)
+        if cached:
+            comment_cache[video_id] = cached
+            return jsonify({"video_id": video_id, "comments": cached}), 200
 
-    if len(_pending_futures) >= MAX_WORKERS * 2:
-        return jsonify({"error": "Server busy, try again later"}), 429
-
-    _pending_futures[key] = executor.submit(_background_comment_worker, video_id)
-    return jsonify({"video_id": video_id,
-                    "status": "pending",
-                    "retry_after": 3}), 202
+    try:
+        comments = _fetch_comments_resilient(video_id)
+        comment_cache[video_id] = comments
+        with shelve.open(PERSISTENT_COMMENT_DB) as db:
+            db[video_id] = comments
+        return jsonify({"video_id": video_id, "comments": comments}), 200
+    except Exception as e:
+        logger.error(f"Comment fetch failed for {video_id}: {e}")
+        return jsonify({"error": "Comment fetch failed"}), 500
 
 @app.route("/openai/responses", methods=["POST"])
 @limiter.limit("200/hour;50/minute") # Limits for OpenAI proxy
