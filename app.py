@@ -513,7 +513,7 @@ def _background_comment_worker(video_id: str):
 
 
 @app.route("/transcript", methods=["GET"])
-@limiter.limit("120/hour;20/minute")  # Limits for transcript endpoint
+@limiter.limit("1000/hour;200/minute")  # Increased limits for transcript endpoint
 def get_transcript_endpoint():
     video_url_or_id = request.args.get("videoId", "")
     if not video_url_or_id:
@@ -522,6 +522,20 @@ def get_transcript_endpoint():
     video_id = extract_video_id(video_url_or_id)
     if not video_id:
         return jsonify({"error": "Invalid videoId format or URL"}), 400
+
+    # Check if transcript is generated and available
+    try:
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB'])
+        if not transcript.is_transcript_generated:
+            return jsonify({"error": "Captions are unavailable or restricted for this video."}), 403
+    except NoTranscriptFound:
+        return jsonify({"error": "Transcript not available"}), 404
+    except TranscriptsDisabled:
+        return jsonify({"error": "Transcripts are disabled for this video."}), 403
+    except Exception as e:
+        logger.error(f"Transcript check failed for {video_id}: {e}")
+        return jsonify({"error": "Transcript check failed"}), 500
 
     # Check RAM cache
     cached = transcript_cache.get(video_id)
