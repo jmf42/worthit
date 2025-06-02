@@ -527,8 +527,6 @@ def get_transcript_endpoint():
     try:
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB'])
-        if not transcript.is_transcript_generated:
-            return jsonify({"error": "Captions are unavailable or restricted for this video."}), 403
     except NoTranscriptFound:
         return jsonify({"error": "Transcript not available"}), 404
     except TranscriptsDisabled:
