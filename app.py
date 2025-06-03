@@ -523,21 +523,9 @@ def get_transcript_endpoint():
     if not video_id:
         return jsonify({"error": "Invalid videoId format or URL"}), 400
 
-    # Check if transcript is generated and available
-    try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB'])
-        # The following check is intentionally removed to allow more permissive access to transcripts:
-        # if not transcript.is_transcript_generated:
-        #     return jsonify({"error": "Captions are unavailable or restricted for this video."}), 403
-    except NoTranscriptFound:
-        return jsonify({"error": "Transcript not available"}), 404
-    except TranscriptsDisabled:
-        return jsonify({"error": "Transcripts are disabled for this video."}), 403
-    except Exception as e:
-        logger.error(f"Transcript check failed for {video_id}: {e}")
-        return jsonify({"error": "Transcript check failed"}), 500
+    
 
+    
     # Check RAM cache
     cached = transcript_cache.get(video_id)
     if cached is not None:
