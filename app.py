@@ -54,8 +54,8 @@ YTDL_COOKIE_FILE = os.getenv("YTDL_COOKIE_FILE")
 # Smartproxy (Optional - if credentials are set)
 SMARTPROXY_USER = os.getenv("SMARTPROXY_USER")
 SMARTPROXY_PASS = os.getenv("SMARTPROXY_PASS")
-SMARTPROXY_HOST = "gate.decodo.com" # Example host
-SMARTPROXY_PORTS = ["10000", "10001", "10002", "10003", "10004"] # Example ports
+SMARTPROXY_HOST = os.getenv("SMARTPROXY_HOST")
+SMARTPROXY_PORTS = os.getenv("SMARTPROXY_PORTS", "").split(",")
 
 PROXY_ROTATION = []
 if SMARTPROXY_USER and SMARTPROXY_PASS:
@@ -525,7 +525,7 @@ def get_transcript_endpoint():
 
     
 
-    
+
     # Check RAM cache
     cached = transcript_cache.get(video_id)
     if cached is not None:
