@@ -17,3 +17,4 @@ vaderSentiment==3.3.2
 youtube-comment-downloader==0.1.76 
 sqlitedict>=2.1
 yt-dlp==2025.04.30
+pytest==8.3.5
