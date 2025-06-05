@@ -100,9 +100,6 @@ else:
 _proxy_cycle = itertools.cycle(PROXY_ROTATION)
 
 
-def get_random_user_agent_header():
-    """Returns a dictionary with a randomly chosen User-Agent header."""
-    return {"User-Agent": random.choice(USER_AGENTS)}
 
 # --- Logging Setup ---
 def setup_logging():
@@ -150,6 +147,11 @@ session.mount("http://", HTTPAdapter(max_retries=retry_cfg))
 
 def rnd_proxy() -> dict:
     return next(_proxy_cycle)
+
+def get_random_user_agent_header():
+    """Returns a dictionary with a randomly chosen User-Agent header."""
+    return {"User-Agent": random.choice(USER_AGENTS)}
+
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
