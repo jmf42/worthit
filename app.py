@@ -5,6 +5,8 @@ import json
 import logging
 import time
 import itertools
+import random
+import urllib.parse
 from functools import lru_cache
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future
@@ -45,6 +47,24 @@ PERSISTENT_CACHE_DIR = os.path.join(os.getcwd(), "persistent_cache")
 PERSISTENT_TRANSCRIPT_DB = os.path.join(PERSISTENT_CACHE_DIR, "transcript_cache.db")
 PERSISTENT_COMMENT_DB = os.path.join(PERSISTENT_CACHE_DIR, "comment_cache.db")
 
+# --- User-Agent Rotation ---
+# A list of realistic, modern browser User-Agents to avoid being flagged as a bot.
+USER_AGENTS = [
+    # Chrome on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    # Chrome on macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    # Firefox on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    # Firefox on macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:126.0) Gecko/20100101 Firefox/126.0",
+    # Safari on macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    # Edge on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+]
+
 # Ensure cache directory exists
 os.makedirs(PERSISTENT_CACHE_DIR, exist_ok=True)
 
@@ -64,6 +84,10 @@ else:
     PROXY_ROTATION = [{}] # No proxy
 
 _proxy_cycle = itertools.cycle(PROXY_ROTATION)
+
+def get_random_user_agent_header():
+    """Returns a dictionary with a randomly chosen User-Agent header."""
+    return {"User-Agent": random.choice(USER_AGENTS)}
 
 # --- Logging Setup ---
 def setup_logging():
@@ -223,6 +247,7 @@ def yt_dlp_extract_info(video_id: str, extract_comments: bool = False, use_proxy
     if use_proxy and PROXY_ROTATION and PROXY_ROTATION[0]:
         proxy_dict = rnd_proxy()
         proxy_url = proxy_dict.get("https")
+        opts['http_headers'] = get_random_user_agent_header()
         if proxy_url:
             opts["proxy"] = proxy_url
             logger.debug("yt-dlp: using proxy %s for %s", proxy_url, video_id)
@@ -257,8 +282,9 @@ def _fetch_transcript_api(video_id: str, languages: list[str]) -> str | None:
             logger.debug("[transcript] attempt %d for %s via %s",
                          attempt+1, video_id,
                          proxy_cfg.get("https") if proxy_cfg else "direct")
+            headers = get_random_user_agent_header()
             transcript_list = YouTubeTranscriptApi.list_transcripts(
-                video_id, proxies=proxy_cfg
+                video_id, proxies=proxy_cfg, headers=headers
             )
 
             for finder in (transcript_list.find_transcript, transcript_list.find_generated_transcript):
@@ -377,22 +403,39 @@ def _fetch_comments_downloader(video_id: str, use_proxy: bool = False) -> list[s
         logger.error("youtube-comment-downloader failed for %s: %s", video_id, str(e), exc_info=LOG_LEVEL=="DEBUG")
         return []
 
-def _fetch_comments_yt_dlp(video_id: str, use_proxy: bool = False) -> list[str] | None:
-    if not YTDL_COOKIE_FILE:
-        # Since 2024‑05 yt-dlp can pull the first batch of public comments without authentication
-        logger.debug("yt-dlp comments: proceeding without cookies (public endpoints only).")
-    logger.debug("Attempting comments via yt-dlp for %s", video_id)
-    info = yt_dlp_extract_info(video_id, extract_comments=True, use_proxy=use_proxy)
-    if info and info.get("comment_count", 1) == 0:
-        logger.info("Comments disabled for %s – skipping proxy tiers", video_id)
-        return []
-    if info and "comments" in info and info["comments"]:
-        comments_text = [c["text"] for c in info["comments"] if c.get("text")]
-        if comments_text:
-            logger.info("Fetched %d comments via yt-dlp for %s", len(comments_text), video_id)
-            return comments_text[:COMMENT_LIMIT]
-    logger.warning("No comments found via yt-dlp for %s", video_id)
-    return None
+def yt_dlp_extract_info(video_id: str, extract_comments: bool = False, use_proxy: bool = False) -> dict | None:
+    opts = _YDL_OPTS_BASE.copy()
+    
+    # --- CORRECTED LOGIC ---
+    # Always add a random User-Agent to every yt-dlp request
+    opts['http_headers'] = get_random_user_agent_header()
+    
+    # Apply proxy only if requested and configured
+    if use_proxy and PROXY_ROTATION and PROXY_ROTATION[0]:
+        proxy_dict = rnd_proxy()
+        proxy_url = proxy_dict.get("https")
+        if proxy_url:
+            opts["proxy"] = proxy_url
+            logger.debug("yt-dlp: using proxy %s for %s", proxy_url, video_id)
+    # --- END OF CORRECTION ---
+    
+    if extract_comments:
+        opts["getcomments"] = True
+        opts["max_comments"] = COMMENT_LIMIT
+    
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    logger.debug("yt-dlp: Extracting info for %s (comments: %s)", video_id, extract_comments)
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            if info:
+                logger.info("yt-dlp: Successfully extracted info for %s", video_id)
+                return info
+            logger.warning("yt-dlp: No info returned for %s", video_id)
+            return None
+    except Exception as e:
+        logger.error("yt-dlp: Failed to extract info for %s: %s", video_id, str(e), exc_info=LOG_LEVEL == "DEBUG")
+        return None
 
 # --- Comment Fetching Logic (improved racer) ---
 
