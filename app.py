@@ -71,19 +71,34 @@ os.makedirs(PERSISTENT_CACHE_DIR, exist_ok=True)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 YTDL_COOKIE_FILE = os.getenv("YTDL_COOKIE_FILE")
 
-# Smartproxy (Optional - if credentials are set)
+# High-quality Residential Proxy Configuration
 SMARTPROXY_USER = os.getenv("SMARTPROXY_USER")
 SMARTPROXY_PASS = os.getenv("SMARTPROXY_PASS")
 SMARTPROXY_HOST = os.getenv("SMARTPROXY_HOST")
-SMARTPROXY_PORTS = os.getenv("SMARTPROXY_PORTS", "").split(",")
+SMARTPROXY_PORTS_STR = os.getenv("SMARTPROXY_PORTS")
 
 PROXY_ROTATION = []
-if SMARTPROXY_USER and SMARTPROXY_PASS:
-    PROXY_ROTATION = [{"https": f"http://{SMARTPROXY_USER}:{SMARTPROXY_PASS}@{SMARTPROXY_HOST}:{port}"} for port in SMARTPROXY_PORTS]
-else:
-    PROXY_ROTATION = [{}] # No proxy
+# Check if all parts of the proxy config are present in the environment
+if SMARTPROXY_USER and SMARTPROXY_PASS and SMARTPROXY_HOST and SMARTPROXY_PORTS_STR:
+    SMARTPROXY_PORTS = SMARTPROXY_PORTS_STR.split(",")
 
+    # URL-encode the password to handle special characters like '~' safely
+    encoded_pass = urllib.parse.quote_plus(SMARTPROXY_PASS)
+
+    # Build the list of proxy URLs using the SMARTPROXY variables
+    PROXY_ROTATION = [
+        {"https": f"http://{SMARTPROXY_USER}:{encoded_pass}@{SMARTPROXY_HOST}:{port}"}
+        for port in SMARTPROXY_PORTS
+    ]
+    logger.info(f"Proxy rotation configured with {len(PROXY_ROTATION)} residential endpoints.")
+else:
+    # Fallback to no proxy if credentials are not fully configured
+    PROXY_ROTATION = [{}]
+    logger.warning("Proxy credentials not fully configured. Running without proxies.")
+
+# Create the iterator for the rest of the app to use
 _proxy_cycle = itertools.cycle(PROXY_ROTATION)
+
 
 def get_random_user_agent_header():
     """Returns a dictionary with a randomly chosen User-Agent header."""
