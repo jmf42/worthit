@@ -303,7 +303,7 @@ def _fetch_transcript_api(video_id: str, languages: list[str]) -> str | None:
                          proxy_cfg.get("https") if proxy_cfg else "direct")
             headers = get_random_user_agent_header()
             transcript_list = YouTubeTranscriptApi.list_transcripts(
-                video_id, proxies=proxy_cfg, headers=headers
+                video_id, proxies=proxy_cfg
             )
 
             for finder in (transcript_list.find_transcript, transcript_list.find_generated_transcript):
