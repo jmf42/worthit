@@ -343,8 +343,11 @@ def _fetch_transcript_resilient(video_id: str) -> str:
                 logger.info("Transcript fetched for %s via %s",
                             video_id, "proxy" if proxy_cfg else "direct")
                 return txt
-        except (TranscriptsDisabled, CouldNotRetrieveTranscript, NoTranscriptFound):
-            raise
+        except (TranscriptsDisabled, CouldNotRetrieveTranscript, NoTranscriptFound) as e:
+            logger.debug("Transcript not found via %s for %s: %s",
+                         "proxy" if proxy_cfg else "direct", video_id, e)
+            # Continue to next proxy or direct fallback
+            continue
         except Exception as e:
             logger.debug("Proxy attempt failed for %s: %s", video_id, e)
 
