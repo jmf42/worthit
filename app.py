@@ -292,7 +292,11 @@ def yt_dlp_extract_info(video_id: str, extract_comments: bool = False, use_proxy
         return None
 
 # --- Transcript Fetching Logic ---
-FALLBACK_LANGUAGES = ['en', 'es', 'fr', 'de', 'pt', 'ru', 'it', 'nl', 'hi', 'ja', 'ko', 'ar', 'zh-Hans']
+FALLBACK_LANGUAGES = [
+    'en', 'en-US', 'en-GB', 'en-CA', 'en-AU',  # English variants
+    'es', 'fr', 'de', 'pt', 'ru', 'it', 'nl',
+    'hi', 'ja', 'ko', 'ar', 'zh', 'zh-Hans', 'zh-Hant'
+]
 
 def _fetch_transcript_api(video_id: str,
                           languages: list[str],
@@ -319,6 +323,7 @@ def _fetch_transcript_api(video_id: str,
             continue
     return None
 # --- Helper for CAPTCHA detection ---
+# --- Helper for CAPTCHA detection ---
 def _is_captcha_response(text: str) -> bool:
     if not text:
         return False
@@ -327,6 +332,42 @@ def _is_captcha_response(text: str) -> bool:
         "captcha", "recaptcha", "i am not a robot",
         "confirm you’re not a robot", "why did this happen"
     ))
+
+# --- yt-dlp subtitle fallback ---
+def _fetch_transcript_yt_dlp(video_id: str) -> str | None:
+    """
+    Last‑chance subtitle grab using yt‑dlp --write-auto-sub.
+    Returns plain text or None.
+    """
+    tmp_dir = "/tmp"
+    opts = _YDL_OPTS_BASE.copy()
+    opts.update({
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": ["en,*,auto"],
+        "outtmpl": os.path.join(tmp_dir, "%(id)s"),
+        "quiet": True,
+        "skip_download": True,
+        "max_downloads": 1,
+        "nooverwrites": True,
+    })
+    try:
+        with YoutubeDL(opts) as ydl:
+            result = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            subs = result.get("subtitles") or result.get("automatic_captions")
+            if not subs:
+                return None
+            # Pick first English‑ish track
+            for lang_code in ("en", "en-US", "en-GB"):
+                track_list = subs.get(lang_code)
+                if track_list:
+                    url = track_list[0]["url"]
+                    resp = session.get(url, timeout=5)
+                    resp.raise_for_status()
+                    return resp.text
+    except Exception as e:
+        logger.debug("yt‑dlp subtitle fallback failed for %s: %s", video_id, e)
+    return None
 
 def _fetch_transcript_resilient(video_id: str) -> str:
     """
@@ -359,6 +400,14 @@ def _fetch_transcript_resilient(video_id: str) -> str:
                 return txt
         except Exception as e:
             logger.debug("Direct fallback failed for %s: %s", video_id, e)
+
+    # Ultimate fallback: yt‑dlp auto subs
+    try:
+        if text := _fetch_transcript_yt_dlp(video_id):
+            logger.info("Transcript fetched for %s via yt‑dlp auto‑subs fallback", video_id)
+            return text
+    except Exception:
+        pass
 
     logger.error("All transcript sources failed for video %s", video_id)
     raise NoTranscriptFound(video_id, [], None)
