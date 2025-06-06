@@ -414,8 +414,9 @@ def _fetch_transcript_yt_dlp(video_id: str) -> str | None:
         opts.update({
             "writesubtitles": True,
             "writeautomaticsub": True,
-            "subtitleslangs": ["en", "en-US", "en-GB", "*"],
-            "subtitlesformat": "vtt/srt",
+            # “*” alone is invalid. Use regex wildcards accepted by yt‑dlp:
+            "subtitleslangs": ["en", "en-.*", ".*"],
+            "subtitlesformat": "best",   # yt‑dlp picks vtt → srt when convert_subs is set
             "convert_subs": "srt",
             "outtmpl": outtmpl,
             "quiet": True,
