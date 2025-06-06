@@ -41,7 +41,7 @@ TRANSCRIPT_CACHE_SIZE = int(os.getenv("TRANSCRIPT_CACHE_SIZE", "200"))
 TRANSCRIPT_CACHE_TTL = int(os.getenv("TRANSCRIPT_CACHE_TTL", "7200")) # 2 hours
 #
 # Transcript tuning
-TRANSCRIPT_HTTP_TIMEOUT   = int(os.getenv("TRANSCRIPT_HTTP_TIMEOUT", "7"))
+TRANSCRIPT_HTTP_TIMEOUT   = int(os.getenv("TRANSCRIPT_HTTP_TIMEOUT", "15"))
 TRANSCRIPT_PROXY_ATTEMPTS = int(os.getenv("TRANSCRIPT_PROXY_ATTEMPTS", "3"))
 TRANSCRIPT_DIRECT_ATTEMPT = os.getenv("TRANSCRIPT_DIRECT_ATTEMPT", "true").lower() != "false"
 COMMENT_CACHE_SIZE = int(os.getenv("COMMENT_CACHE_SIZE", "150"))
@@ -189,7 +189,45 @@ _pending_futures: dict[str, Future] = {}
 logger.info(f"App initialized. Max workers: {MAX_WORKERS}. Comment limit: {COMMENT_LIMIT}")
 logger.info(f"Transcript Cache: size={TRANSCRIPT_CACHE_SIZE}, ttl={TRANSCRIPT_CACHE_TTL}s")
 logger.info(f"Comment Cache: size={COMMENT_CACHE_SIZE}, ttl={COMMENT_CACHE_TTL}s")
-logger.info("Global timeouts → external requests: 7 s, worker hard-timeout: 7 s; UX budget ≤ 20 s")
+logger.info("Global timeouts → external requests: 15 s, worker hard-timeout: 15 s; UX budget ≤ 25 s")
+# --- Fast playerResponse fallback for captions ---
+def _fetch_transcript_player(video_id: str) -> str | None:
+    """
+    Fetch captions by parsing YouTube playerResponse JSON.
+    Often succeeds when list_transcripts fails (auto‑CC present).
+    """
+    url = f"https://www.youtube.com/watch?v={video_id}&pbj=1"
+    headers = get_random_user_agent_header()
+    proxy_cfg = rnd_proxy() if PROXY_ROTATION and PROXY_ROTATION[0] else {}
+    try:
+        r = session.get(url, headers=headers, proxies=proxy_cfg, timeout=10)
+        r.raise_for_status()
+        if '"captionTracks"' not in r.text:
+            return None
+        # Try to parse the correct playerResponse JSON structure
+        try:
+            js = r.json()
+            if isinstance(js, list) and len(js) > 2 and "playerResponse" in js[2]:
+                data = js[2]['playerResponse']
+            elif isinstance(js, list) and js and "player_response" in js[0]:
+                data = js[0]['player_response']
+            else:
+                return None
+        except Exception:
+            return None
+        tracks = (data.get("captions", {})
+                       .get("playerCaptionsTracklistRenderer", {})
+                       .get("captionTracks", []))
+        if not tracks:
+            return None
+        vtt_url = tracks[0].get("baseUrl") + "&fmt=vtt"
+        vtt = session.get(vtt_url, headers=headers, proxies=proxy_cfg, timeout=10).text
+        lines = [re.sub(r"<[^>]+>", "", ln).strip() for ln in vtt.splitlines()
+                 if ln and "-->" not in ln and not ln.startswith("WEBVTT")]
+        return " ".join(lines).strip() or None
+    except Exception as e:
+        logger.debug("playerResponse fallback failed for %s: %s", video_id, e)
+        return None
 
 # --- Video ID Validation & Extraction ---
 VIDEO_ID_REGEX = re.compile(r'^[\w-]{11}$')
@@ -296,7 +334,7 @@ def yt_dlp_extract_info(video_id: str, extract_comments: bool = False, use_proxy
 
 # --- Transcript Fetching Logic ---
 FALLBACK_LANGUAGES = [
-    'en', 'en-US', 'en-GB', 'en-CA', 'en-AU',  # English variants
+    'en', 'en-US', 'en-GB', 'en-CA', 'en-AU',
     'es', 'fr', 'de', 'pt', 'ru', 'it', 'nl',
     'hi', 'ja', 'ko', 'ar', 'zh', 'zh-Hans', 'zh-Hant'
 ]
@@ -340,38 +378,57 @@ def _is_captcha_response(text: str) -> bool:
 # --- yt-dlp subtitle fallback ---
 def _fetch_transcript_yt_dlp(video_id: str) -> str | None:
     """
-    Last‑chance subtitle grab using yt‑dlp --write-auto-sub.
+    Last‑chance subtitle grab using yt‑dlp auto‑subs (VTT) and convert to plain text.
     Returns plain text or None.
     """
-    tmp_dir = "/tmp"
-    opts = _YDL_OPTS_BASE.copy()
-    opts.update({
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": ["en,*,auto"],
-        "outtmpl": os.path.join(tmp_dir, "%(id)s"),
-        "quiet": True,
-        "skip_download": True,
-        "max_downloads": 1,
-        "nooverwrites": True,
-    })
-    try:
-        with YoutubeDL(opts) as ydl:
-            result = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-            subs = result.get("subtitles") or result.get("automatic_captions")
-            if not subs:
+    import tempfile, pathlib, html
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        outtmpl = str(pathlib.Path(tmp_dir) / "%(id)s.%(ext)s")
+
+        opts = _YDL_OPTS_BASE.copy()
+        opts.update({
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": ["en", "en-US", "en-GB", "*"],
+            "subtitlesformat": "vtt",
+            "outtmpl": outtmpl,
+            "quiet": True,
+            "skip_download": True,
+            "nooverwrites": True,
+            "max_downloads": 1,
+            "http_headers": get_random_user_agent_header(),
+        })
+
+        # Proxy for yt-dlp itself
+        if PROXY_ROTATION and PROXY_ROTATION[0]:
+            proxy_url = rnd_proxy().get("https")
+            if proxy_url:
+                opts["proxy"] = proxy_url
+
+        try:
+            with YoutubeDL(opts) as ydl:
+                ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
+
+            vtt_files = list(pathlib.Path(tmp_dir).glob(f"{video_id}*.vtt"))
+            if not vtt_files:
                 return None
-            # Pick first English‑ish track
-            for lang_code in ("en", "en-US", "en-GB"):
-                track_list = subs.get(lang_code)
-                if track_list:
-                    url = track_list[0]["url"]
-                    resp = session.get(url, timeout=5)
-                    resp.raise_for_status()
-                    return resp.text
-    except Exception as e:
-        logger.debug("yt‑dlp subtitle fallback failed for %s: %s", video_id, e)
-    return None
+            vtt_text = vtt_files[0].read_text(encoding="utf-8", errors="ignore")
+        except Exception as e:
+            logger.debug("yt‑dlp subtitle fallback failed for %s: %s", video_id, e)
+            return None
+
+    # Strip WEBVTT header and timestamps
+    lines: list[str] = []
+    for line in vtt_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("WEBVTT", "X-TIMESTAMP-MAP")):
+            continue
+        if "-->" in line:
+            continue
+        lines.append(html.unescape(line))
+    plain = " ".join(lines).strip()
+    return plain or None
 
 def _fetch_transcript_resilient(video_id: str) -> str:
     """
@@ -403,7 +460,15 @@ def _fetch_transcript_resilient(video_id: str) -> str:
                 logger.info("Transcript fetched for %s via direct fallback", video_id)
                 return txt
         except Exception as e:
-            logger.debug("Direct fallback failed for %s: %s", video_id, e)
+            logger.debug("Direct fallback failed for %s: %s", video_id, e, exc_info=LOG_LEVEL=="DEBUG")
+
+    # Player‑response JSON fallback (fast)
+    try:
+        if text := _fetch_transcript_player(video_id):
+            logger.info("Transcript fetched for %s via playerResponse fallback", video_id)
+            return text
+    except Exception:
+        pass
 
     # Ultimate fallback: yt‑dlp auto subs
     try:
