@@ -307,6 +307,7 @@ def _fetch_transcript_api(video_id: str,
         video_id,
         proxies=proxy_cfg,
         timeout=timeout,
+        http_headers=headers,
     )
     for finder in (transcript_list.find_transcript, transcript_list.find_generated_transcript):
         try:
