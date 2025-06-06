@@ -220,11 +220,35 @@ def _fetch_transcript_player(video_id: str) -> str | None:
                        .get("captionTracks", []))
         if not tracks:
             return None
-        vtt_url = tracks[0].get("baseUrl") + "&fmt=vtt"
-        vtt = session.get(vtt_url, headers=headers, proxies=proxy_cfg, timeout=10).text
-        lines = [re.sub(r"<[^>]+>", "", ln).strip() for ln in vtt.splitlines()
-                 if ln and "-->" not in ln and not ln.startswith("WEBVTT")]
-        return " ".join(lines).strip() or None
+        # Try VTT first, then SRV3 (XML) if VTT is empty
+        import html
+        base_url = tracks[0].get("baseUrl")
+        text_payload = ""
+
+        # 1️⃣ attempt VTT
+        vtt_url = base_url + ("&fmt=vtt" if "fmt=" not in base_url else re.sub(r"fmt=\w+", "fmt=vtt", base_url))
+        vtt_resp = session.get(vtt_url, headers=headers, proxies=proxy_cfg, timeout=10).text
+        if vtt_resp.strip() and "-->" in vtt_resp:
+            text_payload = vtt_resp
+        else:
+            # 2️⃣ attempt SRV3 XML
+            srv3_url = base_url + ("&fmt=srv3" if "fmt=" not in base_url else re.sub(r"fmt=\w+", "fmt=srv3", base_url))
+            srv3_resp = session.get(srv3_url, headers=headers, proxies=proxy_cfg, timeout=10).text
+            if "<text" in srv3_resp:
+                text_payload = srv3_resp
+
+        if not text_payload:
+            return None
+
+        if text_payload.lstrip().startswith("WEBVTT"):
+            # Parse VTT
+            lines = [re.sub(r"<[^>]+>", "", ln).strip() for ln in text_payload.splitlines()
+                     if ln and "-->" not in ln and not ln.startswith("WEBVTT")]
+            return " ".join(lines).strip() or None
+        else:
+            # Parse SRV3 XML
+            texts = re.findall(r'>([^<]+)</text>', text_payload)
+            return " ".join(html.unescape(t).strip() for t in texts).strip() or None
     except Exception as e:
         logger.debug("playerResponse fallback failed for %s: %s", video_id, e)
         return None
@@ -391,7 +415,8 @@ def _fetch_transcript_yt_dlp(video_id: str) -> str | None:
             "writesubtitles": True,
             "writeautomaticsub": True,
             "subtitleslangs": ["en", "en-US", "en-GB", "*"],
-            "subtitlesformat": "vtt",
+            "subtitlesformat": "vtt/srt",
+            "convert_subs": "srt",
             "outtmpl": outtmpl,
             "quiet": True,
             "skip_download": True,
@@ -410,21 +435,27 @@ def _fetch_transcript_yt_dlp(video_id: str) -> str | None:
             with YoutubeDL(opts) as ydl:
                 ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
 
-            vtt_files = list(pathlib.Path(tmp_dir).glob(f"{video_id}*.vtt"))
-            if not vtt_files:
+            caption_files = (
+                list(pathlib.Path(tmp_dir).glob(f"{video_id}*.srt")) +
+                list(pathlib.Path(tmp_dir).glob(f"{video_id}*.vtt"))
+            )
+            if not caption_files:
                 return None
-            vtt_text = vtt_files[0].read_text(encoding="utf-8", errors="ignore")
+            cap_text = caption_files[0].read_text(encoding="utf-8", errors="ignore")
         except Exception as e:
             logger.debug("yt‑dlp subtitle fallback failed for %s: %s", video_id, e)
             return None
 
-    # Strip WEBVTT header and timestamps
+    # Strip WEBVTT/SRT header and timestamps
     lines: list[str] = []
-    for line in vtt_text.splitlines():
+    for line in cap_text.splitlines():
         line = line.strip()
         if not line or line.startswith(("WEBVTT", "X-TIMESTAMP-MAP")):
             continue
         if "-->" in line:
+            continue
+        # For SRT, skip numeric index lines
+        if line.isdigit():
             continue
         lines.append(html.unescape(line))
     plain = " ".join(lines).strip()
