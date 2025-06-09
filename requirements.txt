@@ -1,6 +1,6 @@
 Flask==3.1.0
 gunicorn==20.1.0
-youtube-transcript-api==1.1.0   # versión estable con objetos
+youtube-transcript-api==1.0.3   # versión estable con objetos
 Werkzeug==3.1.3
 requests==2.32.3
 urllib3==2.3.0
