@@ -409,13 +409,22 @@ def _fetch_transcript_api(video_id: str,
     response = None
     try:
         logger.info("[TRANSCRIPT] Paso 1: intentado obtener transcripts disponibles para video_id=%s, proxy=%s, timeout=%s", video_id, bool(proxy_cfg), timeout)
-        transcript_list = YouTubeTranscriptApi.list_transcripts(
-            video_id,
-            proxies=proxy_cfg,
-            timeout=timeout,
-            http_headers=headers,
-            cookies=YTDL_COOKIE_FILE if YTDL_COOKIE_FILE else None,
-        )
+        try:
+            transcript_list = YouTubeTranscriptApi.list_transcripts(
+                video_id,
+                proxies=proxy_cfg,
+                timeout=timeout,
+                http_headers=headers,
+                cookies=YTDL_COOKIE_FILE if YTDL_COOKIE_FILE else None,
+            )
+        except TypeError:
+            # For versions that don't support the timeout parameter
+            transcript_list = YouTubeTranscriptApi.list_transcripts(
+                video_id,
+                proxies=proxy_cfg,
+                http_headers=headers,
+                cookies=YTDL_COOKIE_FILE if YTDL_COOKIE_FILE else None,
+            )
         logger.info("[TRANSCRIPT] Paso 2: transcripts listados correctamente para video_id=%s", video_id)
     except Exception as e:
         logger.error("[TRANSCRIPT] Error al obtener lista de transcripts para video_id=%s: %s", video_id, e)
