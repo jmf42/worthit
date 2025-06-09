@@ -407,26 +407,37 @@ def _fetch_transcript_api(video_id: str,
     """
     headers = get_random_user_agent_header()
     response = None
-    # --- (Optional for debugging) Save raw HTML if LOG_LEVEL == DEBUG ---
-    # But only if called via requests, not YouTubeTranscriptApi. So we do it just before parsing, after getting response.
-    # However, YouTubeTranscriptApi does not expose the response directly.
-    # So, instead, after calling list_transcripts, we can try to access the raw response if possible.
-    transcript_list = YouTubeTranscriptApi.list_transcripts(
-        video_id,
-        proxies=proxy_cfg,
-        timeout=timeout,
-        http_headers=headers,
-        cookies=YTDL_COOKIE_FILE if YTDL_COOKIE_FILE else None,
-    )
-    # (Optional for debugging) Not possible here unless we patch YouTubeTranscriptApi, so we skip direct response logging.
+    try:
+        logger.info("[TRANSCRIPT] Paso 1: intentado obtener transcripts disponibles para video_id=%s, proxy=%s, timeout=%s", video_id, bool(proxy_cfg), timeout)
+        transcript_list = YouTubeTranscriptApi.list_transcripts(
+            video_id,
+            proxies=proxy_cfg,
+            timeout=timeout,
+            http_headers=headers,
+            cookies=YTDL_COOKIE_FILE if YTDL_COOKIE_FILE else None,
+        )
+        logger.info("[TRANSCRIPT] Paso 2: transcripts listados correctamente para video_id=%s", video_id)
+    except Exception as e:
+        logger.error("[TRANSCRIPT] Error al obtener lista de transcripts para video_id=%s: %s", video_id, e)
+        raise
     for finder in (transcript_list.find_transcript, transcript_list.find_generated_transcript):
         try:
+            logger.info("[TRANSCRIPT] Paso 3: intentando buscar transcript con finder=%s para video_id=%s", finder.__name__, video_id)
             tr = finder(languages)
+            logger.info("[TRANSCRIPT] Paso 4: transcript encontrado, intentando fetch() para video_id=%s", video_id)
             text = " ".join(seg["text"] for seg in tr.fetch()).strip()
             if text:
+                logger.info("[TRANSCRIPT] Paso 5: transcript obtenido con éxito para video_id=%s, longitud=%d", video_id, len(text))
                 return text
-        except NoTranscriptFound:
+            else:
+                logger.info("[TRANSCRIPT] Paso 5: transcript vacío para video_id=%s", video_id)
+        except NoTranscriptFound as nf:
+            logger.info("[TRANSCRIPT] NoTranscriptFound usando finder=%s para video_id=%s: %s", finder.__name__, video_id, nf)
             continue
+        except Exception as e:
+            logger.error("[TRANSCRIPT] Error inesperado en finder=%s para video_id=%s: %s", finder.__name__, video_id, e)
+            continue
+    logger.info("[TRANSCRIPT] Paso final: no se encontró transcript disponible para video_id=%s", video_id)
     return None
 # --- Helper for CAPTCHA detection ---
 # --- Helper for CAPTCHA detection ---
