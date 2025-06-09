@@ -50,6 +50,21 @@ PERSISTENT_CACHE_DIR = os.path.join(os.getcwd(), "persistent_cache")
 PERSISTENT_TRANSCRIPT_DB = os.path.join(PERSISTENT_CACHE_DIR, "transcript_cache.db")
 PERSISTENT_COMMENT_DB = os.path.join(PERSISTENT_CACHE_DIR, "comment_cache.db")
 
+# --- CONSENT cookie fallback (para vídeos con CC auto) ----------------------
+# Si el usuario no define YTDL_COOKIE_FILE, se generará un archivo con la
+# cookie de consentimiento universal para YouTube.
+CONSENT_COOKIE_STRING = (
+    "# Netscape HTTP Cookie File\n"
+    ".youtube.com\tTRUE\t/\tFALSE\t2145916800\tCONSENT\tYES+cb.20210328-17-p0.en+FX+888\n"
+)
+if not YTDL_COOKIE_FILE:
+    _consent_cookie_path = os.path.join(PERSISTENT_CACHE_DIR, "consent_cookies.txt")
+    if not os.path.isfile(_consent_cookie_path):
+        with open(_consent_cookie_path, "w", encoding="utf-8") as fh:
+            fh.write(CONSENT_COOKIE_STRING)
+        logger.info("Created default CONSENT cookie file at %s", _consent_cookie_path)
+    YTDL_COOKIE_FILE = _consent_cookie_path
+
 # --- User-Agent Rotation ---
 # A list of realistic, modern browser User-Agents to avoid being flagged as a bot.
 USER_AGENTS = [
@@ -324,7 +339,8 @@ _YDL_OPTS_BASE = {
     "quiet": True, "skip_download": True, "extract_flat": "discard_in_playlist",
     "no_warnings": True, "restrict_filenames": True, "nocheckcertificate": True,
     "ignoreerrors": True, "no_playlist": True, "writeinfojson": False,
-    "writesubtitles": False, "writeautomaticsub": False,
+    "writesubtitles": True, "writeautomaticsub": True,
+    "extractor_args": {"youtube": ["player_client=ios"]},
     **({"cookiefile": YTDL_COOKIE_FILE} if YTDL_COOKIE_FILE else {}),
 }
 
@@ -426,26 +442,35 @@ def _fetch_transcript_yt_dlp(video_id: str) -> str | None:
             "http_headers": get_random_user_agent_header(),
         })
 
-        # Proxy for yt-dlp itself
-        if PROXY_ROTATION and PROXY_ROTATION[0]:
-            proxy_url = rnd_proxy().get("https")
-            if proxy_url:
-                opts["proxy"] = proxy_url
-
-        try:
-            with YoutubeDL(opts) as ydl:
-                ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
-
-            caption_files = (
-                list(pathlib.Path(tmp_dir).glob(f"{video_id}*.srt")) +
-                list(pathlib.Path(tmp_dir).glob(f"{video_id}*.vtt"))
-            )
-            if not caption_files:
-                return None
-            cap_text = caption_files[0].read_text(encoding="utf-8", errors="ignore")
-        except Exception as e:
-            logger.debug("yt‑dlp subtitle fallback failed for %s: %s", video_id, e)
+        caption_files = []
+        for attempt in range(min(5, len(PROXY_ROTATION))):
+            proxy_dict = rnd_proxy() if PROXY_ROTATION and PROXY_ROTATION[0] else {}
+            opts_try = opts.copy()
+            if proxy_dict:
+                proxy_url = proxy_dict.get("https")
+                if proxy_url:
+                    opts_try["proxy"] = proxy_url
+            try:
+                with YoutubeDL(opts_try) as ydl:
+                    ydl.extract_info(
+                        f"https://www.youtube.com/watch?v={video_id}",
+                        download=True
+                    )
+                caption_files = (
+                    list(pathlib.Path(tmp_dir).glob(f"{video_id}*.srt")) +
+                    list(pathlib.Path(tmp_dir).glob(f"{video_id}*.vtt"))
+                )
+                if caption_files:
+                    break  # éxito
+            except Exception as e:
+                if "data blocks" in str(e) or "HTTP Error 4" in str(e):
+                    logger.debug("yt-dlp attempt %d failed for %s: %s", attempt+1, video_id, e)
+                    time.sleep(1.2)
+                    continue
+                raise
+        if not caption_files:
             return None
+        cap_text = caption_files[0].read_text(encoding="utf-8", errors="ignore")
 
     # Strip WEBVTT/SRT header and timestamps
     lines: list[str] = []
