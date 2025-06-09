@@ -11,6 +11,9 @@ from functools import lru_cache
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future
 
+# --- Proxy force env ---
+FORCE_PROXY = os.getenv("FORCE_PROXY", "false").lower() == "true"
+
 from flask import Flask, request, jsonify
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
@@ -403,6 +406,11 @@ def _fetch_transcript_api(video_id: str,
     Returns the transcript text or None.
     """
     headers = get_random_user_agent_header()
+    response = None
+    # --- (Optional for debugging) Save raw HTML if LOG_LEVEL == DEBUG ---
+    # But only if called via requests, not YouTubeTranscriptApi. So we do it just before parsing, after getting response.
+    # However, YouTubeTranscriptApi does not expose the response directly.
+    # So, instead, after calling list_transcripts, we can try to access the raw response if possible.
     transcript_list = YouTubeTranscriptApi.list_transcripts(
         video_id,
         proxies=proxy_cfg,
@@ -410,6 +418,7 @@ def _fetch_transcript_api(video_id: str,
         http_headers=headers,
         cookies=YTDL_COOKIE_FILE if YTDL_COOKIE_FILE else None,
     )
+    # (Optional for debugging) Not possible here unless we patch YouTubeTranscriptApi, so we skip direct response logging.
     for finder in (transcript_list.find_transcript, transcript_list.find_generated_transcript):
         try:
             tr = finder(languages)
@@ -512,7 +521,7 @@ def _fetch_transcript_resilient(video_id: str) -> str:
 
     # Proxy loop
     for _ in range(TRANSCRIPT_PROXY_ATTEMPTS):
-        proxy_cfg = rnd_proxy() if PROXY_ROTATION and PROXY_ROTATION[0] else None
+        proxy_cfg = rnd_proxy() if (FORCE_PROXY or (PROXY_ROTATION and PROXY_ROTATION[0])) else None
         try:
             if txt := _fetch_transcript_api(video_id, langs, proxy_cfg):
                 logger.info("Transcript fetched for %s via %s",
