@@ -442,7 +442,14 @@ def _fetch_transcript_api(video_id: str,
             logger.info("[TRANSCRIPT] Paso 3: intentando buscar transcript con finder=%s para video_id=%s", finder.__name__, video_id)
             tr = finder(languages)
             logger.info("[TRANSCRIPT] Paso 4: transcript encontrado, intentando fetch() para video_id=%s", video_id)
-            text = " ".join(seg["text"] for seg in tr.fetch()).strip()
+            try:
+                text = " ".join(
+                    seg.text if hasattr(seg, "text") else seg["text"]
+                    for seg in tr.fetch()
+                ).strip()
+            except Exception as e:
+                logger.error("[TRANSCRIPT] Error procesando segmentos para video_id=%s: %s", video_id, e)
+                continue
             if text:
                 logger.info("[TRANSCRIPT] Paso 5: transcript obtenido con éxito para video_id=%s, longitud=%d", video_id, len(text))
                 return text
