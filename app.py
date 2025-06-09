@@ -49,21 +49,9 @@ COMMENT_CACHE_TTL = int(os.getenv("COMMENT_CACHE_TTL", "7200")) # 2 hours
 PERSISTENT_CACHE_DIR = os.path.join(os.getcwd(), "persistent_cache")
 PERSISTENT_TRANSCRIPT_DB = os.path.join(PERSISTENT_CACHE_DIR, "transcript_cache.db")
 PERSISTENT_COMMENT_DB = os.path.join(PERSISTENT_CACHE_DIR, "comment_cache.db")
+# YTDL Cookie file configuration
+YTDL_COOKIE_FILE = ""
 
-# --- CONSENT cookie fallback (para vídeos con CC auto) ----------------------
-# Si el usuario no define YTDL_COOKIE_FILE, se generará un archivo con la
-# cookie de consentimiento universal para YouTube.
-CONSENT_COOKIE_STRING = (
-    "# Netscape HTTP Cookie File\n"
-    ".youtube.com\tTRUE\t/\tFALSE\t2145916800\tCONSENT\tYES+cb.20210328-17-p0.en+FX+888\n"
-)
-if not YTDL_COOKIE_FILE:
-    _consent_cookie_path = os.path.join(PERSISTENT_CACHE_DIR, "consent_cookies.txt")
-    if not os.path.isfile(_consent_cookie_path):
-        with open(_consent_cookie_path, "w", encoding="utf-8") as fh:
-            fh.write(CONSENT_COOKIE_STRING)
-        logger.info("Created default CONSENT cookie file at %s", _consent_cookie_path)
-    YTDL_COOKIE_FILE = _consent_cookie_path
 
 # --- User-Agent Rotation ---
 # A list of realistic, modern browser User-Agents to avoid being flagged as a bot.
