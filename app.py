@@ -50,7 +50,23 @@ PERSISTENT_CACHE_DIR = os.path.join(os.getcwd(), "persistent_cache")
 PERSISTENT_TRANSCRIPT_DB = os.path.join(PERSISTENT_CACHE_DIR, "transcript_cache.db")
 PERSISTENT_COMMENT_DB = os.path.join(PERSISTENT_CACHE_DIR, "comment_cache.db")
 # YTDL Cookie file configuration
-YTDL_COOKIE_FILE = ""
+YTDL_COOKIE_FILE = os.getenv("YTDL_COOKIE_FILE", "")
+
+# ------------------------------------------------------------------
+# Universal CONSENT cookie (avoids 204/empty captions from YouTube)
+if not YTDL_COOKIE_FILE:
+    CONSENT_COOKIE_STRING = (
+        "# Netscape HTTP Cookie File\n"
+        ".youtube.com\tTRUE\t/\tFALSE\t2145916800\tCONSENT\tYES+cb.20210328-17-p0.en+FX+888\n"
+    )
+    _consent_path = os.path.join(PERSISTENT_CACHE_DIR, "consent_cookies.txt")
+    os.makedirs(PERSISTENT_CACHE_DIR, exist_ok=True)
+    if not os.path.isfile(_consent_path):
+        with open(_consent_path, "w", encoding="utf-8") as fh:
+            fh.write(CONSENT_COOKIE_STRING)
+    YTDL_COOKIE_FILE = _consent_path
+    logger.info("Using default CONSENT cookie at %s", _consent_path)
+# ------------------------------------------------------------------
 
 
 # --- User-Agent Rotation ---
@@ -75,7 +91,6 @@ USER_AGENTS = [
 os.makedirs(PERSISTENT_CACHE_DIR, exist_ok=True)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-YTDL_COOKIE_FILE = os.getenv("YTDL_COOKIE_FILE")
 
 
 # --- Logging Setup ---
@@ -201,7 +216,7 @@ def _fetch_transcript_player(video_id: str) -> str | None:
     """
     url = f"https://www.youtube.com/watch?v={video_id}&pbj=1"
     headers = get_random_user_agent_header()
-    proxy_cfg = rnd_proxy() if PROXY_ROTATION and PROXY_ROTATION[0] else {}
+    proxy_cfg = {}  # first attempt direct
     try:
         r = session.get(url, headers=headers, proxies=proxy_cfg, timeout=10)
         r.raise_for_status()
@@ -254,6 +269,13 @@ def _fetch_transcript_player(video_id: str) -> str | None:
             return " ".join(html.unescape(t).strip() for t in texts).strip() or None
     except Exception as e:
         logger.debug("playerResponse fallback failed for %s: %s", video_id, e)
+        # second chance with proxy
+        if not proxy_cfg and PROXY_ROTATION and PROXY_ROTATION[0]:
+            try:
+                proxy_cfg = rnd_proxy()
+                return _fetch_transcript_player(video_id)  # recurse once with proxy
+            except Exception:
+                pass
         return None
 
 # --- Video ID Validation & Extraction ---
@@ -431,8 +453,9 @@ def _fetch_transcript_yt_dlp(video_id: str) -> str | None:
         })
 
         caption_files = []
-        for attempt in range(min(5, len(PROXY_ROTATION))):
-            proxy_dict = rnd_proxy() if PROXY_ROTATION and PROXY_ROTATION[0] else {}
+        # Attempt 0 → no proxy (direct), then rotate proxies
+        proxy_cycle = [None] + (PROXY_ROTATION if PROXY_ROTATION and PROXY_ROTATION[0] else [])
+        for attempt, proxy_dict in enumerate(proxy_cycle[:6]):  # max 6 tries (1 direct + 5 proxies)
             opts_try = opts.copy()
             if proxy_dict:
                 proxy_url = proxy_dict.get("https")
