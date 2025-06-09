@@ -933,6 +933,17 @@ def get_openai_response(response_id):
         logger.error("Error fetching OpenAI response: %s", str(e))
         return jsonify({'error': 'OpenAI service unavailable'}), 503
 
+
+# --- Render root health check ------------------------------------------------
+@app.route("/", methods=["GET"])
+def root_ok():
+    """
+    Simple 200 OK for Render's default health check.
+    Returns minimal JSON with uptime in seconds.
+    """
+    uptime = round(time.time() - app_start_time)
+    return jsonify({"status": "ok", "uptime": uptime}), 200
+
 @app.route("/privacy")
 def privacy(): return send_from_directory("static", "privacy.html")
 
