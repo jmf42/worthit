@@ -32,6 +32,11 @@ import functools
 from youtube_comment_downloader import YoutubeCommentDownloader
 from flask import send_from_directory
 
+# --- Ensure logger is defined early ---
+logger = logging.getLogger("WorthItService")
+logger.setLevel(logging.INFO)
+logging.basicConfig(level=logging.INFO)
+
 # --- Configuration ---
 APP_NAME = "WorthItService"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
