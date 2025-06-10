@@ -431,6 +431,7 @@ def _fetch_transcript_api(video_id: str,
         logger.info("[TRANSCRIPT] Paso 1: intentado obtener transcripts disponibles para video_id=%s, proxy=%s, timeout=%s", video_id, bool(proxy_cfg), timeout)
         # Small jitter so all requests do not look like a bot burst
         time.sleep(random.uniform(0.2, 0.7))
+        logger.info("[TRANSCRIPT] Usando proxy IP: %s", proxy_cfg.get("https") if proxy_cfg else "direct")
         transcript_list = _list_transcripts_safe(
             video_id,
             proxies=proxy_cfg,
@@ -460,7 +461,7 @@ def _fetch_transcript_api(video_id: str,
                     "[TRANSCRIPT] Empty or invalid XML for %s via proxy=%s – forcing next proxy",
                     video_id, bool(proxy_cfg)
                 )
-                raise CouldNotRetrieveTranscript(video_id, [], None)
+                raise CouldNotRetrieveTranscript(video_id)
             except Exception as e:
                 logger.error(
                     "[TRANSCRIPT] Error procesando segmentos para video_id=%s: %s",
