@@ -11,6 +11,9 @@ from functools import lru_cache
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future
 
+# --- XML for robust transcript parsing ---
+import xml.etree.ElementTree as _ET
+
 # --- Proxy force env ---
 FORCE_PROXY = os.getenv("FORCE_PROXY", "false").lower() == "true"
 
@@ -426,6 +429,8 @@ def _fetch_transcript_api(video_id: str,
     response = None
     try:
         logger.info("[TRANSCRIPT] Paso 1: intentado obtener transcripts disponibles para video_id=%s, proxy=%s, timeout=%s", video_id, bool(proxy_cfg), timeout)
+        # Small jitter so all requests do not look like a bot burst
+        time.sleep(random.uniform(0.2, 0.7))
         transcript_list = _list_transcripts_safe(
             video_id,
             proxies=proxy_cfg,
@@ -447,9 +452,21 @@ def _fetch_transcript_api(video_id: str,
                     seg.text if hasattr(seg, "text") else seg["text"]
                     for seg in tr.fetch()
                 ).strip()
+                if not text:
+                    raise ValueError("Empty transcript payload")
+            except (ValueError, _ET.ParseError) as e:
+                # Likely a CAPTCHA / empty XML. Force next proxy.
+                logger.warning(
+                    "[TRANSCRIPT] Empty or invalid XML for %s via proxy=%s – forcing next proxy",
+                    video_id, bool(proxy_cfg)
+                )
+                raise CouldNotRetrieveTranscript(video_id, [], None)
             except Exception as e:
-                logger.error("[TRANSCRIPT] Error procesando segmentos para video_id=%s: %s", video_id, e)
-                continue
+                logger.error(
+                    "[TRANSCRIPT] Error procesando segmentos para video_id=%s: %s",
+                    video_id, e
+                )
+                raise
             if text:
                 logger.info("[TRANSCRIPT] Paso 5: transcript obtenido con éxito para video_id=%s, longitud=%d", video_id, len(text))
                 return text
