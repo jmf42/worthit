@@ -153,32 +153,27 @@ logger = setup_logging()
 app_start_time = time.time()
 
 
-# High-quality Residential Proxy Configuration
 SMARTPROXY_USER = os.getenv("SMARTPROXY_USER")
 SMARTPROXY_PASS = os.getenv("SMARTPROXY_PASS")
 SMARTPROXY_HOST = os.getenv("SMARTPROXY_HOST")
 SMARTPROXY_PORTS_STR = os.getenv("SMARTPROXY_PORTS")
 
-PROXY_ROTATION = []
-# Check if all parts of the proxy config are present in the environment
+# Rotating proxy pool as a list of proxy URLs (strings)
+ROTATING_PROXIES = []
 if SMARTPROXY_USER and SMARTPROXY_PASS and SMARTPROXY_HOST and SMARTPROXY_PORTS_STR:
     SMARTPROXY_PORTS = SMARTPROXY_PORTS_STR.split(",")
-
-    # URL-encode the password to handle special characters like '~' safely
     encoded_pass = urllib.parse.quote_plus(SMARTPROXY_PASS)
-
-    # Build the list of proxy URLs using the SMARTPROXY variables
-    PROXY_ROTATION = [
-        {"https": f"http://{SMARTPROXY_USER}:{encoded_pass}@{SMARTPROXY_HOST}:{port}"}
+    ROTATING_PROXIES = [
+        f"http://{SMARTPROXY_USER}:{encoded_pass}@{SMARTPROXY_HOST}:{port}"
         for port in SMARTPROXY_PORTS
     ]
-    logger.info(f"Proxy rotation configured with {len(PROXY_ROTATION)} residential endpoints.")
+    logger.info(f"Proxy rotation configured with {len(ROTATING_PROXIES)} residential endpoints.")
 else:
-    # Fallback to no proxy if credentials are not fully configured
-    PROXY_ROTATION = [{}]
+    ROTATING_PROXIES = []
     logger.warning("Proxy credentials not fully configured. Running without proxies.")
 
-# Create the iterator for the rest of the app to use
+# For legacy logic, keep PROXY_ROTATION as list of dicts for other uses
+PROXY_ROTATION = [{"https": proxy_url} for proxy_url in ROTATING_PROXIES] if ROTATING_PROXIES else [{}]
 _proxy_cycle = itertools.cycle(PROXY_ROTATION)
 
 
@@ -567,29 +562,37 @@ def _fetch_transcript_yt_dlp(video_id: str) -> str | None:
 
 def _fetch_transcript_resilient(video_id: str) -> str:
     """
-    Try up to TRANSCRIPT_PROXY_ATTEMPTS rotating proxies, then (optionally)
-    fall back to a direct request. Raises NoTranscriptFound if all fail.
+    Attempt to fetch transcript by rotating through proxies in ROTATING_PROXIES.
+    Tries each proxy in order, with a backoff between attempts.
+    If all proxies fail, logs a clear message and raises NoTranscriptFound.
     """
     langs = ["en"] + FALLBACK_LANGUAGES
 
-    # Proxy loop
-    for _ in range(TRANSCRIPT_PROXY_ATTEMPTS):
-        proxy_cfg = rnd_proxy() if (FORCE_PROXY or (PROXY_ROTATION and PROXY_ROTATION[0])) else None
-        try:
-            if txt := _fetch_transcript_api(video_id, langs, proxy_cfg):
-                logger.info("Transcript fetched for %s via %s",
-                            video_id, "proxy" if proxy_cfg else "direct")
-                return txt
-        except (TranscriptsDisabled, CouldNotRetrieveTranscript, NoTranscriptFound) as e:
-            logger.debug("Transcript not found via %s for %s: %s",
-                         "proxy" if proxy_cfg else "direct", video_id, e)
-            # Continue to next proxy or direct fallback
-            continue
-        except Exception as e:
-            logger.debug("Proxy attempt failed for %s: %s", video_id, e)
+    # If proxies are configured, try each in turn (up to TRANSCRIPT_PROXY_ATTEMPTS or length of ROTATING_PROXIES)
+    proxy_attempted = False
+    if ROTATING_PROXIES:
+        max_attempts = min(TRANSCRIPT_PROXY_ATTEMPTS, len(ROTATING_PROXIES))
+        for idx, proxy_url in enumerate(ROTATING_PROXIES[:max_attempts]):
+            proxy_cfg = {"https": proxy_url}
+            proxy_attempted = True
+            try:
+                logger.info(f"[TRANSCRIPT] Attempt {idx+1}/{max_attempts} with proxy {proxy_url} for video_id={video_id}")
+                if txt := _fetch_transcript_api(video_id, langs, proxy_cfg):
+                    logger.info("Transcript fetched for %s via proxy %s", video_id, proxy_url)
+                    return txt
+            except (TranscriptsDisabled, CouldNotRetrieveTranscript, NoTranscriptFound) as e:
+                logger.warning(f"[TRANSCRIPT] Failed with proxy {proxy_url} for video_id={video_id}, retrying...")
+                time.sleep(2)
+                continue
+            except Exception as e:
+                logger.warning(f"[TRANSCRIPT] Unexpected error with proxy {proxy_url} for video_id={video_id}: {e}")
+                time.sleep(2)
+                continue
+        # All proxy attempts failed
+        logger.error(f"[TRANSCRIPT] All proxy attempts failed for video_id={video_id}")
 
-    # Direct fallback
-    if TRANSCRIPT_DIRECT_ATTEMPT:
+    # Direct fallback (if allowed or if no proxies configured)
+    if TRANSCRIPT_DIRECT_ATTEMPT and not proxy_attempted:
         try:
             if txt := _fetch_transcript_api(video_id, langs, None):
                 logger.info("Transcript fetched for %s via direct fallback", video_id)
@@ -613,7 +616,7 @@ def _fetch_transcript_resilient(video_id: str) -> str:
     except Exception:
         pass
 
-    logger.error("All transcript sources failed for video %s", video_id)
+    logger.error(f"[TRANSCRIPT] All transcript sources failed for video {video_id}")
     raise NoTranscriptFound(video_id, [], None)
 
 def _get_or_spawn_transcript(video_id: str) -> str:
