@@ -448,6 +448,7 @@ def _fetch_transcript_api(video_id: str,
             timeout=timeout,
             http_headers=headers,
             http_client=youtube_http,
+            cookies=YTDL_COOKIE_FILE if YTDL_COOKIE_FILE else None,
         )
         logger.info("[TRANSCRIPT] Paso 2: transcripts listados correctamente para video_id=%s", video_id)
     except Exception as e:
