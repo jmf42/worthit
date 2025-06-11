@@ -179,6 +179,7 @@ _proxy_cycle = itertools.cycle(PROXY_ROTATION)
 
 
 # --- HTTP Session with Retries ---
+
 session = requests.Session()
 session.request = functools.partial(session.request, timeout=15)  # ≤15 s per external request
 retry_cfg = Retry(
@@ -190,6 +191,20 @@ retry_cfg = Retry(
 )
 session.mount("https://", HTTPAdapter(max_retries=retry_cfg))
 session.mount("http://", HTTPAdapter(max_retries=retry_cfg))
+
+# --- Global YouTube HTTP client with consent cookie ---
+youtube_http = requests.Session()
+# Always pretend to be a normal browser
+youtube_http.headers.update({
+    "User-Agent": random.choice(USER_AGENTS),
+    "Accept-Language": "en-US,en;q=0.9"
+})
+# Bypass EU‑consent page that breaks transcripts
+youtube_http.cookies.set("CONSENT", "YES+1", domain=".youtube.com")
+# Re‑use same retry / timeout policy as the default session
+youtube_http.request = functools.partial(youtube_http.request, timeout=15)
+youtube_http.mount("https://", HTTPAdapter(max_retries=retry_cfg))
+youtube_http.mount("http://", HTTPAdapter(max_retries=retry_cfg))
 
 def rnd_proxy() -> dict:
     return next(_proxy_cycle)
@@ -432,7 +447,7 @@ def _fetch_transcript_api(video_id: str,
             proxies=proxy_cfg,
             timeout=timeout,
             http_headers=headers,
-            cookies=YTDL_COOKIE_FILE if YTDL_COOKIE_FILE else None,
+            http_client=youtube_http,
         )
         logger.info("[TRANSCRIPT] Paso 2: transcripts listados correctamente para video_id=%s", video_id)
     except Exception as e:
