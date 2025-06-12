@@ -78,7 +78,7 @@ PERSISTENT_CACHE_DIR = os.path.join(os.getcwd(), "persistent_cache")
 PERSISTENT_TRANSCRIPT_DB = os.path.join(PERSISTENT_CACHE_DIR, "transcript_cache.db")
 PERSISTENT_COMMENT_DB = os.path.join(PERSISTENT_CACHE_DIR, "comment_cache.db")
 # YTDL Cookie file configuration
-YTDL_COOKIE_FILE = os.getenv("YTDL_COOKIE_FILE", "")
+YTDL_COOKIE_FILE = os.getenv("YTDL_COOKIE_FILE", "/etc/secrets/cookies_chrome.txt")
 
 # ------------------------------------------------------------------
 # Universal CONSENT cookie (avoids 204/empty captions from YouTube)
@@ -430,7 +430,8 @@ FALLBACK_LANGUAGES = [
 def _fetch_transcript_api(video_id: str,
                           languages: list[str],
                           proxy_cfg: dict | None,
-                          timeout: int = TRANSCRIPT_HTTP_TIMEOUT) -> str | None:
+                          timeout: int = TRANSCRIPT_HTTP_TIMEOUT,
+                          cookies: str = None) -> str | None:
     """
     Perform a single transcript fetch using the specified proxy (or no proxy).
     Returns the transcript text or None.
@@ -448,7 +449,7 @@ def _fetch_transcript_api(video_id: str,
             timeout=timeout,
             http_headers=headers,
             http_client=youtube_http,
-            cookies=YTDL_COOKIE_FILE if YTDL_COOKIE_FILE else None,
+            cookies=cookies if cookies else (YTDL_COOKIE_FILE if YTDL_COOKIE_FILE else None),
         )
         logger.info("[TRANSCRIPT] Paso 2: transcripts listados correctamente para video_id=%s", video_id)
     except Exception as e:
@@ -593,7 +594,7 @@ def _fetch_transcript_resilient(video_id: str) -> str:
             proxy_attempted = True
             try:
                 logger.info(f"[TRANSCRIPT] Attempt {idx+1}/{max_attempts} with proxy {proxy_url} for video_id={video_id}")
-                if txt := _fetch_transcript_api(video_id, langs, proxy_cfg):
+                if txt := _fetch_transcript_api(video_id, langs, proxy_cfg, cookies=YTDL_COOKIE_FILE):
                     logger.info("Transcript fetched for %s via proxy %s", video_id, proxy_url)
                     return txt
             except (TranscriptsDisabled, CouldNotRetrieveTranscript, NoTranscriptFound) as e:
@@ -610,7 +611,7 @@ def _fetch_transcript_resilient(video_id: str) -> str:
     # Direct fallback (if allowed or if no proxies configured)
     if TRANSCRIPT_DIRECT_ATTEMPT and not proxy_attempted:
         try:
-            if txt := _fetch_transcript_api(video_id, langs, None):
+            if txt := _fetch_transcript_api(video_id, langs, None, cookies=YTDL_COOKIE_FILE):
                 logger.info("Transcript fetched for %s via direct fallback", video_id)
                 return txt
         except Exception as e:
