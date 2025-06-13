@@ -210,6 +210,27 @@ youtube_http.mount("http://", HTTPAdapter(max_retries=retry_cfg))
 def rnd_proxy() -> dict:
     return next(_proxy_cycle)
 
+# --- GenericProxyConfig helper (handles signature changes across versions) ---
+def _make_proxy_cfg(url: str):
+    """
+    Return a GenericProxyConfig instance that works with both pre-1.0 (`https=`) and
+    ≥1.0 (`https_url=`) signatures. It also adds a `.https` attribute so existing
+    log lines stay intact.
+    """
+    import inspect
+    sig = inspect.signature(GenericProxyConfig)
+
+    if "https_url" in sig.parameters:
+        cfg = GenericProxyConfig(https_url=url, http_url=url)
+    elif "https" in sig.parameters:
+        cfg = GenericProxyConfig(https=url, http=url)
+    else:
+        raise RuntimeError("Unsupported GenericProxyConfig signature")
+
+    if not hasattr(cfg, "https"):
+        setattr(cfg, "https", url)
+    return cfg
+
 def get_random_user_agent_header():
     """Returns a dictionary with a randomly chosen User-Agent header and Accept-Language."""
     return {
@@ -443,14 +464,17 @@ def _fetch_transcript_api(video_id: str,
     Perform a single transcript fetch using the specified proxy (or no proxy).
     Returns the transcript text or None.
     """
+    proxy_str = "direct"
+    if proxy_cfg:
+        proxy_str = getattr(proxy_cfg, "https", getattr(proxy_cfg, "https_url", "configured"))
     ua = pick_ua()
     headers = {"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9"}
     response = None
     try:
-        logger.info("[TRANSCRIPT] Paso 1: intentado obtener transcripts disponibles para video_id=%s, proxy=%s, timeout=%s", video_id, proxy_cfg.https if proxy_cfg else "direct", timeout)
+        logger.info("[TRANSCRIPT] Paso 1: intentado obtener transcripts disponibles para video_id=%s, proxy=%s, timeout=%s", video_id, proxy_str, timeout)
         # Small jitter so all requests do not look like a bot burst
         time.sleep(random.uniform(0.2, 0.7))
-        logger.info("[TRANSCRIPT] Usando proxy IP: %s", proxy_cfg.https if proxy_cfg else "direct")
+        logger.info("[TRANSCRIPT] Usando proxy IP: %s", proxy_str)
         transcript_list = _list_transcripts_safe(
             video_id,
             proxy_config=proxy_cfg,
@@ -477,7 +501,7 @@ def _fetch_transcript_api(video_id: str,
                 # Likely a CAPTCHA / empty XML. Force next proxy.
                 logger.warning(
                     "[TRANSCRIPT] Empty or invalid XML for %s via proxy=%s – forcing next proxy",
-                    video_id, proxy_cfg.https if proxy_cfg else "direct"
+                    video_id, proxy_str
                 )
                 raise CouldNotRetrieveTranscript(video_id)
             except Exception as e:
@@ -597,8 +621,7 @@ def _fetch_transcript_resilient(video_id: str) -> str:
     attempts.extend(ROTATING_PROXIES[:TRANSCRIPT_PROXY_ATTEMPTS] or [])
 
     for idx, proxy_url in enumerate(attempts, 1):
-        proxy_cfg = (GenericProxyConfig(https=proxy_url)
-                     if proxy_url else None)
+        proxy_cfg = (_make_proxy_cfg(proxy_url) if proxy_url else None)
         try:
             logger.info("[TRANSCRIPT] Attempt %d/%d via %s for video_id=%s",
                         idx, len(attempts),
