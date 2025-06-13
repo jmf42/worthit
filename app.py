@@ -23,6 +23,7 @@ from youtube_transcript_api import (
     TranscriptsDisabled,
     NoTranscriptFound
 )
+from youtube_transcript_api.proxies import GenericProxyConfig   # NEW
 from youtube_transcript_api._errors import CouldNotRetrieveTranscript
 from cachetools import TTLCache
 from logging.handlers import RotatingFileHandler
@@ -78,7 +79,7 @@ PERSISTENT_CACHE_DIR = os.path.join(os.getcwd(), "persistent_cache")
 PERSISTENT_TRANSCRIPT_DB = os.path.join(PERSISTENT_CACHE_DIR, "transcript_cache.db")
 PERSISTENT_COMMENT_DB = os.path.join(PERSISTENT_CACHE_DIR, "comment_cache.db")
 # YTDL Cookie file configuration
-YTDL_COOKIE_FILE = os.getenv("YTDL_COOKIE_FILE", "/etc/secrets/cookies_chrome.txt")
+YTDL_COOKIE_FILE = os.getenv("YTDL_COOKIE_FILE", "/etc/secrets/cookies_chrome2.txt")
 
 # ------------------------------------------------------------------
 # Universal CONSENT cookie (avoids 204/empty captions from YouTube)
@@ -215,6 +216,12 @@ def get_random_user_agent_header():
         "User-Agent": random.choice(USER_AGENTS),
         "Accept-Language": "en-US,en;q=0.8"
     }
+
+# Requires youtube-transcript-api >= 1.0.4 for ProxyConfig support
+
+def pick_ua() -> str:
+    """Return a single UA string to keep list/fetch on the same fingerprint."""
+    return random.choice(USER_AGENTS)
 
 
 # --- Flask App Initialization ---
@@ -429,27 +436,26 @@ FALLBACK_LANGUAGES = [
 
 def _fetch_transcript_api(video_id: str,
                           languages: list[str],
-                          proxy_cfg: dict | None,
+                          proxy_cfg: GenericProxyConfig | None,
                           timeout: int = TRANSCRIPT_HTTP_TIMEOUT,
                           cookies: str = None) -> str | None:
     """
     Perform a single transcript fetch using the specified proxy (or no proxy).
     Returns the transcript text or None.
     """
-    headers = get_random_user_agent_header()
+    ua = pick_ua()
+    headers = {"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9"}
     response = None
     try:
-        logger.info("[TRANSCRIPT] Paso 1: intentado obtener transcripts disponibles para video_id=%s, proxy=%s, timeout=%s", video_id, bool(proxy_cfg), timeout)
+        logger.info("[TRANSCRIPT] Paso 1: intentado obtener transcripts disponibles para video_id=%s, proxy=%s, timeout=%s", video_id, proxy_cfg.https if proxy_cfg else "direct", timeout)
         # Small jitter so all requests do not look like a bot burst
         time.sleep(random.uniform(0.2, 0.7))
-        logger.info("[TRANSCRIPT] Usando proxy IP: %s", proxy_cfg.get("https") if proxy_cfg else "direct")
+        logger.info("[TRANSCRIPT] Usando proxy IP: %s", proxy_cfg.https if proxy_cfg else "direct")
         transcript_list = _list_transcripts_safe(
             video_id,
-            proxies=proxy_cfg,
+            proxy_config=proxy_cfg,
             timeout=timeout,
-            http_headers=headers,
             http_client=youtube_http,
-            cookies=cookies if cookies else (YTDL_COOKIE_FILE if YTDL_COOKIE_FILE else None),
         )
         logger.info("[TRANSCRIPT] Paso 2: transcripts listados correctamente para video_id=%s", video_id)
     except Exception as e:
@@ -471,7 +477,7 @@ def _fetch_transcript_api(video_id: str,
                 # Likely a CAPTCHA / empty XML. Force next proxy.
                 logger.warning(
                     "[TRANSCRIPT] Empty or invalid XML for %s via proxy=%s – forcing next proxy",
-                    video_id, bool(proxy_cfg)
+                    video_id, proxy_cfg.https if proxy_cfg else "direct"
                 )
                 raise CouldNotRetrieveTranscript(video_id)
             except Exception as e:
@@ -585,37 +591,38 @@ def _fetch_transcript_resilient(video_id: str) -> str:
     """
     langs = ["en"] + FALLBACK_LANGUAGES
 
-    # If proxies are configured, try each in turn (up to TRANSCRIPT_PROXY_ATTEMPTS or length of ROTATING_PROXIES)
-    proxy_attempted = False
-    if ROTATING_PROXIES:
-        max_attempts = min(TRANSCRIPT_PROXY_ATTEMPTS, len(ROTATING_PROXIES))
-        for idx, proxy_url in enumerate(ROTATING_PROXIES[:max_attempts]):
-            proxy_cfg = {"https": proxy_url}
-            proxy_attempted = True
-            try:
-                logger.info(f"[TRANSCRIPT] Attempt {idx+1}/{max_attempts} with proxy {proxy_url} for video_id={video_id}")
-                if txt := _fetch_transcript_api(video_id, langs, proxy_cfg, cookies=YTDL_COOKIE_FILE):
-                    logger.info("Transcript fetched for %s via proxy %s", video_id, proxy_url)
-                    return txt
-            except (TranscriptsDisabled, CouldNotRetrieveTranscript, NoTranscriptFound) as e:
-                logger.warning(f"[TRANSCRIPT] Failed with proxy {proxy_url} for video_id={video_id}, retrying...")
-                time.sleep(2)
-                continue
-            except Exception as e:
-                logger.warning(f"[TRANSCRIPT] Unexpected error with proxy {proxy_url} for video_id={video_id}: {e}")
-                time.sleep(2)
-                continue
-        # All proxy attempts failed
-        logger.error(f"[TRANSCRIPT] All proxy attempts failed for video_id={video_id}")
+    attempts: list[str | None] = []
+    if TRANSCRIPT_DIRECT_ATTEMPT:
+        attempts.append(None)             # direct call first
+    attempts.extend(ROTATING_PROXIES[:TRANSCRIPT_PROXY_ATTEMPTS] or [])
 
-    # Direct fallback (if allowed or if no proxies configured)
-    if TRANSCRIPT_DIRECT_ATTEMPT and not proxy_attempted:
+    for idx, proxy_url in enumerate(attempts, 1):
+        proxy_cfg = (GenericProxyConfig(https=proxy_url)
+                     if proxy_url else None)
         try:
-            if txt := _fetch_transcript_api(video_id, langs, None, cookies=YTDL_COOKIE_FILE):
-                logger.info("Transcript fetched for %s via direct fallback", video_id)
+            logger.info("[TRANSCRIPT] Attempt %d/%d via %s for video_id=%s",
+                        idx, len(attempts),
+                        proxy_url if proxy_url else "direct",
+                        video_id)
+            txt = _fetch_transcript_api(video_id, langs, proxy_cfg,
+                                        cookies=YTDL_COOKIE_FILE)
+            if txt:
+                logger.info("Transcript fetched via %s for %s",
+                            proxy_url if proxy_url else "direct", video_id)
                 return txt
+        except (TranscriptsDisabled, CouldNotRetrieveTranscript,
+                NoTranscriptFound) as e:
+            logger.warning("[TRANSCRIPT] Failed via %s for %s: %s – retrying...",
+                           proxy_url if proxy_url else "direct", video_id, e)
+            time.sleep(1.5)
+            continue
         except Exception as e:
-            logger.debug("Direct fallback failed for %s: %s", video_id, e, exc_info=LOG_LEVEL=="DEBUG")
+            logger.warning("[TRANSCRIPT] Unexpected err via %s for %s: %s",
+                           proxy_url if proxy_url else "direct", video_id, e)
+            time.sleep(1.5)
+            continue
+    logger.error("[TRANSCRIPT] All proxy/direct attempts exhausted for %s",
+                 video_id)
 
     # Player‑response JSON fallback (fast)
     try:
