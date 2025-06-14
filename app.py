@@ -27,7 +27,9 @@ from flask import Flask, request, jsonify
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
     TranscriptsDisabled,
-    NoTranscriptFound
+    NoTranscriptFound,
+    RequestBlocked,
+    VideoUnavailable  # <-- THIS IS THE FIX
 )
 from youtube_transcript_api.proxies import GenericProxyConfig
 from youtube_transcript_api._errors import CouldNotRetrieveTranscript
