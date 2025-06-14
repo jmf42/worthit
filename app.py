@@ -14,6 +14,12 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future
 # --- XML for robust transcript parsing ---
 import xml.etree.ElementTree as _ET
 
+# Add these imports near the top of your app.py file
+import html
+import tempfile
+import pathlib
+from youtube_transcript_api import RequestBlocked
+
 # --- Proxy force env ---
 FORCE_PROXY = os.getenv("FORCE_PROXY", "false").lower() == "true"
 
@@ -461,148 +467,129 @@ def _is_captcha_response(text: str) -> bool:
     ))
 
 # --- yt-dlp subtitle fallback ---
+# --- Robust yt-dlp Subtitle Fetcher ---
 def _fetch_transcript_yt_dlp(video_id: str) -> str | None:
     """
-    Last‑chance subtitle grab using yt‑dlp auto‑subs (VTT) and convert to plain text.
-    Returns plain text or None.
+    Last-chance subtitle grab using yt-dlp, iterating through ALL proxies.
+    This is the most robust fallback.
     """
-    import tempfile, pathlib, html
-
+    logger.info("[yt-dlp] Initiating final fallback for %s", video_id)
     with tempfile.TemporaryDirectory() as tmp_dir:
         outtmpl = str(pathlib.Path(tmp_dir) / "%(id)s.%(ext)s")
-
-        opts = _YDL_OPTS_BASE.copy()
-        opts.update({
-            "writesubtitles": True,
-            "writeautomaticsub": True,
-            # “*” alone is invalid. Use regex wildcards accepted by yt‑dlp:
-            "subtitleslangs": ["en", "en-.*", ".*"],
-            "subtitlesformat": "best",   # yt‑dlp picks vtt → srt when convert_subs is set
-            "convert_subs": "srt",
+        
+        base_opts = {
+            "quiet": True, "skip_download": True, "extract_flat": "discard_in_playlist",
+            "no_warnings": True, "restrict_filenames": True, "nocheckcertificate": True,
+            "ignoreerrors": True, "no_playlist": True,
+            "writesubtitles": True, "writeautomaticsub": True,
+            "subtitleslangs": ["en.*", "en", "es.*", "es"], # Prioritize common languages
+            "subtitlesformat": "best[ext=srv3]", # srv3 (XML) is easy to parse
             "outtmpl": outtmpl,
-            "quiet": True,
-            "skip_download": True,
-            "nooverwrites": True,
-            "max_downloads": 1,
-            "http_headers": get_random_user_agent_header(),
-        })
+        }
+        # Safely add cookie file if it exists
+        if YTDL_COOKIE_FILE and os.path.exists(YTDL_COOKIE_FILE):
+             base_opts["cookiefile"] = YTDL_COOKIE_FILE
 
-        caption_files = []
-        # Attempt 0 → no proxy (direct), then rotate proxies
-        proxy_cycle = [None] + (PROXY_ROTATION if PROXY_ROTATION and PROXY_ROTATION[0] else [])
-        for attempt, proxy_dict in enumerate(proxy_cycle[:6]):  # max 6 tries (1 direct + 5 proxies)
-            opts_try = opts.copy()
-            if proxy_dict:
-                proxy_url = proxy_dict.get("https")
-                if proxy_url:
-                    opts_try["proxy"] = proxy_url
+        # Create a list of attempts: direct first, then all configured proxies.
+        proxy_attempts = [None] + ROTATING_PROXIES
+
+        for attempt_num, proxy_url in enumerate(proxy_attempts, 1):
+            opts_try = base_opts.copy()
+            log_proxy_name = "direct"
+            if proxy_url:
+                opts_try["proxy"] = proxy_url
+                try:
+                    log_proxy_name = "proxy@" + proxy_url.split('@', 1)[1]
+                except IndexError:
+                    log_proxy_name = "configured_proxy"
+
+            logger.info("[yt-dlp] Attempt %d/%d for %s via %s", 
+                        attempt_num, len(proxy_attempts), video_id, log_proxy_name)
+            
+            opts_try["http_headers"] = get_random_user_agent_header()
+
             try:
                 with YoutubeDL(opts_try) as ydl:
-                    ydl.extract_info(
-                        f"https://www.youtube.com/watch?v={video_id}",
-                        download=True
-                    )
-                caption_files = (
-                    list(pathlib.Path(tmp_dir).glob(f"{video_id}*.srt")) +
-                    list(pathlib.Path(tmp_dir).glob(f"{video_id}*.vtt"))
-                )
-                if caption_files:
-                    break  # éxito
-            except Exception as e:
-                if "data blocks" in str(e) or "HTTP Error 4" in str(e):
-                    logger.debug("yt-dlp attempt %d failed for %s: %s", attempt+1, video_id, e)
-                    time.sleep(1.2)
-                    continue
-                raise
-        if not caption_files:
-            return None
-        cap_text = caption_files[0].read_text(encoding="utf-8", errors="ignore")
+                    ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
+                
+                # Check for downloaded subtitle file
+                caption_files = list(pathlib.Path(tmp_dir).glob(f"{video_id}*.srv3"))
+                if not caption_files:
+                    continue # No subs downloaded, try next proxy
 
-    # Strip WEBVTT/SRT header and timestamps
-    lines: list[str] = []
-    for line in cap_text.splitlines():
-        line = line.strip()
-        if not line or line.startswith(("WEBVTT", "X-TIMESTAMP-MAP")):
-            continue
-        if "-->" in line:
-            continue
-        # For SRT, skip numeric index lines
-        if line.isdigit():
-            continue
-        lines.append(html.unescape(line))
-    plain = " ".join(lines).strip()
-    return plain or None
+                cap_text = caption_files[0].read_text(encoding="utf-8", errors="ignore")
+                
+                # Parse SRV3 XML (more reliable than SRT/VTT parsing)
+                texts = re.findall(r'>([^<]+)</text>', cap_text)
+                plain_text = " ".join(html.unescape(t).strip() for t in texts).strip()
+
+                if plain_text:
+                    logger.info("[yt-dlp] Success! Fetched subs for %s via %s", video_id, log_proxy_name)
+                    return plain_text
+
+            except Exception as e:
+                # Log informative yt-dlp errors without crashing
+                err_str = str(e)
+                if "Sign in to confirm" in err_str or "HTTP Error 429" in err_str:
+                    logger.warning("[yt-dlp] Blocked on %s: %s", log_proxy_name, err_str.splitlines()[0])
+                else:
+                    logger.error("[yt-dlp] Unexpected error on %s: %s", log_proxy_name, e)
+                time.sleep(1) # Wait a bit before next attempt
+                continue
+
+    logger.error("[yt-dlp] All fallback attempts failed for %s.", video_id)
+    return None
 
 def _fetch_transcript_resilient(video_id: str) -> str:
     """
-    Attempt to fetch transcript by rotating through proxies in ROTATING_PROXIES.
-    Tries each proxy in order, with a backoff between attempts.
-    If all proxies fail, logs a clear message and raises NoTranscriptFound.
+    Orchestrates transcript fetching: first tries the fast API, then the robust yt-dlp fallback.
     """
-    langs = ["en"] + FALLBACK_LANGUAGES
+    langs = ["en", 'es', 'fr', 'de', 'pt'] # A reasonable default set
 
-    attempts: list[str | None] = []
+    # --- Primary Method: youtube-transcript-api with limited proxy rotation ---
+    api_attempts = []
     if TRANSCRIPT_DIRECT_ATTEMPT:
-        attempts.append(None)
-    attempts.extend(ROTATING_PROXIES[:TRANSCRIPT_PROXY_ATTEMPTS] or [])
+        api_attempts.append(None)
+    api_attempts.extend(ROTATING_PROXIES[:TRANSCRIPT_PROXY_ATTEMPTS])
 
-    for idx, proxy_url in enumerate(attempts, 1):
+    for idx, proxy_url in enumerate(api_attempts, 1):
         proxy_cfg = (_make_proxy_cfg(proxy_url) if proxy_url else None)
-        
-        # *** FIX 3: Sanitize proxy URL for logging to avoid exposing credentials ***
+        log_proxy_name = "direct"
         if proxy_url:
             try:
-                # Show only the host and port in logs
                 log_proxy_name = "proxy@" + proxy_url.split('@', 1)[1]
             except IndexError:
                 log_proxy_name = "configured_proxy"
-        else:
-            log_proxy_name = "direct"
-
+        
+        logger.info("[API] Attempt %d/%d for %s via %s", idx, len(api_attempts), video_id, log_proxy_name)
+        
         try:
-            logger.info("[TRANSCRIPT] Attempt %d/%d via %s for video_id=%s",
-                        idx, len(attempts),
-                        log_proxy_name, # Use the sanitized name for logging
-                        video_id)
-            
-            txt = _fetch_transcript_api(video_id, langs, proxy_cfg,
-                                        cookies=YTDL_COOKIE_FILE,
-                                        timeout=TRANSCRIPT_HTTP_TIMEOUT)
+            # We call the original _fetch_transcript_api here
+            txt = _fetch_transcript_api(video_id, langs, proxy_cfg, timeout=TRANSCRIPT_HTTP_TIMEOUT)
             if txt:
-                logger.info("Transcript fetched successfully via %s for %s",
-                            log_proxy_name, video_id)
+                logger.info("[API] Success for %s via %s", video_id, log_proxy_name)
                 return txt
-        except (TranscriptsDisabled, CouldNotRetrieveTranscript, NoTranscriptFound) as e:
-            logger.warning("[TRANSCRIPT] Failed attempt via %s for %s: %s – retrying...",
-                           log_proxy_name, video_id, e.__class__.__name__)
+        except (RequestBlocked, CouldNotRetrieveTranscript) as e:
+            logger.warning("[API] Blocked/Failed on %s: %s. Retrying...", log_proxy_name, e.__class__.__name__)
             time.sleep(1.5)
-            continue
+        except NoTranscriptFound:
+            logger.warning("[API] No transcript found on %s. This video may not have captions.", log_proxy_name)
+            # If the API explicitly says no transcript, we can trust it and fail faster.
+            break 
         except Exception as e:
-            logger.warning("[TRANSCRIPT] Unexpected error via %s for %s: %s",
-                           log_proxy_name, video_id, e)
+            logger.error("[API] Unexpected error on %s: %s", log_proxy_name, e)
             time.sleep(1.5)
-            continue
-            
-    logger.error("[TRANSCRIPT] All primary (API) attempts exhausted for %s", video_id)
 
-    # Player‑response JSON fallback (fast)
-    try:
-        if text := _fetch_transcript_player(video_id):
-            logger.info("Transcript fetched for %s via playerResponse fallback", video_id)
-            return text
-    except Exception:
-        pass
+    logger.warning("[API] All primary API attempts failed for %s. Moving to final fallback.", video_id)
 
-    # Ultimate fallback: yt‑dlp auto subs
-    try:
-        if text := _fetch_transcript_yt_dlp(video_id):
-            logger.info("Transcript fetched for %s via yt‑dlp auto‑subs fallback", video_id)
-            return text
-    except Exception:
-        pass
+    # --- Final, Most Robust Fallback ---
+    text = _fetch_transcript_yt_dlp(video_id)
+    if text:
+        return text
 
-    logger.error(f"[TRANSCRIPT] All transcript sources failed for video {video_id}")
-    raise NoTranscriptFound(video_id, [], None)
+    logger.error("[FATAL] All transcript sources (API and yt-dlp) have failed for video %s", video_id)
+    raise NoTranscriptFound(video_id)
+
 
 def _get_or_spawn_transcript(video_id: str) -> str:
     """
