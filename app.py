@@ -390,72 +390,30 @@ FALLBACK_LANGUAGES = [
 def _fetch_transcript_api(video_id: str,
                           languages: list[str],
                           proxy_cfg: GenericProxyConfig | None,
-                          timeout: int = TRANSCRIPT_HTTP_TIMEOUT,
-                          cookies: str = None) -> str | None:
-    """
-    Perform a single transcript fetch using the specified proxy (or no proxy).
-    Returns the transcript text or None.
-    """
-    proxy_str = "direct"
-    if proxy_cfg:
-        proxy_str = getattr(proxy_cfg, "https", getattr(proxy_cfg, "https_url", "configured"))
-    ua = pick_ua()
-    headers = {"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9"}
-    response = None
-    try:
-        logger.info("[TRANSCRIPT] Paso 1: intentado obtener transcripts disponibles para video_id=%s, proxy=%s, timeout=%s", video_id, proxy_str, timeout)
-        # Small jitter so all requests do not look like a bot burst
-        time.sleep(random.uniform(0.2, 0.7))
-        logger.info("[TRANSCRIPT] Usando proxy IP: %s", proxy_str)
-        transcript_list = _list_transcripts_safe(
-            video_id,
-            proxy_config=proxy_cfg,
-            timeout=timeout,
-            http_client=youtube_http,
-        )
-        logger.info("[TRANSCRIPT] Paso 2: transcripts listados correctamente para video_id=%s", video_id)
-    except Exception as e:
-        logger.error("[TRANSCRIPT] Error al obtener lista de transcripts para video_id=%s: %s", video_id, e)
-        raise
+                          timeout: int) -> str | None:
+    # Create a session for each attempt to inject cookies and headers.
+    session = requests.Session()
+    session.cookies.set("CONSENT", "YES+cb.20210328-17-p0.en+FX+888", domain=".youtube.com")
+    session.headers.update(get_random_user_agent_header())
+
+    # Pass the pre-configured session as the http_client
+    transcript_list = _list_transcripts_safe(
+        video_id=video_id,
+        proxy_config=proxy_cfg,
+        timeout=timeout,
+        http_client=session  # This ensures the API call uses our cookie
+    )
+
     for finder in (transcript_list.find_transcript, transcript_list.find_generated_transcript):
         try:
-            logger.info("[TRANSCRIPT] Paso 3: intentando buscar transcript con finder=%s para video_id=%s", finder.__name__, video_id)
             tr = finder(languages)
-            logger.info("[TRANSCRIPT] Paso 4: transcript encontrado, intentando fetch() para video_id=%s", video_id)
-            try:
-                text = " ".join(
-                    seg.text if hasattr(seg, "text") else seg["text"]
-                    for seg in tr.fetch()
-                ).strip()
-                if not text:
-                    raise ValueError("Empty transcript payload")
-            except (ValueError, _ET.ParseError) as e:
-                # Likely a CAPTCHA / empty XML. Force next proxy.
-                logger.warning(
-                    "[TRANSCRIPT] Empty or invalid XML for %s via proxy=%s – forcing next proxy",
-                    video_id, proxy_str
-                )
-                raise CouldNotRetrieveTranscript(video_id)
-            except Exception as e:
-                logger.error(
-                    "[TRANSCRIPT] Error procesando segmentos para video_id=%s: %s",
-                    video_id, e
-                )
-                raise
+            # Fetch the actual transcript data
+            text = " ".join(seg["text"] for seg in tr.fetch()).strip()
             if text:
-                logger.info("[TRANSCRIPT] Paso 5: transcript obtenido con éxito para video_id=%s, longitud=%d", video_id, len(text))
                 return text
-            else:
-                logger.info("[TRANSCRIPT] Paso 5: transcript vacío para video_id=%s", video_id)
-        except NoTranscriptFound as nf:
-            logger.info("[TRANSCRIPT] NoTranscriptFound usando finder=%s para video_id=%s: %s", finder.__name__, video_id, nf)
+        except NoTranscriptFound:
             continue
-        except Exception as e:
-            logger.error("[TRANSCRIPT] Error inesperado en finder=%s para video_id=%s: %s", finder.__name__, video_id, e)
-            continue
-    logger.info("[TRANSCRIPT] Paso final: no se encontró transcript disponible para video_id=%s", video_id)
     return None
-# --- Helper for CAPTCHA detection ---
 # --- Helper for CAPTCHA detection ---
 def _is_captcha_response(text: str) -> bool:
     if not text:
@@ -569,7 +527,8 @@ def _fetch_transcript_resilient(video_id: str) -> str:
             if txt:
                 logger.info("[API] Success for %s via %s", video_id, log_proxy_name)
                 return txt
-        except (RequestBlocked, CouldNotRetrieveTranscript) as e:
+        # FIX: Add VideoUnavailable to the list of handled exceptions
+        except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable) as e:
             logger.warning("[API] Blocked/Failed on %s: %s. Retrying...", log_proxy_name, e.__class__.__name__)
             time.sleep(1.5)
         except NoTranscriptFound:
@@ -588,7 +547,8 @@ def _fetch_transcript_resilient(video_id: str) -> str:
         return text
 
     logger.error("[FATAL] All transcript sources (API and yt-dlp) have failed for video %s", video_id)
-    raise NoTranscriptFound(video_id)
+    # FIX: Provide the extra required arguments to prevent a crash.
+    raise NoTranscriptFound(video_id, [], {})
 
 
 def _get_or_spawn_transcript(video_id: str) -> str:
