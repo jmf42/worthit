@@ -29,6 +29,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("TranscriptService")
+DISABLE_DIRECT = os.getenv("FORCE_PROXY", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Webshare rotating proxy pool ----------------------------------------------
