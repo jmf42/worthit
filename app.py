@@ -64,9 +64,11 @@ def fetch_api_once(video_id: str, proxy_cfg, timeout: int = 10,
     """
     languages = languages or ["en", "es"]
 
-    ytt_api = YouTubeTranscriptApi(proxy_config=proxy_cfg, timeout=timeout)
+    # youtube‑transcript‑api >= 1.1.0 does not accept "timeout" in the constructor.
+    # Instead pass it to each call of .fetch(...)
+    ytt_api = YouTubeTranscriptApi(proxy_config=proxy_cfg)
     try:
-        ft = ytt_api.fetch(video_id, languages=languages)
+        ft = ytt_api.fetch(video_id, languages=languages, timeout=timeout)
     except NoTranscriptFound:
         return None
 
