@@ -22,6 +22,9 @@ from youtube_transcript_api.proxies import GenericProxyConfig
 from youtube_transcript_api._errors import CouldNotRetrieveTranscript
 from yt_dlp import YoutubeDL
 
+DISABLE_DIRECT = os.getenv("TRANSCRIPT_DIRECT_ATTEMPT", "false").lower() == "true"
+MAX_PROXY_ATTEMPTS = int(os.getenv("TRANSCRIPT_PROXY_ATTEMPTS", "4"))
+
 # ---------------------------------------------------------------------------
 # Basic logging
 logging.basicConfig(
@@ -33,31 +36,33 @@ logger = logging.getLogger("TranscriptService")
 # ---------------------------------------------------------------------------
 # SmartProxy / Decodo rotating proxy pool -----------------------------------
 
-SP_USER  = os.getenv("SMARTPROXY_USER")
-SP_PASS  = os.getenv("SMARTPROXY_PASS")
-SP_HOST  = os.getenv("SMARTPROXY_HOST", "gate.decodo.com")
+SP_USER = os.getenv("SMARTPROXY_USER")
+SP_PASS = os.getenv("SMARTPROXY_PASS")
+SP_HOST = "gate.decodo.com"
 
-SP_PORTS = os.getenv("SMARTPROXY_PORTS", "7000,7001,7002,7003,7004,7005,7006,7007,7008,7009,7010,7011")
-
-# If false → the service will never try Render's own IP first
-DISABLE_DIRECT = os.getenv("TRANSCRIPT_DIRECT_ATTEMPT", "false").lower() == "false"
+# sticky ports (10001–10010), rotating port (10000)
+ROTATING_PORT = 10000
+STICKY_PORTS = list(range(10001, 10011))  # safe for yt-dlp
 
 PROXIES: List[str] = []
+
 if SP_USER and SP_PASS:
     encoded_pass = requests.utils.quote(SP_PASS, safe="")
     PROXIES = [
-        f"http://{SP_USER}:{encoded_pass}@{SP_HOST}:{port.strip()}"
-        for port in SP_PORTS.split(",") if port.strip()
+        f"http://{SP_USER}:{encoded_pass}@{SP_HOST}:{port}"
+        for port in STICKY_PORTS + [ROTATING_PORT]
     ]
-    logger.info("Loaded %d SmartProxy endpoints: %s", len(PROXIES), PROXIES)
+    logger.info("Loaded %d Decodo proxy endpoints: %s", len(PROXIES), PROXIES)
 else:
     logger.info("SmartProxy credentials not set – running direct-only mode")
 
-# randomized proxy strategy – avoids endpoint reuse detection
+# deterministic cycle through proxies
+_PROXY_CYCLE = itertools.cycle(PROXIES) if PROXIES else None
+
 def next_proxy() -> Optional[str]:
-    if not PROXIES:
-        return None
-    return random.choice(PROXIES)
+    if not _PROXY_CYCLE:
+        return None  # direct
+    return next(_PROXY_CYCLE)
 
 # helper to convert raw URL into GenericProxyConfig (runtime-safe)
 
@@ -140,17 +145,18 @@ def fetch_ytdlp(video_id: str, proxy_url: Optional[str]) -> Optional[str]:
 
 # ---------------------------------------------------------------------------
 # Shuffle proxies on each request to avoid being rate limited or blocked by endpoint reuse.
-def get_transcript(video_id: str, max_attempts: int = 4) -> str:
+def get_transcript(video_id: str, max_attempts: int = 0) -> str:
     # scale attempts to proxy count if caller passes max_attempts=0
     if max_attempts == 0:
-        max_attempts = (1 if not DISABLE_DIRECT else 0) + len(PROXIES)
+        max_attempts = MAX_PROXY_ATTEMPTS or ((1 if not DISABLE_DIRECT else 0) + len(PROXIES))
 
     attempts = [] if DISABLE_DIRECT else [None]      # None = direct attempt
     # add enough proxies to reach max_attempts
     room = max_attempts - len(attempts)
     if room > 0 and PROXIES:
-        attempts += random.choices(PROXIES, k=room)
+        attempts += random.sample(PROXIES, min(room, len(PROXIES)))
 
+    random.shuffle(attempts)
     # 1️⃣ try youtube-transcript-api
     for idx, p_url in enumerate(attempts, 1):
         try:
