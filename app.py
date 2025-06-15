@@ -37,7 +37,11 @@ logger = logging.getLogger("TranscriptService")
 SP_USER  = os.getenv("SMARTPROXY_USER")
 SP_PASS  = os.getenv("SMARTPROXY_PASS")
 SP_HOST  = os.getenv("SMARTPROXY_HOST", "gate.decodo.com")
-SP_PORTS = os.getenv("SMARTPROXY_PORTS", "7000")
+
+SP_PORTS = os.getenv("SMARTPROXY_PORTS", "7000,7001,7002,7003,7004,7005,7006,7007,7008,7009,7010,7011")
+
+# If false → the service will never try Render's own IP first
+DISABLE_DIRECT = os.getenv("TRANSCRIPT_DIRECT_ATTEMPT", "false").lower() == "false"
 
 PROXIES: List[str] = []
 if SP_USER and SP_PASS:
@@ -46,7 +50,7 @@ if SP_USER and SP_PASS:
         f"http://{SP_USER}:{encoded_pass}@{SP_HOST}:{port.strip()}"
         for port in SP_PORTS.split(",") if port.strip()
     ]
-    logger.info("Loaded %d SmartProxy endpoints", len(PROXIES))
+    logger.info("Loaded %d SmartProxy endpoints: %s", len(PROXIES), PROXIES)
 else:
     logger.info("SmartProxy credentials not set – running direct-only mode")
 
@@ -141,9 +145,14 @@ def fetch_ytdlp(video_id: str, proxy_url: Optional[str]) -> Optional[str]:
 # Orchestrator ----------------------------------------------------------------
 
 def get_transcript(video_id: str, max_attempts: int = 4) -> str:
-    attempts = [None]  # direct first
-    # add up to max_attempts-1 proxies (cycle)
-    for _ in range(min(max_attempts - 1, len(PROXIES))):
+    # scale attempts to proxy count if caller passes max_attempts=0
+    if max_attempts == 0:
+        max_attempts = (1 if not DISABLE_DIRECT else 0) + len(PROXIES)
+
+    attempts = [] if DISABLE_DIRECT else [None]      # None = direct attempt
+    # add enough proxies to reach max_attempts
+    room = max_attempts - len(attempts)
+    for _ in range(min(room, len(PROXIES))):
         attempts.append(next_proxy())
 
     # 1️⃣ try youtube-transcript-api
