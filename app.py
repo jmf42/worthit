@@ -22,9 +22,6 @@ from youtube_transcript_api.proxies import GenericProxyConfig
 from youtube_transcript_api._errors import CouldNotRetrieveTranscript
 from yt_dlp import YoutubeDL
 
-DISABLE_DIRECT = os.getenv("TRANSCRIPT_DIRECT_ATTEMPT", "false").lower() == "true"
-MAX_PROXY_ATTEMPTS = int(os.getenv("TRANSCRIPT_PROXY_ATTEMPTS", "4"))
-
 # ---------------------------------------------------------------------------
 # Basic logging
 logging.basicConfig(
@@ -34,25 +31,61 @@ logging.basicConfig(
 logger = logging.getLogger("TranscriptService")
 
 # ---------------------------------------------------------------------------
-# SmartProxy / Decodo rotating proxy pool -----------------------------------
+# Webshare rotating proxy pool ----------------------------------------------
+WS_TOKEN = os.getenv("WEBSHARE_TOKEN")
 
+# ---------------------------------------------------------------------------
+# Decodo (SmartProxy) rotating proxy pool ------------------------------------
 SP_USER = os.getenv("SMARTPROXY_USER")
 SP_PASS = os.getenv("SMARTPROXY_PASS")
 SP_HOST = "gate.decodo.com"
 
-ROTATING_PORT = 7000            # Decodo “rotating” port for fresh residential IPs
-STICKY_PORTS: list[int] = []   # no sticky ports for YouTube
+# sticky ports (10001–10010), rotating port (10000)
+ROTATING_PORT = 10000
+STICKY_PORTS = list(range(10001, 10011))  # safe for yt-dlp
 
 PROXIES: List[str] = []
 
-if SP_USER and SP_PASS:
+# --- 1️⃣  Webshare takes precedence if token is provided --------------------
+if WS_TOKEN:
+    try:
+        _tmp: List[str] = []
+        page = 1
+        while True:
+            r = requests.get(
+                "https://proxy.webshare.io/api/v2/proxy/list/",
+                params={"mode": "direct", "page": page, "page_size": 25},
+                headers={"Authorization": f"Token {WS_TOKEN}"},
+                timeout=10,
+            )
+            r.raise_for_status()
+            data = r.json()
+            for p in data.get("results", []):
+                user = p["username"]
+                pwd = requests.utils.quote(p["password"], safe="")
+                addr = p["proxy_address"]
+                port = p["port"]
+                _tmp.append(f"http://{user}:{pwd}@{addr}:{port}")
+            if not data.get("next"):
+                break
+            page += 1
+        PROXIES = _tmp
+        logger.info("Loaded %d Webshare proxy endpoints", len(PROXIES))
+    except Exception as e:
+        logger.error("Failed to load Webshare proxies: %s – falling back to Decodo if configured", e)
+
+# --- 2️⃣  Fall back to Decodo credentials if still no proxies ---------------
+if not PROXIES and SP_USER and SP_PASS:
     encoded_pass = requests.utils.quote(SP_PASS, safe="")
     PROXIES = [
-        f"http://{SP_USER}:{encoded_pass}@{SP_HOST}:{ROTATING_PORT}"
+        f"http://{SP_USER}:{encoded_pass}@{SP_HOST}:{port}"
+        for port in STICKY_PORTS + [ROTATING_PORT]
     ]
-    logger.info("Loaded %d Decodo proxy endpoints: %s", len(PROXIES), PROXIES)
-else:
-    logger.info("SmartProxy credentials not set – running direct-only mode")
+    logger.info("Loaded %d Decodo proxy endpoints", len(PROXIES))
+
+# --- 3️⃣  If neither provider configured run in direct‑only mode ------------
+if not PROXIES:
+    logger.info("No proxy provider configured – running direct‑only mode")
 
 # deterministic cycle through proxies
 _PROXY_CYCLE = itertools.cycle(PROXIES) if PROXIES else None
@@ -143,10 +176,10 @@ def fetch_ytdlp(video_id: str, proxy_url: Optional[str]) -> Optional[str]:
 
 # ---------------------------------------------------------------------------
 # Shuffle proxies on each request to avoid being rate limited or blocked by endpoint reuse.
-def get_transcript(video_id: str, max_attempts: int = 0) -> str:
+def get_transcript(video_id: str, max_attempts: int = 4) -> str:
     # scale attempts to proxy count if caller passes max_attempts=0
     if max_attempts == 0:
-        max_attempts = MAX_PROXY_ATTEMPTS or ((1 if not DISABLE_DIRECT else 0) + len(PROXIES))
+        max_attempts = (1 if not DISABLE_DIRECT else 0) + len(PROXIES)
 
     attempts = [] if DISABLE_DIRECT else [None]      # None = direct attempt
     # add enough proxies to reach max_attempts
