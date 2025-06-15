@@ -42,9 +42,7 @@ if WS_USER and WS_PASS:
         WS_USER = f"{WS_USER}-rotate"
     PROXY_CFG = WebshareProxyConfig(
         proxy_username=WS_USER,
-        proxy_password=WS_PASS,
-        proxy_domain="p.webshare.io",
-        proxy_port=80
+        proxy_password=WS_PASS
     )
     logger.info("Using Webshare rotating residential proxies (username=%s)", WS_USER)
 else:
