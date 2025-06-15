@@ -18,7 +18,7 @@ from youtube_transcript_api import (
     RequestBlocked,
     AgeRestricted,
 )
-from youtube_transcript_api.proxies import GenericProxyConfig
+from youtube_transcript_api.proxies import WebshareProxyConfig
 from youtube_transcript_api._errors import CouldNotRetrieveTranscript
 from yt_dlp import YoutubeDL
 
@@ -32,78 +32,19 @@ logger = logging.getLogger("TranscriptService")
 DISABLE_DIRECT = os.getenv("FORCE_PROXY", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
-# Webshare rotating proxy pool ----------------------------------------------
-WS_TOKEN = os.getenv("WEBSHARE_TOKEN")
+# Webshare rotating residential proxy (recommended by youtube‑transcript‑api)
+WS_USER = os.getenv("WEBSHARE_USER")
+WS_PASS = os.getenv("WEBSHARE_PASS")
 
-# ---------------------------------------------------------------------------
-# Decodo (SmartProxy) rotating proxy pool ------------------------------------
-SP_USER = os.getenv("SMARTPROXY_USER")
-SP_PASS = os.getenv("SMARTPROXY_PASS")
-SP_HOST = "gate.decodo.com"
-
-# sticky ports (10001–10010), rotating port (10000)
-ROTATING_PORT = 10000
-STICKY_PORTS = list(range(10001, 10011))  # safe for yt-dlp
-
-PROXIES: List[str] = []
-
-# --- 1️⃣  Webshare takes precedence if token is provided --------------------
-if WS_TOKEN:
-    try:
-        _tmp: List[str] = []
-        page = 1
-        while True:
-            r = requests.get(
-                "https://proxy.webshare.io/api/v2/proxy/list/",
-                params={"mode": "direct", "page": page, "page_size": 25},
-                headers={"Authorization": f"Token {WS_TOKEN}"},
-                timeout=10,
-            )
-            r.raise_for_status()
-            data = r.json()
-            for p in data.get("results", []):
-                user = p["username"]
-                pwd = requests.utils.quote(p["password"], safe="")
-                addr = p["proxy_address"]
-                port = p["port"]
-                _tmp.append(f"http://{user}:{pwd}@{addr}:{port}")
-            if not data.get("next"):
-                break
-            page += 1
-        PROXIES = _tmp
-        logger.info("Loaded %d Webshare proxy endpoints", len(PROXIES))
-    except Exception as e:
-        logger.error("Failed to load Webshare proxies: %s – falling back to Decodo if configured", e)
-
-# --- 2️⃣  Fall back to Decodo credentials if still no proxies ---------------
-if not PROXIES and SP_USER and SP_PASS:
-    encoded_pass = requests.utils.quote(SP_PASS, safe="")
-    PROXIES = [
-        f"http://{SP_USER}:{encoded_pass}@{SP_HOST}:{port}"
-        for port in STICKY_PORTS + [ROTATING_PORT]
-    ]
-    logger.info("Loaded %d Decodo proxy endpoints", len(PROXIES))
-
-# --- 3️⃣  If neither provider configured run in direct‑only mode ------------
-if not PROXIES:
-    logger.info("No proxy provider configured – running direct‑only mode")
-
-# deterministic cycle through proxies
-_PROXY_CYCLE = itertools.cycle(PROXIES) if PROXIES else None
-
-def next_proxy() -> Optional[str]:
-    if not _PROXY_CYCLE:
-        return None  # direct
-    return next(_PROXY_CYCLE)
-
-# helper to convert raw URL into GenericProxyConfig (runtime-safe)
-
-def make_proxy_cfg(url: str) -> GenericProxyConfig:
-    # GenericProxyConfig signature changed around v1.0 – test attributes
-    try:
-        return GenericProxyConfig(https_url=url, http_url=url)
-    except TypeError:
-        return GenericProxyConfig(https=url, http=url)  # legacy fallback
+PROXY_CFG = None
+if WS_USER and WS_PASS:
+    PROXY_CFG = WebshareProxyConfig(
+        proxy_username=WS_USER,
+        proxy_password=WS_PASS,
+    )
+    logger.info("Using Webshare rotating residential proxies")
+else:
+    logger.info("No Webshare credentials – requests will go direct")
 
 # ---------------------------------------------------------------------------
 # Helper – validate YouTube video IDs (11 chars)
@@ -115,10 +56,9 @@ def valid_vid(vid: str) -> bool:
 # ---------------------------------------------------------------------------
 # Primary fetch via youtube-transcript-api (v1.x compliant)
 
-def fetch_api_once(video_id: str, proxy_url: Optional[str], timeout: int = 10,
+def fetch_api_once(video_id: str, proxy_cfg, timeout: int = 10,
                    languages: Optional[List[str]] = None) -> Optional[str]:
     languages = languages or ["en", "es"]
-    proxy_cfg = make_proxy_cfg(proxy_url) if proxy_url else None
 
     # list_transcripts parameters vary across versions: filter dynamically
     from inspect import signature
@@ -178,37 +118,24 @@ def fetch_ytdlp(video_id: str, proxy_url: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Shuffle proxies on each request to avoid being rate limited or blocked by endpoint reuse.
 def get_transcript(video_id: str, max_attempts: int = 4) -> str:
-    # scale attempts to proxy count if caller passes max_attempts=0
-    if max_attempts == 0:
-        max_attempts = (1 if not DISABLE_DIRECT else 0) + len(PROXIES)
+    try:
+        text = fetch_api_once(video_id, PROXY_CFG)
+        if text:
+            return text
+    except (RequestBlocked, CouldNotRetrieveTranscript,
+            VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
+        logger.warning("API blocked: %s", e.__class__.__name__)
+    except Exception as e:
+        logger.error("Unexpected API error: %s", e)
 
-    attempts = [] if DISABLE_DIRECT else [None]      # None = direct attempt
-    # add enough proxies to reach max_attempts
-    room = max_attempts - len(attempts)
-    if room > 0 and PROXIES:
-        attempts += random.sample(PROXIES, min(room, len(PROXIES)))
+    proxy_url = None
+    if WS_USER and WS_PASS:
+        quoted = requests.utils.quote(WS_PASS, safe="")
+        proxy_url = f"http://{WS_USER}:{quoted}@residential.webshare.io:80"
 
-    random.shuffle(attempts)
-    # 1️⃣ try youtube-transcript-api
-    for idx, p_url in enumerate(attempts, 1):
-        try:
-            logger.info("[API] Attempt %d/%d via %s", idx, len(attempts), p_url or "direct")
-            txt = fetch_api_once(video_id, p_url)
-            if txt:
-                return txt
-        except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable,
-                AgeRestricted, TranscriptsDisabled) as e:
-            logger.warning("Blocked on %s: %s", p_url or "direct", e.__class__.__name__)
-            continue
-        except Exception as e:
-            logger.error("Unexpected API error (%s): %s", p_url or "direct", e)
-            continue
-
-    # 2️⃣ fallback to yt-dlp
-    for p_url in attempts:  # reuse same endpoint order
-        txt = fetch_ytdlp(video_id, p_url)
-        if txt:
-            return txt
+    text = fetch_ytdlp(video_id, proxy_url)
+    if text:
+        return text
     raise NoTranscriptFound(video_id, [], None)
 
 # ---------------------------------------------------------------------------
