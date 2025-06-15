@@ -196,6 +196,15 @@ else:
 PROXY_ROTATION = [{"http": proxy_url, "https": proxy_url} for proxy_url in ROTATING_PROXIES] if ROTATING_PROXIES else [{}]
 _proxy_cycle = itertools.cycle(PROXY_ROTATION)
 
+# ------------------------------------------------------------------
+# If the caller didn't set TRANSCRIPT_PROXY_ATTEMPTS explicitly,
+# default to one attempt per configured proxy endpoint.
+if not os.getenv("TRANSCRIPT_PROXY_ATTEMPTS"):
+    TRANSCRIPT_PROXY_ATTEMPTS = len(ROTATING_PROXIES)
+    logger.info("TRANSCRIPT_PROXY_ATTEMPTS not set; using %d (one per proxy port)",
+                TRANSCRIPT_PROXY_ATTEMPTS)
+# ------------------------------------------------------------------
+
 
 # --- HTTP Session with Retries ---
 session = requests.Session()
