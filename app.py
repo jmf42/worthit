@@ -30,8 +30,7 @@ from youtube_transcript_api import (
     NoTranscriptFound,
     RequestBlocked,
     VideoUnavailable,
-    AgeRestricted,             # NEW – future‑proof exception
-    TooManyRequests            # NEW – future‑proof exception
+    AgeRestricted             # NEW – future‑proof exception
 )
 from youtube_transcript_api.proxies import GenericProxyConfig
 # ---------------------------------------------------------------------------
