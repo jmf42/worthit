@@ -40,17 +40,15 @@ SP_USER = os.getenv("SMARTPROXY_USER")
 SP_PASS = os.getenv("SMARTPROXY_PASS")
 SP_HOST = "gate.decodo.com"
 
-# sticky ports (10001–10010), rotating port (10000)
-ROTATING_PORT = 10000
-STICKY_PORTS = list(range(10001, 10011))  # safe for yt-dlp
+ROTATING_PORT = 7000            # Decodo “rotating” port for fresh residential IPs
+STICKY_PORTS: list[int] = []   # no sticky ports for YouTube
 
 PROXIES: List[str] = []
 
 if SP_USER and SP_PASS:
     encoded_pass = requests.utils.quote(SP_PASS, safe="")
     PROXIES = [
-        f"http://{SP_USER}:{encoded_pass}@{SP_HOST}:{port}"
-        for port in STICKY_PORTS + [ROTATING_PORT]
+        f"http://{SP_USER}:{encoded_pass}@{SP_HOST}:{ROTATING_PORT}"
     ]
     logger.info("Loaded %d Decodo proxy endpoints: %s", len(PROXIES), PROXIES)
 else:
