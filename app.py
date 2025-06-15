@@ -53,13 +53,11 @@ if SP_USER and SP_PASS:
 else:
     logger.info("SmartProxy credentials not set – running direct-only mode")
 
-# deterministic cycle through proxies
-_PROXY_CYCLE = itertools.cycle(PROXIES) if PROXIES else None
-
+# randomized proxy strategy – avoids endpoint reuse detection
 def next_proxy() -> Optional[str]:
-    if not _PROXY_CYCLE:
-        return None  # direct
-    return next(_PROXY_CYCLE)
+    if not PROXIES:
+        return None
+    return random.choice(PROXIES)
 
 # helper to convert raw URL into GenericProxyConfig (runtime-safe)
 
@@ -151,7 +149,7 @@ def get_transcript(video_id: str, max_attempts: int = 4) -> str:
     # add enough proxies to reach max_attempts
     room = max_attempts - len(attempts)
     if room > 0 and PROXIES:
-        attempts += random.sample(PROXIES, min(room, len(PROXIES)))
+        attempts += random.choices(PROXIES, k=room)
 
     # 1️⃣ try youtube-transcript-api
     for idx, p_url in enumerate(attempts, 1):
