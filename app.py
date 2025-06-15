@@ -18,7 +18,7 @@ from youtube_transcript_api import (
     RequestBlocked,
     AgeRestricted,
 )
-from youtube_transcript_api.proxies import GenericProxyConfig
+from youtube_transcript_api.proxies import WebshareProxyConfig
 from youtube_transcript_api._errors import CouldNotRetrieveTranscript
 from yt_dlp import YoutubeDL
 
@@ -35,19 +35,14 @@ DISABLE_DIRECT = os.getenv("FORCE_PROXY", "false").lower() == "true"
 # Webshare rotating residential gateway
 WS_USER = os.getenv("WEBSHARE_USER")
 WS_PASS = os.getenv("WEBSHARE_PASS")
-WS_HOST = os.getenv("WEBSHARE_HOST", "p.webshare.io")
-
-# Ensure -rotate suffix on proxy username
-if WS_USER and not WS_USER.endswith("-rotate"):
-    WS_USER = f"{WS_USER}-rotate"
 
 PROXY_CFG = None
 if WS_USER and WS_PASS:
-    quoted_pass = requests.utils.quote(WS_PASS, safe="")
-    # Webshare rotating residential gateway host
-    proxy_url = f"http://{WS_USER}:{quoted_pass}@p.webshare.io:80"
-    PROXY_CFG = GenericProxyConfig(http_url=proxy_url, https_url=proxy_url)
-    logger.info("Using Webshare rotating residential proxies via %s", proxy_url)
+    # ensure the rotate‑endpoint username
+    if not WS_USER.endswith("-rotate"):
+        WS_USER = f"{WS_USER}-rotate"
+    PROXY_CFG = WebshareProxyConfig(proxy_username=WS_USER, proxy_password=WS_PASS)
+    logger.info("Using Webshare rotating residential proxies (username=%s)", WS_USER)
 else:
     logger.info("No Webshare credentials – requests will go direct")
 
@@ -63,39 +58,33 @@ def valid_vid(vid: str) -> bool:
 
 def fetch_api_once(video_id: str, proxy_cfg, timeout: int = 10,
                    languages: Optional[List[str]] = None) -> Optional[str]:
+    """
+    One shot via youtube‑transcript‑api using the provided proxy config.
+    Newer versions return a FetchedTranscript object, older ones a list[dict].
+    """
     languages = languages or ["en", "es"]
 
-    # list_transcripts parameters vary across versions: filter dynamically
-    from inspect import signature
-    list_sig = signature(YouTubeTranscriptApi.list_transcripts)
-    kwargs = {"video_id": video_id, "proxy_config": proxy_cfg, "timeout": timeout}
-    filtered = {k: v for k, v in kwargs.items() if k in list_sig.parameters}
+    ytt_api = YouTubeTranscriptApi(proxy_config=proxy_cfg, timeout=timeout)
+    try:
+        ft = ytt_api.fetch(video_id, languages=languages)
+    except NoTranscriptFound:
+        return None
 
-    tl = YouTubeTranscriptApi.list_transcripts(**filtered)
-
-    # prefer manually provided captions, then autos
-    for finder in (tl.find_transcript, tl.find_generated_transcript):
-        try:
-            tr = finder(languages)
-        except NoTranscriptFound:
-            continue
-        # fetch(); if v1.x returns FetchedTranscript convert to raw
-        segments = tr.fetch()
-        if hasattr(segments, "to_raw_data"):
-            segments = segments.to_raw_data()
-        text = " ".join(
-            seg.get("text") if isinstance(seg, dict) else getattr(seg, "text", "")
-            for seg in segments
-        ).strip()
-        if text:
-            return text
-    return None
+    # unify to plain text string
+    if hasattr(ft, "to_raw_data"):
+        segments = ft.to_raw_data()
+    else:
+        segments = ft
+    return " ".join(
+        seg["text"] if isinstance(seg, dict) else getattr(seg, "text", "")
+        for seg in segments
+    ).strip() or None
 
 # ---------------------------------------------------------------------------
 # yt-dlp subtitle fallback ---------------------------------------------------
 
 def fetch_ytdlp(video_id: str, proxy_url: Optional[str]) -> Optional[str]:
-    logger.info("[yt-dlp] Attempt via %s", proxy_url or "direct")
+    logger.info("[yt-dlp] Attempt via proxy")
     opts = {
         "quiet": True,
         "skip_download": True,
@@ -133,12 +122,7 @@ def get_transcript(video_id: str, max_attempts: int = 4) -> str:
     except Exception as e:
         logger.error("Unexpected API error: %s", e)
 
-    proxy_url = None
-    if WS_USER and WS_PASS:
-        quoted = requests.utils.quote(WS_PASS, safe="")
-        proxy_url = f"http://{WS_USER}:{quoted}@{WS_HOST}:80"
-
-    text = fetch_ytdlp(video_id, proxy_url)
+    text = fetch_ytdlp(video_id, None)   # yt-dlp goes direct; it will likely fail on age‑gated vids
     if text:
         return text
     raise NoTranscriptFound(video_id, [], None)
