@@ -184,7 +184,8 @@ if SMARTPROXY_USER and SMARTPROXY_PASS and SMARTPROXY_HOST and SMARTPROXY_PORTS_
     # The password contains special characters, so it's crucial to URL-encode it.
     encoded_pass = urllib.parse.quote_plus(SMARTPROXY_PASS)
     ROTATING_PROXIES = [
-        f"http://{SMARTPROXY_USER}:{encoded_pass}@{SMARTPROXY_HOST}:7000"
+        f"http://{SMARTPROXY_USER}:{encoded_pass}@{SMARTPROXY_HOST}:{p.strip()}"
+        for p in SMARTPROXY_PORTS_STR.split(",") if p.strip()
     ]
     logger.info(f"Proxy rotation configured with {len(ROTATING_PROXIES)} residential endpoints.")
 else:
@@ -565,7 +566,7 @@ def _fetch_transcript_resilient(video_id: str) -> str:
                 logger.info("[API] Success for %s via %s", video_id, log_proxy_name)
                 return txt
         except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable,
-                AgeRestricted, TooManyRequests) as e:
+                AgeRestricted) as e:
             logger.warning("[API] Blocked/Failed on %s: %s. Retrying...", log_proxy_name, e.__class__.__name__)
             time.sleep(1.5)
         except NoTranscriptFound:
