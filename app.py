@@ -1,4 +1,3 @@
-
 import os
 import logging
 import re
@@ -142,8 +141,7 @@ def fetch_ytdlp(video_id: str, proxy_url: Optional[str]) -> Optional[str]:
             return None
 
 # ---------------------------------------------------------------------------
-# Orchestrator ----------------------------------------------------------------
-
+# Shuffle proxies on each request to avoid being rate limited or blocked by endpoint reuse.
 def get_transcript(video_id: str, max_attempts: int = 4) -> str:
     # scale attempts to proxy count if caller passes max_attempts=0
     if max_attempts == 0:
@@ -152,8 +150,8 @@ def get_transcript(video_id: str, max_attempts: int = 4) -> str:
     attempts = [] if DISABLE_DIRECT else [None]      # None = direct attempt
     # add enough proxies to reach max_attempts
     room = max_attempts - len(attempts)
-    for _ in range(min(room, len(PROXIES))):
-        attempts.append(next_proxy())
+    if room > 0 and PROXIES:
+        attempts += random.sample(PROXIES, min(room, len(PROXIES)))
 
     # 1️⃣ try youtube-transcript-api
     for idx, p_url in enumerate(attempts, 1):
