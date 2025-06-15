@@ -32,9 +32,14 @@ logger = logging.getLogger("TranscriptService")
 DISABLE_DIRECT = os.getenv("FORCE_PROXY", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
-# Webshare rotating residential proxy (recommended by youtube‑transcript‑api)
+# Webshare rotating residential gateway
 WS_USER = os.getenv("WEBSHARE_USER")
 WS_PASS = os.getenv("WEBSHARE_PASS")
+WS_HOST = os.getenv("WEBSHARE_HOST", "p.webshare.io")
+
+# Ensure -rotate suffix on proxy username
+if WS_USER and not WS_USER.endswith("-rotate"):
+    WS_USER = f"{WS_USER}-rotate"
 
 PROXY_CFG = None
 if WS_USER and WS_PASS:
@@ -131,7 +136,7 @@ def get_transcript(video_id: str, max_attempts: int = 4) -> str:
     proxy_url = None
     if WS_USER and WS_PASS:
         quoted = requests.utils.quote(WS_PASS, safe="")
-        proxy_url = f"http://{WS_USER}:{quoted}@residential.webshare.io:80"
+        proxy_url = f"http://{WS_USER}:{quoted}@{WS_HOST}:80"
 
     text = fetch_ytdlp(video_id, proxy_url)
     if text:
