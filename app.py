@@ -18,7 +18,7 @@ from youtube_transcript_api import (
     RequestBlocked,
     AgeRestricted,
 )
-from youtube_transcript_api.proxies import WebshareProxyConfig
+from youtube_transcript_api.proxies import GenericProxyConfig
 from youtube_transcript_api._errors import CouldNotRetrieveTranscript
 from yt_dlp import YoutubeDL
 
@@ -43,11 +43,11 @@ if WS_USER and not WS_USER.endswith("-rotate"):
 
 PROXY_CFG = None
 if WS_USER and WS_PASS:
-    PROXY_CFG = WebshareProxyConfig(
-        proxy_username=WS_USER,
-        proxy_password=WS_PASS,
-    )
-    logger.info("Using Webshare rotating residential proxies")
+    quoted_pass = requests.utils.quote(WS_PASS, safe="")
+    # Webshare rotating residential gateway host
+    proxy_url = f"http://{WS_USER}:{quoted_pass}@p.webshare.io:80"
+    PROXY_CFG = GenericProxyConfig(http_url=proxy_url, https_url=proxy_url)
+    logger.info("Using Webshare rotating residential proxies via %s", proxy_url)
 else:
     logger.info("No Webshare credentials – requests will go direct")
 
