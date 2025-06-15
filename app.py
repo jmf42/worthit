@@ -38,10 +38,14 @@ WS_PASS = os.getenv("WEBSHARE_PASS")
 
 PROXY_CFG = None
 if WS_USER and WS_PASS:
-    # ensure the rotate‑endpoint username
     if not WS_USER.endswith("-rotate"):
         WS_USER = f"{WS_USER}-rotate"
-    PROXY_CFG = WebshareProxyConfig(proxy_username=WS_USER, proxy_password=WS_PASS)
+    PROXY_CFG = WebshareProxyConfig(
+        proxy_username=WS_USER,
+        proxy_password=WS_PASS,
+        proxy_domain="p.webshare.io",
+        proxy_port=80
+    )
     logger.info("Using Webshare rotating residential proxies (username=%s)", WS_USER)
 else:
     logger.info("No Webshare credentials – requests will go direct")
