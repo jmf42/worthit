@@ -35,6 +35,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from yt_dlp import YoutubeDL
 
+import functools
+
 # --- Patch for youtube-transcript-api compatibility ---
 import inspect
 
