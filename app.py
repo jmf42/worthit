@@ -57,10 +57,6 @@ def _list_transcripts_safe(video_id: str, **kwargs):
 from youtube_comment_downloader import YoutubeCommentDownloader
 from flask import send_from_directory
 
-# --- Ensure logger is defined early ---
-logger = logging.getLogger("WorthItService")
-logger.setLevel(logging.INFO)
-logging.basicConfig(level=logging.INFO)
 
 # --- Configuration ---
 APP_NAME = "WorthItService"
@@ -69,6 +65,8 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", str(min(4, (os.cpu_count() or 1)))))
 COMMENT_LIMIT = int(os.getenv("COMMENT_LIMIT", "50"))
 TRANSCRIPT_CACHE_SIZE = int(os.getenv("TRANSCRIPT_CACHE_SIZE", "200"))
 TRANSCRIPT_CACHE_TTL = int(os.getenv("TRANSCRIPT_CACHE_TTL", "7200")) # 2 hours
+# Preferred languages for transcript API (comma‑separated env var)
+TRANSCRIPT_LANGS = os.getenv("TRANSCRIPT_LANGS", "en").split(",")
 #
 # Transcript tuning
 TRANSCRIPT_HTTP_TIMEOUT   = int(os.getenv("TRANSCRIPT_HTTP_TIMEOUT", "15"))
@@ -352,7 +350,7 @@ def fetch_api_once(video_id: str,
                    timeout: int = 10,
                    languages: Optional[List[str]] = None) -> Optional[str]:
     """Single attempt using youtube-transcript-api. Returns plain text or None."""
-    languages = languages or ["en", "es"]
+    languages = languages or TRANSCRIPT_LANGS
     ytt_api = YouTubeTranscriptApi(proxy_config=proxy_cfg)
     try:
         ft = ytt_api.fetch(video_id, languages=languages)
@@ -360,6 +358,11 @@ def fetch_api_once(video_id: str,
         return None
 
     segments = ft.to_raw_data() if hasattr(ft, "to_raw_data") else ft
+    # Log a clear success message so we know this path was taken
+    if segments:
+        logger.info("✅ youtube-transcript-api SUCCESS for %s (%d chars)",
+                    video_id, len(" ".join(seg["text"] if isinstance(seg, dict) else getattr(seg, "text", "")
+                                  for seg in segments)))
     return " ".join(
         seg["text"] if isinstance(seg, dict) else getattr(seg, "text", "")
         for seg in segments
@@ -411,12 +414,14 @@ def get_transcript(video_id: str) -> str:
 
     txt = fetch_ytdlp(video_id, None)
     if txt:
+        logger.info("✅ yt-dlp FALLBACK SUCCESS (no proxy) for %s (%d chars)", video_id, len(txt))
         return txt
 
     if PROXY_CFG:
         gateway_url = f"http://{WS_USER}:{WS_PASS}@proxy.webshare.io:80"
         txt = fetch_ytdlp(video_id, gateway_url)
         if txt:
+            logger.info("✅ yt-dlp FALLBACK SUCCESS (proxy) for %s (%d chars)", video_id, len(txt))
             return txt
 
     raise NoTranscriptFound(video_id, [], None)
@@ -467,7 +472,7 @@ def _fetch_comments_downloader(video_id: str, use_proxy: bool = False) -> list[s
                 break
 
         if comments_text:
-            logger.info("Fetched %d comments via youtube-comment-downloader for %s", len(comments_text), video_id)
+            logger.debug("Fetched %d comments via youtube-comment-downloader for %s", len(comments_text), video_id)
             return comments_text
         logger.warning("No comments returned by youtube-comment-downloader for %s", video_id)
         return []
@@ -518,39 +523,33 @@ def _fetch_comments_resilient(video_id: str) -> list[str]:
     5. Finally, try Piped API as the last resort.
     """
     logger.info("Initiating resilient comment fetch for %s", video_id)
-    logger.info("Fetching comments with primary youtube-comment-downloader for %s", video_id)
+    # Primary: youtube-comment-downloader (no proxy)
     comments = _fetch_comments_downloader(video_id, False)
     if comments:
-        logger.info("Fetched %d comments via youtube-comment-downloader (primary) for %s", len(comments), video_id)
+        logger.info("✅ Comments (primary): %d via youtube-comment-downloader for %s", len(comments), video_id)
         return comments[:COMMENT_LIMIT]
-    logger.info("Primary fetcher returned no comments, falling back to yt-dlp for %s", video_id)
+    # Fallback: yt-dlp (no proxy)
     comments = _fetch_comments_yt_dlp(video_id, False)
     if comments:
-        logger.info("Fetched %d comments via yt-dlp (fallback)", len(comments), video_id)
+        logger.info("✅ Comments (fallback): %d via yt-dlp (no proxy) for %s", len(comments), video_id)
         return comments[:COMMENT_LIMIT]
-
-    # Tier 3: Try yt-dlp with proxy
-    logger.info("Fallback to yt-dlp with proxy for %s", video_id)
+    # Fallback: yt-dlp (proxy)
     comments = _fetch_comments_yt_dlp(video_id, True)
     if comments:
-        logger.info("Fetched %d comments via yt-dlp (proxy fallback)", len(comments), video_id)
+        logger.info("✅ Comments (proxy): %d via yt-dlp for %s", len(comments), video_id)
         return comments[:COMMENT_LIMIT]
-
-    # Tier 4: Try youtube-comment-downloader with proxy
-    logger.info("Fallback to youtube-comment-downloader with proxy for %s", video_id)
+    # Fallback: youtube-comment-downloader (proxy)
     comments = _fetch_comments_downloader(video_id, True)
     if comments:
-        logger.info("Fetched %d comments via youtube-comment-downloader (proxy fallback)", len(comments), video_id)
+        logger.info("✅ Comments (proxy): %d via youtube-comment-downloader for %s", len(comments), video_id)
         return comments[:COMMENT_LIMIT]
-
-    # Tier 5: Piped API
+    # Fallback: Piped API
     piped_data = _fetch_from_alternative_api(PIPED_HOSTS, f"/comments/{video_id}", _PIPE_COOLDOWN)
     if piped_data and "comments" in piped_data:
         comments_text = [c.get("commentText") for c in piped_data["comments"] if c.get("commentText")]
         if comments_text:
-            logger.info("Fetched %d comments via Piped API for %s", len(comments_text), video_id)
+            logger.info("✅ Comments (piped): %d via piped API for %s", len(comments_text), video_id)
             return comments_text[:COMMENT_LIMIT]
-
     logger.warning("All comment sources failed for video %s. Returning empty list.", video_id)
     return []
 
@@ -656,6 +655,7 @@ def get_transcript_endpoint():
     if cached is not None:
         if cached == "__NOT_AVAILABLE__":
             return jsonify({"error": "Transcript not available"}), 404
+        logger.info("📄 Transcript cache HIT (RAM) for %s", video_id)
         return jsonify({"video_id": video_id, "text": cached}), 200
 
     # Try persistent cache
@@ -665,6 +665,7 @@ def get_transcript_endpoint():
             transcript_cache[video_id] = cached
             if cached == "__NOT_AVAILABLE__":
                 return jsonify({"error": "Transcript not available"}), 404
+            logger.info("📄 Transcript cache HIT (disk) for %s", video_id)
             return jsonify({"video_id": video_id, "text": cached}), 200
 
     # Try fetch (max 7s)
@@ -681,7 +682,7 @@ def get_transcript_endpoint():
                 db[video_id] = "__NOT_AVAILABLE__"
         return jsonify({"error": "Transcript not available"}), 404
     except Exception as e:
-        logger.error(f"Transcript fetch failed for {video_id}: {e}")
+        logger.error("❌ Transcript fetch failed for %s: %s", video_id, e)
         return jsonify({"error": "Transcript fetch failed"}), 500
 
 @app.route("/comments", methods=["GET"])
@@ -712,7 +713,7 @@ def get_comments_endpoint():
             db[video_id] = comments
         return jsonify({"video_id": video_id, "comments": comments}), 200
     except Exception as e:
-        logger.error(f"Comment fetch failed for {video_id}: {e}")
+        logger.error("❌ Comment fetch failed for %s: %s", video_id, e)
         return jsonify({"error": "Comment fetch failed"}), 500
 
 @app.route("/openai/responses", methods=["POST"])
@@ -743,14 +744,14 @@ def openai_proxy():
         payload_text_copy = payload['text'].copy()
         payload_text_copy.pop('input', None)
         logged_payload['text_other_fields'] = payload_text_copy
-    
-    logger.info(f"Proxying to OpenAI. Model: {payload.get('model', 'N/A')}. Payload (scrubbed): {json.dumps(logged_payload)}")
+
+    logger.info("🤖 OpenAI proxy → model=%s | scrubbed payload=%s", payload.get("model", "N/A"), json.dumps(logged_payload))
 
     openai_endpoint = "https://api.openai.com/v1/responses" # Keep as original
 
     try:
         resp = session.post(openai_endpoint, headers=headers, json=payload, timeout=15) # 15 s UX-budget
-        logger.info(f"OpenAI API response status: {resp.status_code}")
+        logger.info("✅ OpenAI response → %d for model=%s", resp.status_code, payload.get("model", "N/A"))
 
         if resp.status_code != 200:
             error_content = resp.text[:1000] # Log part of the error
@@ -762,12 +763,12 @@ def openai_proxy():
                 return jsonify({'error': detailed_error, 'details': error_json}), resp.status_code
             except json.JSONDecodeError:
                 return jsonify({'error': 'OpenAI API error', 'details': error_content}), resp.status_code
-        
+
         response_data = resp.json()
         # Log a snippet of the successful response for debugging structure
         response_preview = {k: (str(v)[:100] + '...' if isinstance(v, (str, list, dict)) and len(str(v)) > 100 else v) for k,v in response_data.items()}
         logger.debug(f"OpenAI successful response preview: {json.dumps(response_preview)}")
-        
+
         return jsonify(response_data), resp.status_code
 
     except requests.exceptions.Timeout:
