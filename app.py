@@ -12,7 +12,7 @@ import pathlib
 from typing import List, Optional
 from functools import lru_cache
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future, as_completed
 
 
 from flask import Flask, request, jsonify
@@ -34,6 +34,8 @@ import requests
 import shutil
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from urllib.parse import urljoin
+
 from yt_dlp import YoutubeDL
 
 import functools
@@ -146,6 +148,7 @@ def setup_logging():
     fh.setFormatter(fh_formatter)
     logger.addHandler(fh)
     
+    logging.getLogger("urllib3.connectionpool").setLevel(logging.INFO)
     return logger
 
 logger = setup_logging()
@@ -298,6 +301,7 @@ _YDL_OPTS_BASE = {
     "ignoreerrors": True, "no_playlist": True, "writeinfojson": False,
     "writesubtitles": True, "writeautomaticsub": True,
     "extractor_args": {"youtube": ["player_client=ios"]},
+    "subtitlesformat": "best[ext=srv3]/best[ext=vtt]/best[ext=srt]",
     **({"cookiefile": YTDL_COOKIE_FILE} if YTDL_COOKIE_FILE else {}),
 }
 
@@ -400,45 +404,113 @@ def fetch_ytdlp(video_id: str, proxy_url: Optional[str]) -> Optional[str]:
             return None
 
 # ---------------------------------------------------------------------------
-# Unified entry point --------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Parallel alternative API fallback: fetch from multiple APIs in parallel
+from cachetools import cached, TTLCache
+
+# Cache for instance lists (1 hour TTL, up to 10 different endpoints)
+instance_cache = TTLCache(maxsize=10, ttl=3600)
+
+@cached(instance_cache)
+def fetch_live_instances(api_url):
+    try:
+        response = session.get(api_url, timeout=5)
+        response.raise_for_status()
+        # For piped, the API returns a list of dicts with "api_url" and "active"
+        # For invidious, the API returns a list of [url, info] where info["health"] and info["monitor"]["status"] may exist
+        if "piped" in api_url:
+            # Piped API
+            return [instance["api_url"].rstrip("/") for instance in response.json() if instance.get("api_url") and instance.get("active")]
+        elif "invidious" in api_url:
+            # Invidious API (https://api.invidious.io/instances.json?sort_by=health)
+            return [
+                url.rstrip("/")
+                for url, info in response.json()
+                if info.get("type") == "https" and info.get("health", 0) > 0 and info.get("monitor", {}).get("status") == "online"
+            ]
+        else:
+            return []
+    except Exception as e:
+        logger.warning(f"Failed to fetch instances from {api_url}: {e}")
+        return []
+
+def _fetch_transcript_alternatives(video_id: str) -> str | None:
+    """
+    Attempt to fetch transcript from multiple alternative APIs (Piped direct, Piped, Invidious) in parallel.
+    Returns transcript text if any succeed, else None.
+    """
+    piped_instances = fetch_live_instances("https://piped-instances.kavin.rocks/")
+    invidious_instances = fetch_live_instances("https://api.invidious.io/instances.json?sort_by=health")
+
+    fetchers = [
+        lambda vid=video_id: _piped_captions_direct(vid, piped_instances),
+        lambda vid=video_id: _piped_captions(vid, piped_instances),
+        lambda vid=video_id: _invidious_captions(vid, invidious_instances)
+    ]
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(fetcher): fetcher.__name__ for fetcher in fetchers}
+        for future in as_completed(futures, timeout=6):
+            try:
+                result = future.result()
+                if result:
+                    logger.info("✅ Alternative API transcript succeeded for %s", video_id)
+                    return result
+            except Exception as e:
+                logger.warning("Transcript fetch via %s failed: %s", futures[future], e)
+    logger.warning("All alternative API transcript fetchers failed for %s", video_id)
+    return None
+
+# ---------------------------------------------------------------------------
+# Unified transcript fetching with clear fallback steps and logging
 def get_transcript(video_id: str) -> str:
-    """Best‑effort transcript fetch using the new logic, with fallback to Piped and Invidious captions."""
+    """
+    Transcript fetch logic with explicit, concise fallback steps:
+    1. Try youtube-transcript-api (proxy if configured)
+    2. Try alternative APIs in parallel (Piped direct, Piped, Invidious)
+    3. Try yt-dlp (no proxy)
+    4. Try yt-dlp (with proxy)
+    Raise NoTranscriptFound if all fail.
+    """
+    # Step 1: Try youtube-transcript-api (with proxy if configured)
     try:
         txt = fetch_api_once(video_id, PROXY_CFG)
         if txt:
+            logger.info("✅ Primary transcript fetch succeeded via youtube-transcript-api for %s", video_id)
             return txt
-    except (RequestBlocked, CouldNotRetrieveTranscript,
-            VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
-        logger.warning("youtube-transcript-api blocked: %s", e.__class__.__name__)
-    except Exception as e:
-        logger.error("Unexpected youtube-transcript-api error: %s", e)
+        else:
+            logger.info("Primary transcript fetch failed: No transcript found via youtube-transcript-api for %s", video_id)
+    except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
+        logger.warning("Primary transcript fetch blocked or failed for %s: %s", video_id, e)
 
-    # Fallback: Try Piped captions
-    txt = _piped_captions(video_id)
+    # Step 2: Try alternative APIs in parallel
+    txt = _fetch_transcript_alternatives(video_id)
     if txt:
-        logger.info("✅ Piped captions fallback for %s (%d chars)", video_id, len(txt))
+        logger.info("✅ Fallback transcript fetch succeeded via alternative APIs for %s", video_id)
         return txt
+    else:
+        logger.info("Alternative APIs fallback failed: No transcript found for %s", video_id)
 
-    # Fallback: Try Invidious captions
-    txt = _invidious_captions(video_id)
-    if txt:
-        logger.info("✅ Invidious captions fallback for %s (%d chars)", video_id, len(txt))
-        return txt
-
-    # Fallback: yt-dlp (no proxy)
+    # Step 3: Try yt-dlp (no proxy)
     txt = fetch_ytdlp(video_id, None)
     if txt:
-        logger.info("✅ yt-dlp FALLBACK SUCCESS (no proxy) for %s (%d chars)", video_id, len(txt))
+        logger.info("✅ Fallback transcript fetch succeeded via yt-dlp (no proxy) for %s", video_id)
         return txt
+    else:
+        logger.info("yt-dlp (no proxy) fallback failed: No transcript found for %s", video_id)
 
-    # Fallback: yt-dlp (proxy)
-    if PROXY_CFG:
-        gateway_url = f"http://{WS_USER}:{WS_PASS}@proxy.webshare.io:80"
-        txt = fetch_ytdlp(video_id, gateway_url)
+    # Step 4: Try yt-dlp (with proxy)
+    proxy_url = _gateway_url()
+    if proxy_url:
+        txt = fetch_ytdlp(video_id, proxy_url)
         if txt:
-            logger.info("✅ yt-dlp FALLBACK SUCCESS (proxy) for %s (%d chars)", video_id, len(txt))
+            logger.info("✅ Fallback transcript fetch succeeded via yt-dlp (with proxy) for %s", video_id)
             return txt
+        else:
+            logger.info("yt-dlp (with proxy) fallback failed: No transcript found for %s", video_id)
 
+    # All methods failed
+    logger.error("❌ All transcript fetch methods failed for %s. Raising NoTranscriptFound.", video_id)
     raise NoTranscriptFound(video_id, [], None)
 
 # --- Transcript Fallback Helpers ---
@@ -446,78 +518,139 @@ def _strip_tags(text: str) -> str:
     """Remove HTML/XML tags from a string."""
     return re.sub(r"<[^>]+>", "", text)
 
-def _piped_captions(video_id: str) -> str | None:
-    """Try to get captions from Piped API."""
-    try:
-        resp = _fetch_from_alternative_api(PIPED_HOSTS, f"/streams/{video_id}", _PIPE_COOLDOWN)
-        if not resp or "subtitles" not in resp or not resp["subtitles"]:
-            return None
-        # Prefer English or first available
-        subs = resp["subtitles"]
-        en_sub = next((s for s in subs if s.get("language", "").lower().startswith("en")), None)
-        chosen = en_sub or subs[0]
-        url = chosen.get("url")
-        if not url:
-            return None
-        r = session.get(url, timeout=5)
-        r.raise_for_status()
-        # Try to extract text from .vtt or .srv3
-        data = r.text
-        if url.endswith(".vtt"):
-            # Remove cues and timestamps, keep text lines
-            lines = [l.strip() for l in data.splitlines() if l and not l.startswith("WEBVTT") and not re.match(r"^\d\d:\d\d", l)]
-            text = " ".join(_strip_tags(l) for l in lines if not re.match(r"^\d+$", l))
-            return text.strip() or None
-        elif url.endswith(".srv3") or "<text" in data:
-            # XML format
-            return " ".join(html.unescape(t) for t in re.findall(r">([^<]+)</text>", data)).strip() or None
-        else:
-            return None
-    except Exception as e:
-        logger.warning("Piped captions fallback failed for %s: %s", video_id, e)
+def _piped_captions_direct(video_id: str, hosts: list[str]) -> str | None:
+    """
+    Try to get captions directly from a list of Piped API instances.
+    """
+    if not hosts:
+        logger.warning("No Piped hosts available for direct captions for %s", video_id)
         return None
-
-def _invidious_captions(video_id: str) -> str | None:
-    """Try to get captions from Invidious API."""
-    invidious_hosts = [
-        "https://invidious.snopyta.org", "https://invidious.privacydev.net",
-        "https://invidious.kavin.rocks", "https://invidious.tiekoetter.com"
-    ]
-    for host in itertools.cycle(invidious_hosts):
+    for host in hosts:
         try:
-            url = f"{host}/api/v1/captions/{video_id}"
-            r = session.get(url, timeout=5)
-            if r.status_code == 404:
+            meta = session.get(f"{host}/api/v1/captions/{video_id}", timeout=4)
+            if meta.status_code == 404:
                 return None
-            r.raise_for_status()
-            data = r.json()
-            if not data or "captions" not in data or not data["captions"]:
-                return None
-            # Prefer English or first available
-            subs = data["captions"]
-            en_sub = next((s for s in subs if s.get("languageCode", "").lower().startswith("en")), None)
-            chosen = en_sub or subs[0]
-            url2 = chosen.get("url")
-            if not url2:
-                return None
-            r2 = session.get(url2, timeout=5)
-            r2.raise_for_status()
-            # .vtt or .srv3 or .srt
-            text = r2.text
-            if url2.endswith(".vtt"):
-                lines = [l.strip() for l in text.splitlines() if l and not l.startswith("WEBVTT") and not re.match(r"^\d\d:\d\d", l)]
-                return " ".join(_strip_tags(l) for l in lines if not re.match(r"^\d+$", l)).strip() or None
-            elif url2.endswith(".srv3") or "<text" in text:
-                return " ".join(html.unescape(t) for t in re.findall(r">([^<]+)</text>", text)).strip() or None
-            elif url2.endswith(".srt"):
-                # Remove SRT timestamps and indexes
-                lines = [l.strip() for l in text.splitlines() if l and not re.match(r"^\d+$", l) and "-->" not in l]
-                return " ".join(lines).strip() or None
-            else:
-                return None
+            meta.raise_for_status()
+            data = meta.json()
+            subs = data.get("captions") or []
+            if not subs:
+                continue
+            chosen = next(
+                (s for s in subs if s.get("language", "").lower().startswith("en")),
+                subs[0]
+            )
+            url = chosen.get("url")
+            if not url:
+                continue
+            if url.startswith("//"):
+                url = "https:" + url
+            raw = session.get(url, timeout=4).text
+            text = " ".join(html.unescape(t) for t in re.findall(r">([^<]+)</text>", raw)).strip()
+            if text:
+                return text
         except Exception as e:
-            logger.warning("Invidious captions fallback failed for %s: %s", video_id, e)
+            logger.debug("Piped captions host %s failed: %s", host, e)
             continue
+    logger.warning("All direct Piped caption mirrors failed for %s", video_id)
+    return None
+
+def _piped_captions(video_id: str, hosts: list[str]) -> str | None:
+    """Try to get captions from Piped API using a list of hosts."""
+    if not hosts:
+        logger.warning("No Piped hosts available for fallback captions for %s", video_id)
+        return None
+    # Use a simple round-robin, try each host in order
+    for host in hosts:
+        try:
+            resp = session.get(f"{host}/streams/{video_id}", timeout=4)
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            if "subtitles" not in data or not data["subtitles"]:
+                continue
+            subs = data["subtitles"]
+            en_sub = next((s for s in subs if s.get("language", "").lower().startswith("en")), None)
+            chosen = en_sub or subs[0]
+            url = chosen.get("url")
+            if not url:
+                continue
+            r = session.get(url, timeout=5)
+            r.raise_for_status()
+            data_text = r.text
+            if url.endswith(".vtt"):
+                lines = [l.strip() for l in data_text.splitlines() if l and not l.startswith("WEBVTT") and not re.match(r"^\d\d:\d\d", l)]
+                text = " ".join(_strip_tags(l) for l in lines if not re.match(r"^\d+$", l))
+                return text.strip() or None
+            elif url.endswith(".srv3") or "<text" in data_text:
+                return " ".join(html.unescape(t) for t in re.findall(r">([^<]+)</text>", data_text)).strip() or None
+            else:
+                continue
+        except Exception as e:
+            logger.debug("Piped fallback captions host %s failed: %s", host, e)
+            continue
+    logger.warning("All fallback Piped API hosts failed for %s", video_id)
+    return None
+
+def _invidious_captions(video_id: str, hosts: list[str]) -> str | None:
+    """
+    Fetch captions from a list of Invidious mirrors.
+    • One attempt per host (no endless cycle / retry storm)
+    • Normalises relative caption URLs returned by some mirrors
+    • Logs individual host failures at DEBUG level only; a single
+      WARNING is emitted if *all* hosts fail.
+    """
+    if not hosts:
+        logger.warning("No Invidious hosts available for captions for %s", video_id)
+        return None
+    for host in hosts:
+        try:
+            meta_url = f"{host}/api/v1/captions/{video_id}"
+            meta_resp = session.get(meta_url, timeout=5)
+            if meta_resp.status_code == 404:
+                # Video has no captions at all; no need to probe others
+                return None
+            meta_resp.raise_for_status()
+            meta_json = meta_resp.json()
+            subs = meta_json.get("captions") or []
+            if not subs:
+                continue
+            # Prefer English, otherwise first available
+            chosen = next(
+                (s for s in subs if s.get("languageCode", "").lower().startswith("en")),
+                subs[0],
+            )
+            rel_url = chosen.get("url")
+            if not rel_url:
+                continue
+            # Some mirrors return a relative path → make it absolute
+            caption_url = rel_url if rel_url.startswith("http") else urljoin(host, rel_url)
+            cap_resp = session.get(caption_url, timeout=5)
+            cap_resp.raise_for_status()
+            raw = cap_resp.text
+            # --- basic format sniffing / parsing ---
+            if caption_url.endswith(".vtt"):
+                lines = [
+                    l.strip()
+                    for l in raw.splitlines()
+                    if l and not l.startswith("WEBVTT") and not re.match(r"^\d\d:\d\d", l)
+                ]
+                return " ".join(_strip_tags(l) for l in lines if not re.match(r"^\d+$", l)).strip() or None
+            if caption_url.endswith(".srv3") or "<text" in raw:
+                return " ".join(html.unescape(t) for t in re.findall(r">([^<]+)</text>", raw)).strip() or None
+            if caption_url.endswith(".srt"):
+                lines = [
+                    l.strip()
+                    for l in raw.splitlines()
+                    if l and "-->" not in l and not re.match(r"^\d+$", l)
+                ]
+                return " ".join(lines).strip() or None
+            # Unknown format → skip to next mirror
+            continue
+        except Exception as exc:
+            logger.debug("Invidious host %s failed: %s", host, exc)
+            continue  # try next mirror
+    logger.warning("All Invidious caption mirrors failed for %s", video_id)
     return None
 
 def _get_or_spawn_transcript(video_id: str) -> str:
