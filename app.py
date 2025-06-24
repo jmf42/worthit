@@ -1,4 +1,5 @@
 import os
+import itertools
 import shelve
 import re
 import json
@@ -401,7 +402,7 @@ def fetch_ytdlp(video_id: str, proxy_url: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Unified entry point --------------------------------------------------------
 def get_transcript(video_id: str) -> str:
-    """Best‑effort transcript fetch using the new logic."""
+    """Best‑effort transcript fetch using the new logic, with fallback to Piped and Invidious captions."""
     try:
         txt = fetch_api_once(video_id, PROXY_CFG)
         if txt:
@@ -412,11 +413,25 @@ def get_transcript(video_id: str) -> str:
     except Exception as e:
         logger.error("Unexpected youtube-transcript-api error: %s", e)
 
+    # Fallback: Try Piped captions
+    txt = _piped_captions(video_id)
+    if txt:
+        logger.info("✅ Piped captions fallback for %s (%d chars)", video_id, len(txt))
+        return txt
+
+    # Fallback: Try Invidious captions
+    txt = _invidious_captions(video_id)
+    if txt:
+        logger.info("✅ Invidious captions fallback for %s (%d chars)", video_id, len(txt))
+        return txt
+
+    # Fallback: yt-dlp (no proxy)
     txt = fetch_ytdlp(video_id, None)
     if txt:
         logger.info("✅ yt-dlp FALLBACK SUCCESS (no proxy) for %s (%d chars)", video_id, len(txt))
         return txt
 
+    # Fallback: yt-dlp (proxy)
     if PROXY_CFG:
         gateway_url = f"http://{WS_USER}:{WS_PASS}@proxy.webshare.io:80"
         txt = fetch_ytdlp(video_id, gateway_url)
@@ -425,6 +440,85 @@ def get_transcript(video_id: str) -> str:
             return txt
 
     raise NoTranscriptFound(video_id, [], None)
+
+# --- Transcript Fallback Helpers ---
+def _strip_tags(text: str) -> str:
+    """Remove HTML/XML tags from a string."""
+    return re.sub(r"<[^>]+>", "", text)
+
+def _piped_captions(video_id: str) -> str | None:
+    """Try to get captions from Piped API."""
+    try:
+        resp = _fetch_from_alternative_api(PIPED_HOSTS, f"/streams/{video_id}", _PIPE_COOLDOWN)
+        if not resp or "subtitles" not in resp or not resp["subtitles"]:
+            return None
+        # Prefer English or first available
+        subs = resp["subtitles"]
+        en_sub = next((s for s in subs if s.get("language", "").lower().startswith("en")), None)
+        chosen = en_sub or subs[0]
+        url = chosen.get("url")
+        if not url:
+            return None
+        r = session.get(url, timeout=5)
+        r.raise_for_status()
+        # Try to extract text from .vtt or .srv3
+        data = r.text
+        if url.endswith(".vtt"):
+            # Remove cues and timestamps, keep text lines
+            lines = [l.strip() for l in data.splitlines() if l and not l.startswith("WEBVTT") and not re.match(r"^\d\d:\d\d", l)]
+            text = " ".join(_strip_tags(l) for l in lines if not re.match(r"^\d+$", l))
+            return text.strip() or None
+        elif url.endswith(".srv3") or "<text" in data:
+            # XML format
+            return " ".join(html.unescape(t) for t in re.findall(r">([^<]+)</text>", data)).strip() or None
+        else:
+            return None
+    except Exception as e:
+        logger.warning("Piped captions fallback failed for %s: %s", video_id, e)
+        return None
+
+def _invidious_captions(video_id: str) -> str | None:
+    """Try to get captions from Invidious API."""
+    invidious_hosts = [
+        "https://invidious.snopyta.org", "https://invidious.privacydev.net",
+        "https://invidious.kavin.rocks", "https://invidious.tiekoetter.com"
+    ]
+    for host in itertools.cycle(invidious_hosts):
+        try:
+            url = f"{host}/api/v1/captions/{video_id}"
+            r = session.get(url, timeout=5)
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            data = r.json()
+            if not data or "captions" not in data or not data["captions"]:
+                return None
+            # Prefer English or first available
+            subs = data["captions"]
+            en_sub = next((s for s in subs if s.get("languageCode", "").lower().startswith("en")), None)
+            chosen = en_sub or subs[0]
+            url2 = chosen.get("url")
+            if not url2:
+                return None
+            r2 = session.get(url2, timeout=5)
+            r2.raise_for_status()
+            # .vtt or .srv3 or .srt
+            text = r2.text
+            if url2.endswith(".vtt"):
+                lines = [l.strip() for l in text.splitlines() if l and not l.startswith("WEBVTT") and not re.match(r"^\d\d:\d\d", l)]
+                return " ".join(_strip_tags(l) for l in lines if not re.match(r"^\d+$", l)).strip() or None
+            elif url2.endswith(".srv3") or "<text" in text:
+                return " ".join(html.unescape(t) for t in re.findall(r">([^<]+)</text>", text)).strip() or None
+            elif url2.endswith(".srt"):
+                # Remove SRT timestamps and indexes
+                lines = [l.strip() for l in text.splitlines() if l and not re.match(r"^\d+$", l) and "-->" not in l]
+                return " ".join(lines).strip() or None
+            else:
+                return None
+        except Exception as e:
+            logger.warning("Invidious captions fallback failed for %s: %s", video_id, e)
+            continue
+    return None
 
 def _get_or_spawn_transcript(video_id: str) -> str:
     """
