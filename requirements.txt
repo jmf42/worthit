@@ -16,4 +16,4 @@ MarkupSafe==3.0.2
 vaderSentiment==3.3.2
 youtube-comment-downloader==0.1.76 
 sqlitedict>=2.1
-yt-dlp==2025.06.09
+yt-dlp==2025.06.25
