@@ -200,7 +200,7 @@ def get_random_user_agent_header():
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
-CORS(app) # Allow all origins for simplicity in this context
+
 
 # Rate Limiting
 RATELIMIT_STORAGE_URI = os.getenv("RATELIMIT_STORAGE_URI") # e.g., redis://localhost:6379/0
@@ -684,7 +684,13 @@ def _fetch_comments_downloader(video_id: str, use_proxy: bool = False) -> list[s
     logger.debug("Attempting comments via youtube-comment-downloader for %s", video_id)
     try:
         # Using a new downloader instance per call to avoid state issues if any
-        downloader = YoutubeCommentDownloader()
+        proxy_url = _gateway_url()
+        downloader_kwargs = {}
+        if use_proxy and proxy_url:
+            downloader_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+            logger.debug("youtube-comment-downloader: using proxy %s for %s", proxy_url, video_id)
+
+        downloader = YoutubeCommentDownloader(**downloader_kwargs)
         comments_generator = downloader.get_comments_from_url(
             f"https://www.youtube.com/watch?v={video_id}",
             sort_by=0,    # 0 for top (popular) comments
