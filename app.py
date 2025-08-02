@@ -1060,6 +1060,9 @@ def privacy(): return send_from_directory("static", "privacy.html")
 @app.route("/terms")
 def terms(): return send_from_directory("static", "terms.html")
 
+@app.route("/support")
+def support(): return send_from_directory("static", "support.html")
+
 
 # --- Cleanup on Exit ---
 def cleanup_on_exit():
