@@ -978,12 +978,23 @@ def openai_proxy():
         payload_text_copy.pop('input', None)
         logged_payload['text_other_fields'] = payload_text_copy
 
+    # --- GPT-5 compatibility: strip unsupported params & adjust timeout ---
+    model = str(payload.get("model", ""))
+    if model.startswith("gpt-5-"):
+        # Remove unsupported parameters for GPT-5 Responses API
+        if "temperature" in payload:
+            payload.pop("temperature", None)
+        # Allow more time for nano/mini which can be slower to return
+        proxy_timeout = 60
+    else:
+        proxy_timeout = 15
+
     logger.info("🤖 OpenAI proxy → model=%s | scrubbed payload=%s", payload.get("model", "N/A"), json.dumps(logged_payload))
 
     openai_endpoint = "https://api.openai.com/v1/responses" # Keep as original
 
     try:
-        resp = session.post(openai_endpoint, headers=headers, json=payload, timeout=15) # 15 s UX-budget
+        resp = session.post(openai_endpoint, headers=headers, json=payload, timeout=proxy_timeout)
         logger.info("✅ OpenAI response → %d for model=%s", resp.status_code, payload.get("model", "N/A"))
 
         if resp.status_code != 200:
