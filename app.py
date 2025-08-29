@@ -16,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future, as_comp
 
 
 from flask import Flask, request, jsonify
+from flask import g
+import uuid
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
     TranscriptsDisabled,
@@ -29,6 +31,7 @@ from cachetools import TTLCache
 from logging.handlers import RotatingFileHandler
 from flask_cors import CORS
 from flask_limiter import Limiter
+from flask_limiter.errors import RateLimitExceeded
 from flask_limiter.util import get_remote_address
 import requests
 import shutil
@@ -216,6 +219,41 @@ if RATELIMIT_STORAGE_URI:
 else:
     logger.warning("Rate limiting using in-memory storage (not recommended for production scale).")
 limiter = Limiter(**limiter_kwargs)
+
+# --------- Request context + structured logging helpers ---------
+def _client_ip():
+    try:
+        ip = request.headers.get('CF-Connecting-IP') or request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+        return ip or request.remote_addr or 'unknown'
+    except Exception:
+        return 'unknown'
+
+def log_event(level: str, event: str, **fields):
+    payload = {"event": event, "request_id": getattr(g, 'request_id', None), **fields}
+    line = f"{APP_NAME}:{event} " + json.dumps(payload, default=str)
+    if level == 'debug': logger.debug(line)
+    elif level == 'warning': logger.warning(line)
+    elif level == 'error': logger.error(line)
+    else: logger.info(line)
+
+@app.before_request  # type: ignore
+def _before_request():
+    g.request_id = uuid.uuid4().hex[:12]
+    g.started_at = time.perf_counter()
+    g.ip = _client_ip()
+    g.country = _client_country()
+    g.client = _client_agent()
+    log_event('info', 'request_start', method=request.method, path=request.path, ip=g.ip, country=g.country, client=g.client)
+
+@app.after_request  # type: ignore
+def _after_request(response):
+    try:
+        dur_ms = int((time.perf_counter() - getattr(g, 'started_at', time.perf_counter())) * 1000)
+        response.headers['X-Request-ID'] = getattr(g, 'request_id', '') or ''
+        log_event('info', 'request_end', method=request.method, path=request.path, status=response.status_code, duration_ms=dur_ms, ip=getattr(g, 'ip', 'unknown'), country=getattr(g, 'country', 'unknown'))
+    except Exception:
+        pass
+    return response
 
 # --- Caches & Worker Pool ---
 transcript_cache = TTLCache(maxsize=TRANSCRIPT_CACHE_SIZE, ttl=TRANSCRIPT_CACHE_TTL)
@@ -872,12 +910,15 @@ def _background_comment_worker(video_id: str):
 @app.route("/transcript", methods=["GET"])
 @limiter.limit("1000/hour;200/minute")  # Increased limits for transcript endpoint
 def get_transcript_endpoint():
+    t0 = time.perf_counter()
     video_url_or_id = request.args.get("videoId", "")
     if not video_url_or_id:
+        log_event('warning', 'transcript_missing_video_id', ip=g.ip)
         return jsonify({"error": "videoId parameter is missing"}), 400
 
     video_id = extract_video_id(video_url_or_id)
     if not video_id:
+        log_event('warning', 'transcript_invalid_video_id', raw=video_url_or_id, ip=g.ip)
         return jsonify({"error": "Invalid videoId format or URL"}), 400
 
     
@@ -887,8 +928,9 @@ def get_transcript_endpoint():
     cached = transcript_cache.get(video_id)
     if cached is not None:
         if cached == "__NOT_AVAILABLE__":
+            log_event('info', 'transcript_cache_miss_marker', video_id=video_id)
             return jsonify({"error": "Transcript not available"}), 404
-        logger.info("📄 Transcript cache HIT (RAM) for %s", video_id)
+        log_event('info', 'transcript_cache_hit', video_id=video_id, text_len=len(cached))
         return jsonify({"video_id": video_id, "text": cached}), 200
 
     # Try persistent cache
@@ -897,8 +939,9 @@ def get_transcript_endpoint():
         if cached is not None:
             transcript_cache[video_id] = cached
             if cached == "__NOT_AVAILABLE__":
+                log_event('info', 'transcript_persisted_not_available', video_id=video_id)
                 return jsonify({"error": "Transcript not available"}), 404
-            logger.info("📄 Transcript cache HIT (disk) for %s", video_id)
+            log_event('info', 'transcript_persisted_hit', video_id=video_id, text_len=len(cached))
             return jsonify({"video_id": video_id, "text": cached}), 200
 
     # Try fetch (max 7s)
@@ -907,15 +950,17 @@ def get_transcript_endpoint():
         transcript_cache[video_id] = text
         with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
             db[video_id] = text
+        log_event('info', 'transcript_fetched', video_id=video_id, text_len=len(text), duration_ms=int((time.perf_counter()-t0)*1000))
         return jsonify({"video_id": video_id, "text": text}), 200
     except NoTranscriptFound:
         if video_id not in transcript_cache:
             transcript_cache[video_id] = "__NOT_AVAILABLE__"
             with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
                 db[video_id] = "__NOT_AVAILABLE__"
+        log_event('warning', 'transcript_not_found', video_id=video_id, duration_ms=int((time.perf_counter()-t0)*1000))
         return jsonify({"error": "Transcript not available"}), 404
     except Exception as e:
-        logger.error("❌ Transcript fetch failed for %s: %s", video_id, e)
+        log_event('error', 'transcript_fetch_failed', video_id=video_id, error=str(e), duration_ms=int((time.perf_counter()-t0)*1000))
         return jsonify({"error": "Transcript fetch failed"}), 500
 
 @app.route("/comments", methods=["GET"])
@@ -931,12 +976,14 @@ def get_comments_endpoint():
 
     cached = comment_cache.get(video_id)
     if cached is not None:
+        log_event('info', 'comments_cache_hit', video_id=video_id, count=len(cached))
         return jsonify({"video_id": video_id, "comments": cached}), 200
 
     with shelve.open(PERSISTENT_COMMENT_DB) as db:
         cached = db.get(video_id)
         if cached is not None:
             comment_cache[video_id] = cached
+            log_event('info', 'comments_persisted_hit', video_id=video_id, count=len(cached))
             return jsonify({"video_id": video_id, "comments": cached}), 200
 
     try:
@@ -944,9 +991,10 @@ def get_comments_endpoint():
         comment_cache[video_id] = comments
         with shelve.open(PERSISTENT_COMMENT_DB) as db:
             db[video_id] = comments
+        log_event('info', 'comments_fetched', video_id=video_id, count=len(comments), duration_ms=int((time.perf_counter()-t0)*1000))
         return jsonify({"video_id": video_id, "comments": comments}), 200
     except Exception as e:
-        logger.error("❌ Comment fetch failed for %s: %s", video_id, e)
+        log_event('error', 'comments_fetch_failed', video_id=video_id, error=str(e), duration_ms=int((time.perf_counter()-t0)*1000))
         return jsonify({"error": "Comment fetch failed"}), 500
 
 @app.route("/openai/responses", methods=["POST"])
@@ -989,17 +1037,25 @@ def openai_proxy():
     else:
         proxy_timeout = 15
 
-    logger.info("🤖 OpenAI proxy → model=%s | scrubbed payload=%s", payload.get("model", "N/A"), json.dumps(logged_payload))
+    t0 = time.perf_counter()
+    model_for_log = payload.get("model", "N/A")
+    log_event('info', 'openai_proxy_request', model=model_for_log, payload=logged_payload)
 
     openai_endpoint = "https://api.openai.com/v1/responses" # Keep as original
 
     try:
         resp = session.post(openai_endpoint, headers=headers, json=payload, timeout=proxy_timeout)
-        logger.info("✅ OpenAI response → %d for model=%s", resp.status_code, payload.get("model", "N/A"))
+        dur_ms = int((time.perf_counter() - t0) * 1000)
+        usage = None
+        try:
+            usage = resp.json().get('usage')
+        except Exception:
+            usage = None
+        log_event('info', 'openai_proxy_response', model=model_for_log, status=resp.status_code, duration_ms=dur_ms, usage=usage)
 
         if resp.status_code != 200:
             error_content = resp.text[:1000] # Log part of the error
-            logger.error(f"OpenAI API error {resp.status_code}. Body: {error_content}")
+            log_event('error', 'openai_proxy_error', model=model_for_log, status=resp.status_code, body_snippet=error_content)
             # Try to parse standard OpenAI error for clearer message to client
             try:
                 error_json = resp.json()
@@ -1009,20 +1065,19 @@ def openai_proxy():
                 return jsonify({'error': 'OpenAI API error', 'details': error_content}), resp.status_code
 
         response_data = resp.json()
-        # Log a snippet of the successful response for debugging structure
         response_preview = {k: (str(v)[:100] + '...' if isinstance(v, (str, list, dict)) and len(str(v)) > 100 else v) for k,v in response_data.items()}
-        logger.debug(f"OpenAI successful response preview: {json.dumps(response_preview)}")
+        log_event('debug', 'openai_proxy_preview', model=model_for_log, preview=response_preview)
 
         return jsonify(response_data), resp.status_code
 
     except requests.exceptions.Timeout:
-        logger.error("Request to OpenAI API timed out.")
+        log_event('error', 'openai_proxy_timeout', model=model_for_log)
         return jsonify({'error': 'Request to OpenAI timed out'}), 504
     except requests.exceptions.RequestException as e:
-        logger.error(f"Network error communicating with OpenAI: {e}", exc_info=True)
+        log_event('error', 'openai_proxy_network_error', model=model_for_log, error=str(e))
         return jsonify({'error': 'Network error with OpenAI service'}), 503
     except Exception as e:
-        logger.error(f"Unexpected error in OpenAI proxy: {e}", exc_info=True)
+        log_event('error', 'openai_proxy_unexpected', model=model_for_log, error=str(e))
         return jsonify({'error': 'Internal server error during OpenAI proxy'}), 500
 
 # --- Retrieve a stored OpenAI response by ID ---------------------------------
