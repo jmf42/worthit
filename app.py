@@ -1162,9 +1162,12 @@ def openai_proxy():
 
         def _iter_sse():
             client_disconnected = False
+            first_event_sent = False
             try:
                 # Open upstream stream
-                upstream = session.post(openai_endpoint, headers=headers, json=payload, timeout=proxy_timeout, stream=True)
+                up_headers = dict(headers)
+                up_headers["Accept"] = "text/event-stream"
+                upstream = session.post(openai_endpoint, headers=up_headers, json=payload, timeout=proxy_timeout, stream=True)
                 if upstream.status_code != 200:
                     # Emit a single SSE error event and return
                     txt = upstream.text[:1000]
@@ -1183,6 +1186,10 @@ def openai_proxy():
                             # heartbeat when None (requests may yield None on keep-alive)
                             continue
                         yield raw + "\n"
+                        if not first_event_sent:
+                            first_event_sent = True
+                            t_first = int((time.perf_counter() - t0) * 1000)
+                            log_event('info', 'openai_proxy_first_event', model=model_for_log, duration_ms=t_first)
                     except GeneratorExit:
                         client_disconnected = True
                         break
