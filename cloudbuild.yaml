@@ -1,14 +1,11 @@
-
 steps:
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-    entrypoint: bash
+  - name: 'gcr.io/buildpacks/builder'
     args:
-      - -lc
-      - |
-        gcloud run deploy worthit \
-          --source . \
-          --region europe-west1 \
-          --allow-unauthenticated \
-          --project $PROJECT_ID
+      - build
+      - "--builder=gcr.io/buildpacks/builder"
+      - "--env"
+      - "GOOGLE_ENTRYPOINT=gunicorn -b :$PORT main:app --workers=2 --timeout=120"
+      - "--path"
+      - "."
 images:
   - "europe-west1-docker.pkg.dev/$PROJECT_ID/worthit-repo/worthit:$COMMIT_SHA"
