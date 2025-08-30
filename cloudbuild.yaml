@@ -1,0 +1,27 @@
+substitutions:
+  _IMAGE: "europe-west1-docker.pkg.dev/$PROJECT_ID/worthit-repo/worthit:$COMMIT_SHA"
+
+steps:
+  - name: 'gcr.io/buildpacks/builder'
+    args:
+      - build
+      - ${_IMAGE}
+      - "--builder=gcr.io/buildpacks/builder"
+      - "--env"
+      - "GOOGLE_ENTRYPOINT=gunicorn -b 0.0.0.0:8080 main:app --workers=2 --timeout=120"
+      - "--path"
+      - "."
+
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    args:
+      - run
+      - deploy
+      - worthit
+      - --image=${_IMAGE}
+      - --region=europe-west1
+      - --allow-unauthenticated
+      - --project=$PROJECT_ID
+      - --timeout=120
+
+images:
+  - ${_IMAGE}
