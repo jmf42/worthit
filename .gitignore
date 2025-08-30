@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Cache
+persistent_cache/
+
+# Backup artifacts
+*.sb-*
