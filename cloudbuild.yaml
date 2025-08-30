@@ -1,0 +1,13 @@
+steps:
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: bash
+    args:
+      - -lc
+      - |
+        gcloud run deploy worthit \
+          --source . \
+          --region europe-west1 \
+          --allow-unauthenticated \
+          --project $PROJECT_ID
+images:
+  - "europe-west1-docker.pkg.dev/$PROJECT_ID/worthit-repo/worthit:$COMMIT_SHA"
