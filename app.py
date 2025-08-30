@@ -277,7 +277,12 @@ def _before_request():
     g.request_id = uuid.uuid4().hex[:12]
     g.started_at = time.perf_counter()
     g.ip = _client_ip()
-    g.country = _client_country()
+    # Be defensive: in case of mismatched deployments where `_client_country`
+    # isn’t available yet, avoid 500s and default gracefully.
+    try:
+        g.country = _client_country()
+    except NameError:
+        g.country = 'unknown'
     g.client = _client_agent()
     log_event('info', 'request_start', method=request.method, path=request.path, ip=g.ip, country=g.country, client=g.client)
 
