@@ -1178,8 +1178,10 @@ atexit.register(cleanup_on_exit)
 
 # --- Run App ---
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5020)) # Changed port slightly from 5010
+    port = int(os.environ.get("PORT", 8080))  # Cloud Run expects $PORT, default 8080
     logger.info(f"Starting {APP_NAME} on port {port}")
-    # Use Waitress or Gunicorn for production instead of Flask's built-in server
-    # For Render, it usually handles this.
     app.run(host="0.0.0.0", port=port, threaded=True)
+
+# For Cloud Run / Gunicorn
+if __name__ != "__main__":
+    gunicorn_app = app
