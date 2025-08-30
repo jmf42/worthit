@@ -10,3 +10,7 @@ persistent_cache/
 
 # Backup artifacts
 *.sb-*
+
+__pycache__/
+logs/
+tests/
