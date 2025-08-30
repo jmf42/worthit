@@ -16,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future, as_comp
 
 
 from flask import Flask, request, jsonify
+from flask import make_response
+from flask import make_response
 from flask import g
 import uuid
 from youtube_transcript_api import (
@@ -203,6 +205,10 @@ def get_random_user_agent_header():
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
+_cors_origins_env = os.getenv("WORTHIT_CORS_ORIGINS", "*")
+_cors_origins = [o.strip() for o in _cors_origins_env.split(",")] if _cors_origins_env != "*" else "*"
+CORS(app, resources={r"/*": {"origins": _cors_origins}})
+app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_CONTENT_LENGTH_BYTES", str(2 * 1024 * 1024)))
 
 
 # Rate Limiting
@@ -250,6 +256,12 @@ def _after_request(response):
     try:
         dur_ms = int((time.perf_counter() - getattr(g, 'started_at', time.perf_counter())) * 1000)
         response.headers['X-Request-ID'] = getattr(g, 'request_id', '') or ''
+        # Security headers applied to JSON responses only (avoid breaking static pages)
+        if response.mimetype == 'application/json':
+            response.headers['X-Content-Type-Options'] = 'nosniff'
+            response.headers['Referrer-Policy'] = 'no-referrer'
+            response.headers['Permissions-Policy'] = 'interest-cohort=()'
+            response.headers['Content-Security-Policy'] = "default-src 'none'"
         log_event('info', 'request_end', method=request.method, path=request.path, status=response.status_code, duration_ms=dur_ms, ip=getattr(g, 'ip', 'unknown'), country=getattr(g, 'country', 'unknown'))
     except Exception:
         pass
@@ -944,24 +956,43 @@ def get_transcript_endpoint():
             log_event('info', 'transcript_persisted_hit', video_id=video_id, text_len=len(cached))
             return jsonify({"video_id": video_id, "text": cached}), 200
 
-    # Try fetch (max 7s)
-    try:
-        text = get_transcript(video_id)
-        transcript_cache[video_id] = text
-        with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
-            db[video_id] = text
-        log_event('info', 'transcript_fetched', video_id=video_id, text_len=len(text), duration_ms=int((time.perf_counter()-t0)*1000))
-        return jsonify({"video_id": video_id, "text": text}), 200
-    except NoTranscriptFound:
-        if video_id not in transcript_cache:
-            transcript_cache[video_id] = "__NOT_AVAILABLE__"
+    # Try fetch with short retry/backoff on transient errors
+    attempts = 0
+    last_err = None
+    while attempts < 2:
+        try:
+            text = get_transcript(video_id)
+            transcript_cache[video_id] = text
             with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
-                db[video_id] = "__NOT_AVAILABLE__"
-        log_event('warning', 'transcript_not_found', video_id=video_id, duration_ms=int((time.perf_counter()-t0)*1000))
-        return jsonify({"error": "Transcript not available"}), 404
-    except Exception as e:
-        log_event('error', 'transcript_fetch_failed', video_id=video_id, error=str(e), duration_ms=int((time.perf_counter()-t0)*1000))
-        return jsonify({"error": "Transcript fetch failed"}), 500
+                db[video_id] = text
+            log_event('info', 'transcript_fetched', video_id=video_id, text_len=len(text), duration_ms=int((time.perf_counter()-t0)*1000))
+            resp = make_response(jsonify({"video_id": video_id, "text": text}), 200)
+            resp.headers['Cache-Control'] = 'public, max-age=3600'
+            return resp
+        except NoTranscriptFound:
+            if video_id not in transcript_cache:
+                transcript_cache[video_id] = "__NOT_AVAILABLE__"
+                with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
+                    db[video_id] = "__NOT_AVAILABLE__"
+            log_event('warning', 'transcript_not_found', video_id=video_id, duration_ms=int((time.perf_counter()-t0)*1000))
+            resp = make_response(jsonify({"error": "Transcript not available"}), 404)
+            resp.headers['Cache-Control'] = 'public, max-age=600'
+            return resp
+        except requests.exceptions.RequestException as e:
+            # Transient network/SSL errors – backoff and retry once
+            attempts += 1
+            last_err = e
+            time.sleep(0.5 * attempts)
+            continue
+        except Exception as e:
+            # Non-retryable internal error
+            log_event('error', 'transcript_fetch_failed', video_id=video_id, error=str(e), duration_ms=int((time.perf_counter()-t0)*1000))
+            return jsonify({"error": "Transcript fetch failed"}), 500
+    # Retries exhausted → treat as not available
+    log_event('warning', 'transcript_unavailable_after_retry', video_id=video_id, error=str(last_err) if last_err else None, duration_ms=int((time.perf_counter()-t0)*1000))
+    resp = make_response(jsonify({"error": "Transcript not available"}), 404)
+    resp.headers['Cache-Control'] = 'public, max-age=600'
+    return resp
 
 @app.route("/comments", methods=["GET"])
 @limiter.limit("120/hour;20/minute")  # Limits for comments endpoint
