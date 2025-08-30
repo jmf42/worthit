@@ -134,32 +134,48 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # --- Logging Setup ---
 def setup_logging():
-    # Use /tmp/logs for Cloud Run writeability; allow override.
-    log_dir = os.getenv("LOG_DIR", "/tmp/logs")
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, "app_server.log")
-
-    logging.basicConfig(level=logging.WARNING) # Keep external libraries less verbose
+    """
+    Configure a single JSON logger to stdout with no propagation to avoid
+    duplicates under Gunicorn. Root stays at WARNING to keep 3rd‑party quiet.
+    
+    Cloud Run best practice: write to stdout/stderr only; avoid local files.
+    """
+    # Root for libraries
+    logging.basicConfig(level=logging.WARNING)
 
     logger = logging.getLogger(APP_NAME)
     logger.setLevel(LOG_LEVEL)
+    # Prevent messages from bubbling to root/gunicorn handlers (duplication)
+    logger.propagate = False
+    # Ensure a single handler
     if logger.hasHandlers():
         logger.handlers.clear()
-    # Console Handler
+
+    class JsonFormatter(logging.Formatter):
+        def format(self, record: logging.LogRecord) -> str:
+            try:
+                base = getattr(record, "structured", None)
+                if not isinstance(base, dict):
+                    # Fallback – wrap record message
+                    base = {"message": record.getMessage()}
+                base.setdefault("logger", APP_NAME)
+                base.setdefault("severity", record.levelname)
+                return json.dumps(base, default=str, ensure_ascii=False)
+            except Exception:
+                return json.dumps({
+                    "logger": APP_NAME,
+                    "severity": record.levelname,
+                    "message": record.getMessage(),
+                }, ensure_ascii=False)
+
     ch = logging.StreamHandler()
     ch.setLevel(LOG_LEVEL)
-    ch_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s (%(filename)s:%(lineno)d)')
-    ch.setFormatter(ch_formatter)
+    ch.setFormatter(JsonFormatter())
     logger.addHandler(ch)
 
-    # File Handler
-    fh = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
-    fh.setLevel(LOG_LEVEL)
-    fh_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s (%(filename)s:%(lineno)d)')
-    fh.setFormatter(fh_formatter)
-    logger.addHandler(fh)
-    
+    # Keep noisy libs contained
     logging.getLogger("urllib3.connectionpool").setLevel(logging.INFO)
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
     return logger
 
 logger = setup_logging()
@@ -264,13 +280,38 @@ def _client_agent() -> str:
     ua = request.headers.get('User-Agent', '') or ''
     return ua[:120]
 
-def log_event(level: str, event: str, **fields):
-    payload = {"event": event, "request_id": getattr(g, 'request_id', None), **fields}
-    line = f"{APP_NAME}:{event} " + json.dumps(payload, default=str)
-    if level == 'debug': logger.debug(line)
-    elif level == 'warning': logger.warning(line)
-    elif level == 'error': logger.error(line)
-    else: logger.info(line)
+def _full_url() -> str:
+    try:
+        qs = request.query_string.decode() if request and request.query_string else ""
+        return (request.base_url + (f"?{qs}" if qs else ""))
+    except Exception:
+        return ""
+
+def log_event(level: str, event: str, include_http: bool = False, **fields):
+    structured = {"event": event, "request_id": getattr(g, 'request_id', None), **fields}
+    # Attach httpRequest per Google format when requested
+    if include_http and request is not None:
+        http = {
+            "requestMethod": request.method,
+            "requestUrl": _full_url(),
+            "remoteIp": getattr(g, 'ip', None) or request.headers.get('X-Forwarded-For', '').split(',')[0].strip() or request.remote_addr,
+            "userAgent": getattr(g, 'client', None) or request.headers.get('User-Agent', ''),
+        }
+        # If a status or latency is present in fields, pass them through
+        if 'status' in fields:
+            http["status"] = fields['status']
+        if 'duration_ms' in fields:
+            try:
+                http["latency"] = f"{float(fields['duration_ms'])/1000:.3f}s"
+            except Exception:
+                pass
+        structured["httpRequest"] = http
+
+    extra = {"structured": structured}
+    if level == 'debug': logger.debug("", extra=extra)
+    elif level == 'warning': logger.warning("", extra=extra)
+    elif level == 'error': logger.error("", extra=extra)
+    else: logger.info("", extra=extra)
 
 @app.before_request  # type: ignore
 def _before_request():
@@ -284,7 +325,7 @@ def _before_request():
     except NameError:
         g.country = 'unknown'
     g.client = _client_agent()
-    log_event('info', 'request_start', method=request.method, path=request.path, ip=g.ip, country=g.country, client=g.client)
+    log_event('info', 'request_start', include_http=True, method=request.method, path=request.path, ip=g.ip, country=g.country, client=g.client)
 
 @app.after_request  # type: ignore
 def _after_request(response):
@@ -297,7 +338,7 @@ def _after_request(response):
             response.headers['Referrer-Policy'] = 'no-referrer'
             response.headers['Permissions-Policy'] = 'interest-cohort=()'
             response.headers['Content-Security-Policy'] = "default-src 'none'"
-        log_event('info', 'request_end', method=request.method, path=request.path, status=response.status_code, duration_ms=dur_ms, ip=getattr(g, 'ip', 'unknown'), country=getattr(g, 'country', 'unknown'))
+        log_event('info', 'request_end', include_http=True, method=request.method, path=request.path, status=response.status_code, duration_ms=dur_ms, ip=getattr(g, 'ip', 'unknown'), country=getattr(g, 'country', 'unknown'))
     except Exception:
         pass
     return response
@@ -1114,6 +1155,62 @@ def openai_proxy():
 
     openai_endpoint = "https://api.openai.com/v1/responses" # Keep as original
 
+    # --- Streaming mode (Server-Sent Events pass-through) ---
+    if bool(payload.get('stream')):
+        import itertools as _it
+        from flask import Response, stream_with_context
+
+        def _iter_sse():
+            client_disconnected = False
+            try:
+                # Open upstream stream
+                upstream = session.post(openai_endpoint, headers=headers, json=payload, timeout=proxy_timeout, stream=True)
+                if upstream.status_code != 200:
+                    # Emit a single SSE error event and return
+                    txt = upstream.text[:1000]
+                    log_event('error', 'openai_proxy_stream_error', model=model_for_log, status=upstream.status_code, body_snippet=txt)
+                    yield f"event: error\n"
+                    err_json = json.dumps({'error': 'OpenAI API error', 'status': upstream.status_code})
+                    yield f"data: {err_json}\n\n"
+                    return
+
+                log_event('info', 'openai_proxy_stream_start', model=model_for_log)
+
+                # Forward upstream SSE lines directly to client
+                for raw in upstream.iter_lines(decode_unicode=True):
+                    try:
+                        if raw is None:
+                            # heartbeat when None (requests may yield None on keep-alive)
+                            continue
+                        yield raw + "\n"
+                    except GeneratorExit:
+                        client_disconnected = True
+                        break
+                    except Exception:
+                        # Attempt to continue on transient write errors
+                        continue
+
+                # Ensure final blank line to delimit
+                yield "\n"
+
+            except requests.exceptions.Timeout:
+                log_event('error', 'openai_proxy_stream_timeout', model=model_for_log)
+            except Exception as e:
+                log_event('error', 'openai_proxy_stream_exception', model=model_for_log, error=str(e))
+            finally:
+                dur_ms = int((time.perf_counter() - t0) * 1000)
+                log_event('info', 'openai_proxy_stream_end', model=model_for_log, client_cancelled=client_disconnected, duration_ms=dur_ms)
+
+        headers_resp = {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-cache, no-transform',
+            'Connection': 'keep-alive',
+            # Disable proxy buffering where respected (e.g., Nginx)
+            'X-Accel-Buffering': 'no'
+        }
+        return Response(stream_with_context(_iter_sse()), headers=headers_resp)
+
+    # --- Non-streaming mode (JSON pass-through) ---
     try:
         resp = session.post(openai_endpoint, headers=headers, json=payload, timeout=proxy_timeout)
         dur_ms = int((time.perf_counter() - t0) * 1000)
