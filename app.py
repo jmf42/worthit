@@ -80,7 +80,8 @@ TRANSCRIPT_LANGS = os.getenv("TRANSCRIPT_LANGS", "en").split(",")
 TRANSCRIPT_HTTP_TIMEOUT   = int(os.getenv("TRANSCRIPT_HTTP_TIMEOUT", "15"))
 COMMENT_CACHE_SIZE = int(os.getenv("COMMENT_CACHE_SIZE", "150"))
 COMMENT_CACHE_TTL = int(os.getenv("COMMENT_CACHE_TTL", "7200")) # 2 hours
-PERSISTENT_CACHE_DIR = os.path.join(os.getcwd(), "persistent_cache")
+# In Cloud Run, only /tmp is writable. Allow override via env.
+PERSISTENT_CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/persistent_cache")
 PERSISTENT_TRANSCRIPT_DB = os.path.join(PERSISTENT_CACHE_DIR, "transcript_cache.db")
 PERSISTENT_COMMENT_DB = os.path.join(PERSISTENT_CACHE_DIR, "comment_cache.db")
 # YTDL Cookie file configuration
@@ -88,6 +89,11 @@ YTDL_COOKIE_FILE = os.getenv("YTDL_COOKIE_FILE", "/etc/secrets/cookies_chrome2.t
 
 # ------------------------------------------------------------------
 # Universal CONSENT cookie (avoids 204/empty captions from YouTube)
+# If an explicit cookie file is configured but does not exist, ignore it.
+if YTDL_COOKIE_FILE and not os.path.isfile(YTDL_COOKIE_FILE):
+    YTDL_COOKIE_FILE = None
+
+# If no cookie file is configured, create a minimal consent cookie in writable cache dir.
 if not YTDL_COOKIE_FILE:
     CONSENT_COOKIE_STRING = (
         "# Netscape HTTP Cookie File\n"
@@ -99,7 +105,6 @@ if not YTDL_COOKIE_FILE:
         with open(_consent_path, "w", encoding="utf-8") as fh:
             fh.write(CONSENT_COOKIE_STRING)
     YTDL_COOKIE_FILE = _consent_path
-    logger.info("Using default CONSENT cookie at %s", _consent_path)
 # ------------------------------------------------------------------
 
 
@@ -129,7 +134,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # --- Logging Setup ---
 def setup_logging():
-    log_dir = "logs"
+    # Use /tmp/logs for Cloud Run writeability; allow override.
+    log_dir = os.getenv("LOG_DIR", "/tmp/logs")
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "app_server.log")
 
@@ -233,6 +239,30 @@ def _client_ip():
         return ip or request.remote_addr or 'unknown'
     except Exception:
         return 'unknown'
+
+def _client_country() -> str:
+    """Best-effort country detection from common proxy/CDN headers."""
+    try:
+        # Cloudflare
+        country = request.headers.get('CF-IPCountry')
+        if country:
+            return country.upper()
+        # App Engine / some GCP setups
+        country = request.headers.get('X-Appengine-Country')
+        if country and country not in ('ZZ',):
+            return country.upper()
+        # Some proxies/CDNs may forward Geo headers
+        country = request.headers.get('X-Geo-Country') or request.headers.get('X-Country-Code')
+        if country:
+            return country.upper()
+    except Exception:
+        pass
+    return 'unknown'
+
+def _client_agent() -> str:
+    """Short User-Agent summary to avoid logging huge strings."""
+    ua = request.headers.get('User-Agent', '') or ''
+    return ua[:120]
 
 def log_event(level: str, event: str, **fields):
     payload = {"event": event, "request_id": getattr(g, 'request_id', None), **fields}
@@ -1159,6 +1189,11 @@ def terms(): return send_from_directory("static", "terms.html")
 
 @app.route("/support")
 def support(): return send_from_directory("static", "support.html")
+
+@app.route('/favicon.ico')
+def favicon():
+    # Avoid noisy 404/500s when browsers request favicon
+    return ("", 204)
 
 
 # --- Cleanup on Exit ---
