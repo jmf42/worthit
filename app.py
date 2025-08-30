@@ -472,6 +472,10 @@ def fetch_ytdlp(video_id: str, proxy_url: Optional[str]) -> Optional[str]:
         "proxy": proxy_url or None,
         "nocheckcertificate": True,
     }
+    # If a cookie file is available (either user-provided via env or the
+    # generated consent cookie), pass it to yt-dlp to reduce bot challenges.
+    if YTDL_COOKIE_FILE:
+        opts["cookiefile"] = YTDL_COOKIE_FILE
     with tempfile.TemporaryDirectory() as td:
         opts["outtmpl"] = f"{td}/%(id)s.%(ext)s"
         try:
@@ -1032,6 +1036,7 @@ def get_transcript_endpoint():
 @app.route("/comments", methods=["GET"])
 @limiter.limit("120/hour;20/minute")  # Limits for comments endpoint
 def get_comments_endpoint():
+    t0 = time.perf_counter()
     video_url_or_id = request.args.get("videoId", "")
     if not video_url_or_id:
         return jsonify({"error": "videoId parameter is missing"}), 400
