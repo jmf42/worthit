@@ -816,10 +816,12 @@ def _fetch_comments_downloader(video_id: str, use_proxy: bool = False) -> list[s
         # Using a new downloader instance per call to avoid state issues if any
         proxy_url = _gateway_url()
         downloader_kwargs = {}
-        if use_proxy and proxy_url:
-            downloader_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
-            logger.debug("youtube-comment-downloader: using proxy %s for %s", proxy_url, video_id)
-
+        # Removed proxy configuration for YoutubeCommentDownloader as it does not support the 'proxies' argument.
+        # If proxy functionality is needed for this specific downloader in the future, a different approach will be required.
+        # if proxy_url:
+        #     downloader_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+        # Log proxy use for comment downloader if applicable
+        log_event('debug', 'comment_downloader_proxy_config', video_id=video_id, proxy_url=None) # Explicitly set proxy_url to None for logging purposes
         downloader = YoutubeCommentDownloader(**downloader_kwargs)
         comments_generator = downloader.get_comments_from_url(
             f"https://www.youtube.com/watch?v={video_id}",
@@ -1106,8 +1108,9 @@ def get_comments_endpoint():
         log_event('info', 'comments_fetched', video_id=video_id, count=len(comments), duration_ms=int((time.perf_counter()-t0)*1000))
         return jsonify({"video_id": video_id, "comments": comments}), 200
     except Exception as e:
-        log_event('error', 'comments_fetch_failed', video_id=video_id, error=str(e), duration_ms=int((time.perf_counter()-t0)*1000))
-        return jsonify({"error": "Comment fetch failed"}), 500
+        log_event('warning', 'comments_fetch_failed_with_exception', video_id=video_id, error=str(e), duration_ms=int((time.perf_counter()-t0)*1000))
+        # On technical failure, return 200 OK with empty comments and a warning message.
+        return jsonify({"video_id": video_id, "comments": [], "warning": "Comments could not be fetched due to a technical issue."}), 200
 
 @app.route("/openai/responses", methods=["POST"])
 @limiter.limit("200/hour;50/minute") # Limits for OpenAI proxy
