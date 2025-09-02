@@ -15,7 +15,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future, as_completed
 
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g, make_response
 from flask import make_response
 from flask import make_response
 from flask import g
@@ -319,7 +319,7 @@ def _before_request():
     g.started_at = time.perf_counter()
     g.ip = _client_ip()
     # Be defensive: in case of mismatched deployments where `_client_country`
-    # isn’t available yet, avoid 500s and default gracefully.
+    # isn't available yet, avoid 500s and default gracefully.
     try:
         g.country = _client_country()
     except NameError:
@@ -386,38 +386,42 @@ PIPED_HOSTS = deque([
 ])
 _PIPE_COOLDOWN: dict[str, float] = {}
 
-def _fetch_from_alternative_api(hosts: deque, path: str, cooldown_map: dict[str, float], timeout: float = 2.0) -> dict | None:
+def _fetch_from_alternative_api(hosts: deque, path: str, cooldown_map: dict[str, float], timeout: float = 2.0, request_id: str = "") -> dict | None:
     deadline = time.time() + timeout
+    log_event('info', 'alternative_api_attempt_flow_start', path=path, host_count=len(hosts), request_id=request_id)
     # Simple round-robin with cooldown
     for _ in range(len(hosts)):
         host = hosts.popleft() # Get from left
         hosts.append(host)    # Add to right for next cycle
 
         if time.time() >= deadline:
-            logger.warning("Timeout fetching from alternative API for path: %s", path)
+            log_event('warning', 'alternative_api_flow_timeout', path=path, host=host, reason='Deadline reached', request_id=request_id)
             break
         if cooldown_map.get(host, 0) > time.time():
+            log_event('info', 'alternative_api_host_cooldown', path=path, host=host, request_id=request_id)
             continue
         
         url = f"{host}{path}"
         current_proxy = get_proxy_dict()
         
+        t_host_attempt = time.perf_counter()
+        log_event('debug', 'alternative_api_host_attempt', url=url, host=host, proxy_used=bool(current_proxy), request_id=request_id)
         try:
-            logger.debug("Attempting alternative API: %s (Proxy: %s)", url, "Yes" if current_proxy else "No")
             r = session.get(url, proxies=current_proxy, timeout=3) # Shorter timeout for alternatives
             r.raise_for_status()
             if "application/json" not in r.headers.get("Content-Type", ""):
-                logger.warning("Non-JSON response from %s", url)
+                log_event('warning', 'alternative_api_non_json_response', url=url, host=host, duration_ms=int((time.perf_counter() - t_host_attempt) * 1000), request_id=request_id)
                 cooldown_map[host] = time.time() + 600 # Longer cooldown for structural issues
                 continue
-            logger.info("Successfully fetched from alternative API: %s", url)
+            log_event('info', 'alternative_api_host_success', url=url, host=host, duration_ms=int((time.perf_counter() - t_host_attempt) * 1000), request_id=request_id)
             return r.json()
         except requests.exceptions.RequestException as e:
-            logger.warning("Alternative API host %s failed: %s", host, str(e))
+            log_event('warning', 'alternative_api_host_failure', url=url, host=host, error=str(e), duration_ms=int((time.perf_counter() - t_host_attempt) * 1000), request_id=request_id)
             cooldown_map[host] = time.time() + 300 # Cooldown on error
         except Exception as e:
-            logger.error("Unexpected error with alternative API host %s: %s", host, str(e), exc_info=True)
+            log_event('error', 'alternative_api_host_unexpected_error', url=url, host=host, error=str(e), duration_ms=int((time.perf_counter() - t_host_attempt) * 1000), request_id=request_id, exc_info=LOG_LEVEL=="DEBUG")
             cooldown_map[host] = time.time() + 300
+    log_event('warning', 'alternative_api_all_hosts_failed', path=path, duration_ms=int((time.perf_counter() - t0_workflow) * 1000), request_id=request_id)
     return None
 
 # --- yt-dlp Helper ---
@@ -479,30 +483,80 @@ def rnd_proxy() -> dict:
 def fetch_api_once(video_id: str,
                    proxy_cfg,
                    timeout: int = 10,
-                   languages: Optional[List[str]] = None) -> Optional[str]:
+                   languages: Optional[List[str]] = None,
+                   request_id: str = "") -> Optional[str]:
     """Single attempt using youtube-transcript-api. Returns plain text or None."""
+    t0 = time.perf_counter()
     languages = languages or TRANSCRIPT_LANGS
+    log_event('info', 'transcript_method_attempt', extra={
+        "method": "youtube-transcript-api",
+        "video_id": video_id,
+        "languages": languages,
+        "proxy_config": {
+            "is_configured": proxy_cfg is not None,
+            "type": type(proxy_cfg).__name__ if proxy_cfg else None
+        },
+        "timeout": timeout,
+        "request_id": request_id
+    })
+    
     ytt_api = YouTubeTranscriptApi(proxy_config=proxy_cfg)
     try:
         ft = ytt_api.fetch(video_id, languages=languages)
     except NoTranscriptFound:
+        log_event('warning', 'transcript_method_failure', extra={
+            "method": "youtube-transcript-api",
+            "video_id": video_id,
+            "reason": "NoTranscriptFound",
+            "languages_attempted": languages,
+            "duration_ms": int((time.perf_counter() - t0) * 1000),
+            "request_id": request_id
+        })
+        return None
+    except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
+        log_event('error', 'transcript_method_failure', extra={
+            "method": "youtube-transcript-api",
+            "video_id": video_id,
+            "reason": str(e),
+            "error_type": type(e).__name__,
+            "languages_attempted": languages,
+            "proxy_used": proxy_cfg is not None,
+            "duration_ms": int((time.perf_counter() - t0) * 1000),
+            "request_id": request_id
+        })
         return None
 
     segments = ft.to_raw_data() if hasattr(ft, "to_raw_data") else ft
-    # Log a clear success message so we know this path was taken
-    if segments:
-        logger.info("✅ youtube-transcript-api SUCCESS for %s (%d chars)",
-                    video_id, len(" ".join(seg["text"] if isinstance(seg, dict) else getattr(seg, "text", "")
-                                  for seg in segments)))
-    return " ".join(
+    text_content = " ".join(
         seg["text"] if isinstance(seg, dict) else getattr(seg, "text", "")
         for seg in segments
     ).strip() or None
 
+    if text_content:
+        log_event('info', 'transcript_method_success', extra={
+            "method": "youtube-transcript-api",
+            "video_id": video_id,
+            "text_len": len(text_content),
+            "language_detected": ft.language_code if hasattr(ft, 'language_code') else 'unknown',
+            "duration_ms": int((time.perf_counter() - t0) * 1000),
+            "request_id": request_id
+        })
+    return text_content
+
 # ---------------------------------------------------------------------------
 # yt‑dlp subtitle fallback ---------------------------------------------------
-def fetch_ytdlp(video_id: str, proxy_url: Optional[str]) -> Optional[str]:
-    logger.info("[yt-dlp] Attempt (proxy=%s) for %s", bool(proxy_url), video_id)
+# Simplified wrapper for yt-dlp to fetch subtitles
+# NOTE: yt-dlp has its own internal retries; this is a single call.
+def fetch_ytdlp(video_id: str, proxy_url: Optional[str], request_id: str = "") -> Optional[str]:
+    """Fetch subtitles via yt-dlp, falling back to auto-generated if manual fails."""
+    t0 = time.perf_counter()
+    logger.info("Attempting transcript fetch via yt-dlp", extra={
+        "event": "transcript_method_attempt",
+        "method": "yt-dlp",
+        "video_id": video_id,
+        "proxy_used": proxy_url is not None,
+        "request_id": request_id
+    })
     opts = {
         "quiet": True,
         "skip_download": True,
@@ -564,11 +618,15 @@ def fetch_live_instances(api_url):
         logger.warning(f"Failed to fetch instances from {api_url}: {e}")
         return []
 
-def _fetch_transcript_alternatives(video_id: str) -> str | None:
-    """
-    Attempt to fetch transcript from multiple alternative APIs (Piped direct, Piped, Invidious) in parallel.
-    Returns transcript text if any succeed, else None.
-    """
+def _fetch_transcript_alternatives(video_id: str, request_id: str = "") -> str | None:
+    """Try alternative APIs in parallel for transcript fetching."""
+    t0 = time.perf_counter()
+    logger.info("Attempting transcript fetch via alternative APIs", extra={
+        "event": "transcript_method_attempt",
+        "method": "alternative_apis",
+        "video_id": video_id,
+        "request_id": request_id
+    })
     piped_instances = fetch_live_instances("https://piped-instances.kavin.rocks/")
     invidious_instances = fetch_live_instances("https://api.invidious.io/instances.json?sort_by=health")
 
@@ -584,16 +642,38 @@ def _fetch_transcript_alternatives(video_id: str) -> str | None:
             try:
                 result = future.result()
                 if result:
-                    logger.info("✅ Alternative API transcript succeeded for %s", video_id)
+                    logger.info("✅ Alternative API transcript succeeded", extra={
+                        "event": "transcript_step_success",
+                        "step": 2,
+                        "method": "alternative_apis",
+                        "video_id": video_id,
+                        "text_len": len(result),
+                        "duration_ms": int((time.perf_counter() - t0) * 1000),
+                        "request_id": request_id
+                    })
                     return result
             except Exception as e:
-                logger.warning("Transcript fetch via %s failed: %s", futures[future], e)
-    logger.warning("All alternative API transcript fetchers failed for %s", video_id)
+                logger.warning("Transcript fetch via %s failed", futures[future], extra={
+                    "event": "transcript_step_failure",
+                    "step": 2,
+                    "method": "alternative_apis",
+                    "video_id": video_id,
+                    "reason": str(e),
+                    "request_id": request_id
+                })
+    logger.warning("All alternative API transcript fetchers failed for %s", video_id, extra={
+        "event": "transcript_step_failure",
+        "step": 2,
+        "method": "alternative_apis",
+        "video_id": video_id,
+        "reason": "All alternative API transcript fetchers failed",
+        "request_id": request_id
+    })
     return None
 
 # ---------------------------------------------------------------------------
 # Unified transcript fetching with clear fallback steps and logging
-def get_transcript(video_id: str) -> str:
+def get_transcript(video_id: str, request_id: str = "") -> str:
     """
     Transcript fetch logic with explicit, concise fallback steps:
     1. Try youtube-transcript-api (proxy if configured)
@@ -602,46 +682,134 @@ def get_transcript(video_id: str) -> str:
     4. Try yt-dlp (with proxy)
     Raise NoTranscriptFound if all fail.
     """
+    t0_workflow = time.perf_counter()
+    logger.info("💡 Initiating unified transcript fetch workflow", extra={
+        "event": "transcript_workflow_start",
+        "video_id": video_id,
+        "request_id": request_id
+    })
+
     # Step 1: Try youtube-transcript-api (with proxy if configured)
     try:
-        txt = fetch_api_once(video_id, PROXY_CFG)
+        txt = fetch_api_once(video_id, PROXY_CFG, request_id=request_id)
         if txt:
-            logger.info("✅ Primary transcript fetch succeeded via youtube-transcript-api for %s", video_id)
+            logger.info("Primary transcript fetch succeeded", extra={
+                "event": "transcript_step_success",
+                "step": 1,
+                "method": "youtube-transcript-api",
+                "video_id": video_id,
+                "text_len": len(txt),
+                "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+                "request_id": request_id
+            })
             return txt
         else:
-            logger.info("Primary transcript fetch failed: No transcript found via youtube-transcript-api for %s", video_id)
+            logger.info("Primary transcript fetch failed (no transcript found)", extra={
+                "event": "transcript_step_failure",
+                "step": 1,
+                "method": "youtube-transcript-api",
+                "video_id": video_id,
+                "reason": "No transcript found",
+                "request_id": request_id
+            })
     except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
-        logger.warning("Primary transcript fetch blocked or failed for %s: %s", video_id, e)
+        logger.warning("Primary transcript fetch blocked or failed", extra={
+            "event": "transcript_step_failure",
+            "step": 1,
+            "method": "youtube-transcript-api",
+            "video_id": video_id,
+            "reason": str(e),
+            "request_id": request_id
+        })
 
     # Step 2: Try alternative APIs in parallel
-    txt = _fetch_transcript_alternatives(video_id)
+    txt = _fetch_transcript_alternatives(video_id, request_id=request_id)
     if txt:
-        logger.info("✅ Fallback transcript fetch succeeded via alternative APIs for %s", video_id)
+        logger.info("Fallback transcript fetch succeeded via alternative APIs", extra={
+            "event": "transcript_step_success",
+            "step": 2,
+            "method": "alternative_apis",
+            "video_id": video_id,
+            "text_len": len(txt),
+            "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+            "request_id": request_id
+        })
         return txt
     else:
-        logger.info("Alternative APIs fallback failed: No transcript found for %s", video_id)
+        logger.info("Alternative APIs fallback failed (no transcript found)", extra={
+            "event": "transcript_step_failure",
+            "step": 2,
+            "method": "alternative_apis",
+            "video_id": video_id,
+            "reason": "No transcript found",
+            "request_id": request_id
+        })
 
     # Step 3: Try yt-dlp (no proxy)
-    txt = fetch_ytdlp(video_id, None)
+    txt = fetch_ytdlp(video_id, None, request_id=request_id)
     if txt:
-        logger.info("✅ Fallback transcript fetch succeeded via yt-dlp (no proxy) for %s", video_id)
+        logger.info("Fallback transcript fetch succeeded via yt-dlp (no proxy)", extra={
+            "event": "transcript_step_success",
+            "step": 3,
+            "method": "yt-dlp_no_proxy",
+            "video_id": video_id,
+            "text_len": len(txt),
+            "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+            "request_id": request_id
+        })
         return txt
     else:
-        logger.info("yt-dlp (no proxy) fallback failed: No transcript found for %s", video_id)
+        logger.info("yt-dlp (no proxy) fallback failed (no transcript found)", extra={
+            "event": "transcript_step_failure",
+            "step": 3,
+            "method": "yt-dlp_no_proxy",
+            "video_id": video_id,
+            "reason": "No transcript found",
+            "request_id": request_id
+        })
 
     # Step 4: Try yt-dlp (with proxy)
     proxy_url = _gateway_url()
     if proxy_url:
-        txt = fetch_ytdlp(video_id, proxy_url)
+        txt = fetch_ytdlp(video_id, proxy_url, request_id=request_id)
         if txt:
-            logger.info("✅ Fallback transcript fetch succeeded via yt-dlp (with proxy) for %s", video_id)
+            logger.info("Fallback transcript fetch succeeded via yt-dlp (with proxy)", extra={
+                "event": "transcript_step_success",
+                "step": 4,
+                "method": "yt-dlp_with_proxy",
+                "video_id": video_id,
+                "text_len": len(txt),
+                "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+                "request_id": request_id
+            })
             return txt
         else:
-            logger.info("yt-dlp (with proxy) fallback failed: No transcript found for %s", video_id)
+            logger.info("yt-dlp (with proxy) fallback failed (no transcript found)", extra={
+                "event": "transcript_step_failure",
+                "step": 4,
+                "method": "yt-dlp_with_proxy",
+                "video_id": video_id,
+                "reason": "No transcript found",
+                "request_id": request_id
+            })
+    else:
+        logger.info("yt-dlp (with proxy) skipped: No proxy URL available", extra={
+            "event": "transcript_step_skipped",
+            "step": 4,
+            "method": "yt-dlp_with_proxy",
+            "video_id": video_id,
+            "reason": "No proxy URL",
+            "request_id": request_id
+        })
 
-    # All methods failed
-    logger.error("❌ All transcript fetch methods failed for %s. Raising NoTranscriptFound.", video_id)
-    raise NoTranscriptFound(video_id, [], None)
+    # If all fail
+    logger.warning("❌ All transcript fetch methods FAILED.", extra={
+        "event": "all_transcript_methods_failed",
+        "video_id": video_id,
+        "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+        "request_id": request_id
+    })
+    raise NoTranscriptFound
 
 # --- Transcript Fallback Helpers ---
 def _strip_tags(text: str) -> str:
@@ -810,18 +978,27 @@ def _get_or_spawn_transcript(video_id: str) -> str:
     raise NoTranscriptFound(video_id, [], None)
 
 # --- Comment Fetching Logic ---
-def _fetch_comments_downloader(video_id: str, use_proxy: bool = False) -> list[str] | None:
-    logger.debug("Attempting comments via youtube-comment-downloader for %s", video_id)
+def _fetch_comments_downloader(video_id: str, use_proxy: bool = False, request_id: str = "") -> list[str]:
+    """Fetches comments using youtube-comment-downloader."""
+    t0 = time.perf_counter()
+    log_event('info', 'comment_method_attempt', extra={
+        "method": "youtube-comment-downloader",
+        "video_id": video_id,
+        "proxy_config": {
+            "is_configured": use_proxy,
+            "proxy_url": _gateway_url() if use_proxy else None
+        },
+        "language": 'en',  # Hardcoded in current implementation
+        "request_id": request_id
+    })
     try:
-        # Using a new downloader instance per call to avoid state issues if any
-        proxy_url = _gateway_url()
+        proxy_url = _gateway_url() if use_proxy else None
         downloader_kwargs = {}
-        # Removed proxy configuration for YoutubeCommentDownloader as it does not support the 'proxies' argument.
-        # If proxy functionality is needed for this specific downloader in the future, a different approach will be required.
-        # if proxy_url:
-        #     downloader_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
-        # Log proxy use for comment downloader if applicable
-        log_event('debug', 'comment_downloader_proxy_config', video_id=video_id, proxy_url=None) # Explicitly set proxy_url to None for logging purposes
+        log_event('debug', 'comment_downloader_proxy_config', extra={
+            "video_id": video_id, 
+            "proxy_url": proxy_url, 
+            "request_id": request_id
+        })
         downloader = YoutubeCommentDownloader(**downloader_kwargs)
         comments_generator = downloader.get_comments_from_url(
             f"https://www.youtube.com/watch?v={video_id}",
@@ -829,7 +1006,7 @@ def _fetch_comments_downloader(video_id: str, use_proxy: bool = False) -> list[s
             language='en' # English comments
         )
         comments_text: list[str] = []
-        for item in comments_generator:
+        for item in itertools.islice(comments_generator, MAX_COMMENTS_FETCH):
             text = item.get("text")
             if text:
                 comments_text.append(text)
@@ -837,15 +1014,159 @@ def _fetch_comments_downloader(video_id: str, use_proxy: bool = False) -> list[s
                 break
 
         if comments_text:
-            logger.debug("Fetched %d comments via youtube-comment-downloader for %s", len(comments_text), video_id)
+            log_event('info', 'comment_method_success', extra={
+                "method": "youtube-comment-downloader",
+                "video_id": video_id,
+                "count": len(comments_text),
+                "proxy_used": use_proxy,
+                "duration_ms": int((time.perf_counter() - t0) * 1000),
+                "request_id": request_id
+            })
             return comments_text
-        logger.warning("No comments returned by youtube-comment-downloader for %s", video_id)
+        
+        log_event('warning', 'comment_method_failure', extra={
+            "method": "youtube-comment-downloader",
+            "video_id": video_id,
+            "reason": "No comments returned",
+            "proxy_used": use_proxy,
+            "duration_ms": int((time.perf_counter() - t0) * 1000),
+            "request_id": request_id
+        })
         return []
     except Exception as e:
-        logger.error("youtube-comment-downloader failed for %s: %s", video_id, str(e), exc_info=LOG_LEVEL=="DEBUG")
+        log_event('error', 'comment_method_failure', extra={
+            "method": "youtube-comment-downloader",
+            "video_id": video_id,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "proxy_used": use_proxy,
+            "duration_ms": int((time.perf_counter() - t0) * 1000),
+            "request_id": request_id,
+            "exc_info": LOG_LEVEL == "DEBUG"
+        })
         return []
 
-def yt_dlp_extract_info(video_id: str, extract_comments: bool = False, use_proxy: bool = False) -> dict | None:
+def _fetch_comments_yt_dlp(video_id: str, use_proxy: bool = False, request_id: str = "") -> list[str] | None:
+    """
+    Fetch comments via yt-dlp's `getcomments` mechanism.
+    Returns a list of comment texts or None/empty list.
+    """
+    t0 = time.perf_counter()
+    log_event('info', 'comment_method_attempt', method='yt-dlp_comments', video_id=video_id, proxy_used=use_proxy, request_id=request_id)
+    info = yt_dlp_extract_info(video_id, extract_comments=True, use_proxy=use_proxy, request_id=request_id)
+    if not info:
+        log_event('warning', 'comment_method_failure', method='yt-dlp_comments', video_id=video_id, reason='No info from yt-dlp', duration_ms=int((time.perf_counter() - t0) * 1000), request_id=request_id)
+        return []
+    comments_raw = info.get("comments") or []
+    comments = [c.get("text") or c.get("comment") or "" for c in comments_raw]
+    comments = [c for c in comments if c]
+    if comments:
+        log_event('info', 'comment_method_success', method='yt-dlp_comments', video_id=video_id, count=len(comments), proxy_used=use_proxy, duration_ms=int((time.perf_counter() - t0) * 1000), request_id=request_id)
+        return comments
+    log_event('warning', 'comment_method_failure', method='yt-dlp_comments', video_id=video_id, reason='No comments returned', proxy_used=use_proxy, duration_ms=int((time.perf_counter() - t0) * 1000), request_id=request_id)
+    return []
+
+def _fetch_comments_resilient(video_id: str, request_id: str = "") -> list[str]:
+    """Fetch comments in a primary→fallback→proxy→Piped sequence."""
+    t0_workflow = time.perf_counter()
+    log_event('info', 'comments_workflow_start', extra={
+        "video_id": video_id,
+        "strategies": [
+            "youtube-comment-downloader (no proxy)",
+            "youtube-comment-downloader (with proxy)",
+            "yt-dlp (no proxy)",
+            "yt-dlp (with proxy)",
+            "alternative APIs"
+        ],
+        "request_id": request_id
+    })
+
+    comment_retrieval_strategies = [
+        ("youtube-comment-downloader (no proxy)", lambda: _fetch_comments_downloader(video_id, False, request_id)),
+        ("youtube-comment-downloader (with proxy)", lambda: _fetch_comments_downloader(video_id, True, request_id)),
+        ("yt-dlp (no proxy)", lambda: _fetch_comments_from_ytdlp(video_id, False, request_id)),
+        ("yt-dlp (with proxy)", lambda: _fetch_comments_from_ytdlp(video_id, True, request_id))
+    ]
+
+    # Try alternative APIs concurrently
+    piped_instances = fetch_live_instances("https://piped-instances.kavin.rocks/")
+    invidious_instances = fetch_live_instances("https://api.invidious.io/instances.json?sort_by=health")
+
+    comment_sources = [
+        ("Alternative API (Piped direct)", lambda instance: _fetch_from_alternative_api([f"{instance}/api"], f"/comments/{video_id}", _PIPE_COOLDOWN, request_id=request_id)),
+        ("Alternative API (Piped)", lambda instance: _fetch_from_alternative_api([instance], f"/comments/{video_id}", _PIPE_COOLDOWN, request_id=request_id)),
+        ("Alternative API (Invidious)", lambda instance: _fetch_from_alternative_api([instance], f"/api/v1/comments/{video_id}", _PIPE_COOLDOWN, request_id=request_id)),
+    ]
+
+    # First, try primary strategies sequentially
+    for strategy_name, fetch_func in comment_retrieval_strategies:
+        comments = fetch_func()
+        if comments:
+            log_event('info', 'comment_step_success', extra={
+                "step": strategy_name,
+                "video_id": video_id,
+                "count": len(comments),
+                "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+                "request_id": request_id
+            })
+            return comments
+        
+        log_event('warning', 'comment_step_failure', extra={
+            "step": strategy_name,
+            "video_id": video_id,
+            "reason": "No comments returned",
+            "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+            "request_id": request_id
+        })
+
+    # If primary strategies fail, try alternative APIs concurrently
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = []
+        for source_name, fetch_func_factory in comment_sources:
+            if "Piped" in source_name:
+                for instance in piped_instances:
+                    futures.append(executor.submit(fetch_func_factory(instance)))
+            elif "Invidious" in source_name:
+                for instance in invidious_instances:
+                    futures.append(executor.submit(fetch_func_factory(instance)))
+        
+        for future in as_completed(futures, timeout=10):
+            try:
+                result_json = future.result()
+                if result_json and "comments" in result_json:
+                    comments = [c.get("text") for c in result_json["comments"] if c.get("text")]
+                    if comments:
+                        log_event('info', 'comment_step_success', extra={
+                            "step": "alternative_apis_concurrent",
+                            "video_id": video_id,
+                            "count": len(comments),
+                            "sources": [f"{source_name} ({instance})" for source_name, fetch_func_factory in comment_sources],
+                            "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+                            "request_id": request_id
+                        })
+                        return comments
+            except Exception as e:
+                log_event('warning', 'comment_step_failure', extra={
+                    "step": "alternative_apis_concurrent",
+                    "video_id": video_id,
+                    "reason": str(e),
+                    "request_id": request_id
+                })
+
+    # If all methods fail
+    log_event('error', 'all_comment_methods_failed', extra={
+        "video_id": video_id,
+        "strategies_attempted": [
+            strategy[0] for strategy in comment_retrieval_strategies
+        ] + [source[0] for source in comment_sources],
+        "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+        "request_id": request_id
+    })
+    return []
+
+def yt_dlp_extract_info(video_id: str, extract_comments: bool = False, use_proxy: bool = False, request_id: str = "") -> dict | None:
+    t0 = time.perf_counter()
+    log_event('info', 'yt_dlp_info_extract_attempt', video_id=video_id, extract_comments=extract_comments, proxy_used=use_proxy, request_id=request_id)
     opts = _YDL_OPTS_BASE.copy()
     # --- CORRECTED LOGIC ---
     # Always add a random User-Agent to every yt-dlp request
@@ -855,7 +1176,7 @@ def yt_dlp_extract_info(video_id: str, extract_comments: bool = False, use_proxy
         proxy_url = _gateway_url()
         if proxy_url:
             opts["proxy"] = proxy_url
-            logger.debug("yt-dlp: using proxy %s for %s", proxy_url, video_id)
+            log_event('debug', 'yt_dlp_proxy_config', video_id=video_id, proxy_url=proxy_url, request_id=request_id)
     # --- END OF CORRECTION ---
 
     if extract_comments:
@@ -863,79 +1184,75 @@ def yt_dlp_extract_info(video_id: str, extract_comments: bool = False, use_proxy
         opts["max_comments"] = COMMENT_LIMIT
 
     video_url = f"https://www.youtube.com/watch?v={video_id}"
-    logger.debug("yt-dlp: Extracting info for %s (comments: %s)", video_id, extract_comments)
+    log_event('debug', 'yt_dlp_extract_info_details', video_id=video_id, comments_requested=extract_comments, request_id=request_id)
     try:
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
             if info:
-                logger.info("yt-dlp: Successfully extracted info for %s", video_id)
+                log_event('info', 'yt_dlp_info_extract_success', video_id=video_id, duration_ms=int((time.perf_counter() - t0) * 1000), request_id=request_id)
                 return info
-            logger.warning("yt-dlp: No info returned for %s", video_id)
+            log_event('warning', 'yt_dlp_info_extract_failure', video_id=video_id, reason='No info returned', duration_ms=int((time.perf_counter() - t0) * 1000), request_id=request_id)
             return None
     except Exception as e:
-        logger.error("yt-dlp: Failed to extract info for %s: %s", video_id, str(e), exc_info=LOG_LEVEL == "DEBUG")
+        log_event('error', 'yt_dlp_info_extract_error', video_id=video_id, error=str(e), duration_ms=int((time.perf_counter() - t0) * 1000), request_id=request_id, exc_info=LOG_LEVEL == "DEBUG")
         return None
 
-# --- Comment Fetching Logic (improved racer) ---
+def _fetch_comments_from_ytdlp(video_id: str, use_proxy: bool = False, request_id: str = "") -> list[str] | None:
+    """Fetches comments using yt-dlp. Supports auto and user comments."""
+    t0 = time.perf_counter()
+    log_event('info', 'comment_method_attempt', extra={
+        "method": "yt-dlp_comments",
+        "video_id": video_id,
+        "proxy_config": {
+            "is_configured": use_proxy,
+            "proxy_url": _gateway_url() if use_proxy else None
+        },
+        "comment_types": ["user", "auto"],
+        "request_id": request_id
+    })
 
-def _fetch_comments_resilient(video_id: str) -> list[str]:
-    """Fetch comments in a primary→fallback→proxy→Piped sequence.
-
-    1. Try youtube-comment-downloader without proxy.
-    2. Fallback to yt-dlp without proxy if no comments.
-    3. Try yt-dlp with proxy if still no comments.
-    4. Try youtube-comment-downloader with proxy.
-    5. Finally, try Piped API as the last resort.
-    """
-    logger.info("Initiating resilient comment fetch for %s", video_id)
-    # Primary: youtube-comment-downloader (no proxy)
-    comments = _fetch_comments_downloader(video_id, False)
-    if comments:
-        logger.info("✅ Comments (primary): %d via youtube-comment-downloader for %s", len(comments), video_id)
-        return comments[:COMMENT_LIMIT]
-    # Fallback: yt-dlp (no proxy)
-    comments = _fetch_comments_yt_dlp(video_id, False)
-    if comments:
-        logger.info("✅ Comments (fallback): %d via yt-dlp (no proxy) for %s", len(comments), video_id)
-        return comments[:COMMENT_LIMIT]
-    # Fallback: yt-dlp (proxy)
-    comments = _fetch_comments_yt_dlp(video_id, True)
-    if comments:
-        logger.info("✅ Comments (proxy): %d via yt-dlp for %s", len(comments), video_id)
-        return comments[:COMMENT_LIMIT]
-    # Fallback: youtube-comment-downloader (proxy)
-    comments = _fetch_comments_downloader(video_id, True)
-    if comments:
-        logger.info("✅ Comments (proxy): %d via youtube-comment-downloader for %s", len(comments), video_id)
-        return comments[:COMMENT_LIMIT]
-    # Fallback: Piped API
-    piped_data = _fetch_from_alternative_api(PIPED_HOSTS, f"/comments/{video_id}", _PIPE_COOLDOWN)
-    if piped_data and "comments" in piped_data:
-        comments_text = [c.get("commentText") for c in piped_data["comments"] if c.get("commentText")]
-        if comments_text:
-            logger.info("✅ Comments (piped): %d via piped API for %s", len(comments_text), video_id)
-            return comments_text[:COMMENT_LIMIT]
-    logger.warning("All comment sources failed for video %s. Returning empty list.", video_id)
-    return []
-
-def _fetch_comments_yt_dlp(video_id: str, use_proxy: bool = False) -> list[str] | None:
-    """
-    Fetch comments via yt-dlp's `getcomments` mechanism.
-    Returns a list of comment texts or None/empty list.
-    """
-    info = yt_dlp_extract_info(video_id,
-                               extract_comments=True,
-                               use_proxy=use_proxy)
+    info = yt_dlp_extract_info(video_id, extract_comments=True, use_proxy=use_proxy, request_id=request_id)
     if not info:
+        log_event('warning', 'comment_method_failure', extra={
+            "method": "yt-dlp_comments",
+            "video_id": video_id,
+            "reason": "No info from yt-dlp",
+            "proxy_used": use_proxy,
+            "duration_ms": int((time.perf_counter() - t0) * 1000),
+            "request_id": request_id
+        })
         return []
+
     comments_raw = info.get("comments") or []
     comments = [c.get("text") or c.get("comment") or "" for c in comments_raw]
     comments = [c for c in comments if c]
-    if comments:
-        logger.info("Fetched %d comments via yt-dlp (%sproxy) for %s",
-                    len(comments), "" if use_proxy else "no-", video_id)
-    return comments
 
+    if comments:
+        log_event('info', 'comment_method_success', extra={
+            "method": "yt-dlp_comments",
+            "video_id": video_id,
+            "count": len(comments),
+            "comment_sources": list(set(
+                c.get("source", "unknown") 
+                for c in info.get("comments", []) 
+                if c.get("text") or c.get("comment")
+            )),
+            "proxy_used": use_proxy,
+            "duration_ms": int((time.perf_counter() - t0) * 1000),
+            "request_id": request_id
+        })
+        return comments
+
+    log_event('warning', 'comment_method_failure', extra={
+        "method": "yt-dlp_comments",
+        "video_id": video_id,
+        "reason": "No comments returned",
+        "raw_comments_count": len(comments_raw),
+        "proxy_used": use_proxy,
+        "duration_ms": int((time.perf_counter() - t0) * 1000),
+        "request_id": request_id
+    })
+    return []
 
 # --- Endpoints ---
 @app.before_request
@@ -1004,27 +1321,27 @@ def _background_comment_worker(video_id: str):
 @app.route("/transcript", methods=["GET"])
 @limiter.limit("1000/hour;200/minute")  # Increased limits for transcript endpoint
 def get_transcript_endpoint():
-    t0 = time.perf_counter()
+    g.request_start_time = time.perf_counter() # Mark request start time
     video_url_or_id = request.args.get("videoId", "")
     if not video_url_or_id:
-        log_event('warning', 'transcript_missing_video_id', ip=g.ip)
+        log_event('warning', 'transcript_missing_video_id', video_id=video_url_or_id, ip=get_remote_address(), request_id=g.request_id)
         return jsonify({"error": "videoId parameter is missing"}), 400
 
     video_id = extract_video_id(video_url_or_id)
     if not video_id:
-        log_event('warning', 'transcript_invalid_video_id', raw=video_url_or_id, ip=g.ip)
+        log_event('warning', 'transcript_invalid_video_id', raw=video_url_or_id, ip=get_remote_address(), request_id=g.request_id)
         return jsonify({"error": "Invalid videoId format or URL"}), 400
 
-    
-
+    # Log the start of transcript fetching
+    log_event('info', 'transcript_fetch_workflow_start', video_id=video_id, languages=request.args.get("languages", TRANSCRIPT_LANGS), ip=get_remote_address(), request_id=g.request_id)
 
     # Check RAM cache
     cached = transcript_cache.get(video_id)
     if cached is not None:
         if cached == "__NOT_AVAILABLE__":
-            log_event('info', 'transcript_cache_miss_marker', video_id=video_id)
+            log_event('info', 'transcript_cache_miss_marker', video_id=video_id, request_id=g.request_id)
             return jsonify({"error": "Transcript not available"}), 404
-        log_event('info', 'transcript_cache_hit', video_id=video_id, text_len=len(cached))
+        log_event('info', 'transcript_cache_hit', video_id=video_id, text_len=len(cached), request_id=g.request_id)
         return jsonify({"video_id": video_id, "text": cached}), 200
 
     # Try persistent cache
@@ -1033,9 +1350,9 @@ def get_transcript_endpoint():
         if cached is not None:
             transcript_cache[video_id] = cached
             if cached == "__NOT_AVAILABLE__":
-                log_event('info', 'transcript_persisted_not_available', video_id=video_id)
+                log_event('info', 'transcript_persisted_not_available', video_id=video_id, request_id=g.request_id)
                 return jsonify({"error": "Transcript not available"}), 404
-            log_event('info', 'transcript_persisted_hit', video_id=video_id, text_len=len(cached))
+            log_event('info', 'transcript_persisted_hit', video_id=video_id, text_len=len(cached), request_id=g.request_id)
             return jsonify({"video_id": video_id, "text": cached}), 200
 
     # Try fetch with short retry/backoff on transient errors
@@ -1043,11 +1360,13 @@ def get_transcript_endpoint():
     last_err = None
     while attempts < 2:
         try:
-            text = get_transcript(video_id)
+            # Log attempt start
+            log_event('info', 'transcript_method_attempt', method='unified_fetch', attempt=attempts + 1, video_id=video_id, request_id=g.request_id)
+            text = get_transcript(video_id) # This calls the internal get_transcript function
             transcript_cache[video_id] = text
             with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
                 db[video_id] = text
-            log_event('info', 'transcript_fetched', video_id=video_id, text_len=len(text), duration_ms=int((time.perf_counter()-t0)*1000))
+            log_event('info', 'transcript_fetched', video_id=video_id, text_len=len(text), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
             resp = make_response(jsonify({"video_id": video_id, "text": text}), 200)
             resp.headers['Cache-Control'] = 'public, max-age=3600'
             return resp
@@ -1056,7 +1375,7 @@ def get_transcript_endpoint():
                 transcript_cache[video_id] = "__NOT_AVAILABLE__"
                 with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
                     db[video_id] = "__NOT_AVAILABLE__"
-            log_event('warning', 'transcript_not_found', video_id=video_id, duration_ms=int((time.perf_counter()-t0)*1000))
+            log_event('warning', 'transcript_not_found', video_id=video_id, duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
             resp = make_response(jsonify({"error": "Transcript not available"}), 404)
             resp.headers['Cache-Control'] = 'public, max-age=600'
             return resp
@@ -1064,14 +1383,15 @@ def get_transcript_endpoint():
             # Transient network/SSL errors – backoff and retry once
             attempts += 1
             last_err = e
+            log_event('warning', 'transcript_fetch_network_error', video_id=video_id, attempt=attempts, error=str(e), request_id=g.request_id)
             time.sleep(0.5 * attempts)
             continue
         except Exception as e:
             # Non-retryable internal error
-            log_event('error', 'transcript_fetch_failed', video_id=video_id, error=str(e), duration_ms=int((time.perf_counter()-t0)*1000))
+            log_event('error', 'transcript_fetch_failed', video_id=video_id, error=str(e), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
             return jsonify({"error": "Transcript fetch failed"}), 500
     # Retries exhausted → treat as not available
-    log_event('warning', 'transcript_unavailable_after_retry', video_id=video_id, error=str(last_err) if last_err else None, duration_ms=int((time.perf_counter()-t0)*1000))
+    log_event('warning', 'transcript_unavailable_after_retry', video_id=video_id, error=str(last_err) if last_err else None, duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
     resp = make_response(jsonify({"error": "Transcript not available"}), 404)
     resp.headers['Cache-Control'] = 'public, max-age=600'
     return resp
@@ -1079,36 +1399,41 @@ def get_transcript_endpoint():
 @app.route("/comments", methods=["GET"])
 @limiter.limit("120/hour;20/minute")  # Limits for comments endpoint
 def get_comments_endpoint():
-    t0 = time.perf_counter()
+    g.request_start_time = time.perf_counter() # Mark request start time
     video_url_or_id = request.args.get("videoId", "")
     if not video_url_or_id:
+        log_event('warning', 'comments_missing_video_id', video_id=video_url_or_id, ip=get_remote_address(), request_id=g.request_id)
         return jsonify({"error": "videoId parameter is missing"}), 400
 
     video_id = extract_video_id(video_url_or_id)
     if not video_id:
+        log_event('warning', 'comments_invalid_video_id', raw=video_url_or_id, ip=get_remote_address(), request_id=g.request_id)
         return jsonify({"error": "Invalid videoId format or URL"}), 400
+
+    # Log the start of comment fetching
+    log_event('info', 'comments_fetch_workflow_start', video_id=video_id, ip=get_remote_address(), request_id=g.request_id)
 
     cached = comment_cache.get(video_id)
     if cached is not None:
-        log_event('info', 'comments_cache_hit', video_id=video_id, count=len(cached))
+        log_event('info', 'comments_cache_hit', video_id=video_id, count=len(cached), request_id=g.request_id)
         return jsonify({"video_id": video_id, "comments": cached}), 200
 
     with shelve.open(PERSISTENT_COMMENT_DB) as db:
         cached = db.get(video_id)
         if cached is not None:
             comment_cache[video_id] = cached
-            log_event('info', 'comments_persisted_hit', video_id=video_id, count=len(cached))
+            log_event('info', 'comments_persisted_hit', video_id=video_id, count=len(cached), request_id=g.request_id)
             return jsonify({"video_id": video_id, "comments": cached}), 200
 
     try:
-        comments = _fetch_comments_resilient(video_id)
+        comments = _fetch_comments_resilient(video_id) # This calls the internal _fetch_comments_resilient function
         comment_cache[video_id] = comments
         with shelve.open(PERSISTENT_COMMENT_DB) as db:
             db[video_id] = comments
-        log_event('info', 'comments_fetched', video_id=video_id, count=len(comments), duration_ms=int((time.perf_counter()-t0)*1000))
+        log_event('info', 'comments_fetched', video_id=video_id, count=len(comments), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
         return jsonify({"video_id": video_id, "comments": comments}), 200
     except Exception as e:
-        log_event('warning', 'comments_fetch_failed_with_exception', video_id=video_id, error=str(e), duration_ms=int((time.perf_counter()-t0)*1000))
+        log_event('warning', 'comments_fetch_failed_with_exception', video_id=video_id, error=str(e), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
         # On technical failure, return 200 OK with empty comments and a warning message.
         return jsonify({"video_id": video_id, "comments": [], "warning": "Comments could not be fetched due to a technical issue."}), 200
 
