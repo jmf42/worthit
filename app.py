@@ -1458,13 +1458,13 @@ def openai_proxy():
     }
     
     # Log scrubbed payload
-    logged_payload = {k: v for k, v in payload.items() if k not in ['input', 'text']} # Avoid logging large text fields
-    if 'input' in payload: logged_payload['input_length'] = len(payload['input'])
-    if 'text' in payload and isinstance(payload['text'], dict) and 'input' in payload['text'] : # Handle new structure
-        logged_payload['text_input_length'] = len(payload['text']['input'])
-        payload_text_copy = payload['text'].copy()
-        payload_text_copy.pop('input', None)
-        logged_payload['text_other_fields'] = payload_text_copy
+    logged_payload = payload.copy()
+    # if 'input' in payload: logged_payload['input_length'] = len(payload['input'])
+    # if 'text' in payload and isinstance(payload['text'], dict) and 'input' in payload['text'] : # Handle new structure
+    #     logged_payload['text_input_length'] = len(payload['text']['input'])
+    #     payload_text_copy = payload['text'].copy()
+    #     payload_text_copy.pop('input', None)
+    #     logged_payload['text_other_fields'] = payload_text_copy
 
     # --- GPT-5 compatibility: strip unsupported params & adjust timeout ---
     model = str(payload.get("model", ""))
