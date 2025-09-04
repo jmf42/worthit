@@ -504,15 +504,52 @@ def fetch_api_once(video_id: str,
     try:
         ft = ytt_api.fetch(video_id, languages=languages)
     except NoTranscriptFound:
-        log_event('warning', 'transcript_method_failure', extra={
-            "method": "youtube-transcript-api",
-            "video_id": video_id,
-            "reason": "NoTranscriptFound",
-            "languages_attempted": languages,
-            "duration_ms": int((time.perf_counter() - t0) * 1000),
-            "request_id": request_id
-        })
-        return None
+        # Try advanced fallback: list transcripts, then fetch/translate
+        try:
+            tl = _list_transcripts_safe(video_id)
+            # Prefer requested languages directly
+            if languages:
+                try:
+                    t = tl.find_transcript(languages)
+                    ft = t.fetch()
+                except Exception:
+                    t = None
+            else:
+                t = None
+
+            # If no direct match, pick any transcript then translate to first preferred language if possible
+            if not 'ft' in locals() or ft is None:
+                # Pick a manually created transcript first, otherwise any
+                t = t or (getattr(tl, 'find_manually_created_transcript', lambda langs: None)(languages or []))
+                t = t or (getattr(tl, 'find_generated_transcript', lambda langs: None)(languages or []))
+                t = t or (next(iter(tl), None))
+                if t is None:
+                    raise NoTranscriptFound
+                # Translate if caller provided preferred languages and translation is supported
+                if languages and getattr(t, 'is_translatable', False):
+                    translated = None
+                    for lang in languages:
+                        try:
+                            translated = t.translate(lang)
+                            break
+                        except Exception:
+                            continue
+                    if translated is not None:
+                        ft = translated.fetch()
+                    else:
+                        ft = t.fetch()
+                else:
+                    ft = t.fetch()
+        except Exception:
+            log_event('warning', 'transcript_method_failure', extra={
+                "method": "youtube-transcript-api",
+                "video_id": video_id,
+                "reason": "NoTranscriptFound",
+                "languages_attempted": languages,
+                "duration_ms": int((time.perf_counter() - t0) * 1000),
+                "request_id": request_id
+            })
+            return None
     except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
         log_event('error', 'transcript_method_failure', extra={
             "method": "youtube-transcript-api",
@@ -628,6 +665,21 @@ def fetch_live_instances(api_url):
             return []
     except Exception as e:
         logger.warning(f"Failed to fetch instances from {api_url}: {e}")
+        # Fallback to a small static list of known instances
+        if "piped" in api_url:
+            return [
+                "https://pipedapi.kavin.rocks",
+                "https://pipedapi.adminforge.de",
+                "https://pipedapi.tokhmi.xyz",
+                "https://piped-api.privacy.com.de",
+                "https://api-piped.mha.fi",
+            ]
+        if "invidious" in api_url:
+            return [
+                "https://yewtu.be",
+                "https://vid.puffyan.us",
+                "https://inv.nadeko.net",
+            ]
         return []
 
 def _fetch_transcript_alternatives(video_id: str, request_id: str = "", languages: Optional[List[str]] = None) -> str | None:
