@@ -44,7 +44,6 @@ from urllib.parse import urljoin
 from yt_dlp import YoutubeDL
 
 import functools
-import random as _random
 
 # --- Patch for youtube-transcript-api compatibility ---
 import inspect
@@ -480,7 +479,8 @@ def _gateway_url() -> str | None:
     if GEN_HTTP:
         return GEN_HTTP
     if WS_USER and WS_PASS:
-        return f"http://{WS_USER}:{WS_PASS}@proxy.webshare.io:80"
+        # Webshare rotating residential gateway host
+        return f"http://{WS_USER}:{WS_PASS}@p.webshare.io:80"
     return None
 
 def get_proxy_dict() -> dict:
@@ -541,11 +541,19 @@ def fetch_api_once(video_id: str,
         "request_id": request_id
     })
     
+    # If forced proxy is enabled but no proxy is configured, skip direct attempt
+    if DISABLE_DIRECT and proxy_cfg is None:
+        log_event('warning', 'direct_fetch_disallowed_no_proxy', extra={
+            "video_id": video_id,
+            "request_id": request_id
+        })
+        return None
+
     # Build Accept-Language header with q-values
     accept_lang = ", ".join(f"{code};q={1.0 - (idx*0.1):.1f}" for idx, code in enumerate(languages[:5]))
     http_client = requests.Session()
     http_client.headers.update({
-        "User-Agent": _random.choice(USER_AGENTS),
+        "User-Agent": random.choice(USER_AGENTS),
         "Accept-Language": accept_lang,
         "Cookie": CONSENT_COOKIE_HEADER
     })
