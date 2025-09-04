@@ -667,15 +667,23 @@ def fetch_ytdlp(video_id: str,
             continue
         sub_langs.extend([f"{c}.*", c])
 
+    # Slightly more robust defaults to reduce bot checks on fallback path only.
     opts = {
         "quiet": True,
         "skip_download": True,
         "writesubtitles": True,
         "writeautomaticsub": True,
         "subtitleslangs": sub_langs or ["en.*", "en"],
-        "subtitlesformat": "best[ext=srv3]",
+        "subtitlesformat": "best[ext=srv3]/best[ext=vtt]/best[ext=srt]",
         "proxy": proxy_url or None,
         "nocheckcertificate": True,
+        # Use iOS client to avoid some web challenges; send realistic headers
+        "extractor_args": {"youtube": ["player_client=ios"]},
+        "http_headers": {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept-Language": "en-US,en;q=0.8",
+            "Cookie": CONSENT_COOKIE_HEADER,
+        },
     }
     # If a cookie file is available (either user-provided via env or the
     # generated consent cookie), pass it to yt-dlp to reduce bot challenges.
@@ -708,7 +716,8 @@ instance_cache = TTLCache(maxsize=10, ttl=3600)
 @cached(instance_cache)
 def fetch_live_instances(api_url):
     try:
-        response = session.get(api_url, timeout=5)
+        # Use proxy if configured to improve reachability under egress limits
+        response = session.get(api_url, timeout=5, proxies=get_proxy_dict())
         response.raise_for_status()
         # For piped, the API returns a list of dicts with "api_url" and "active"
         # For invidious, the API returns a list of [url, info] where info["health"] and info["monitor"]["status"] may exist
@@ -770,6 +779,21 @@ def _fetch_transcript_alternatives(video_id: str, request_id: str = "", language
     })
     piped_instances = fetch_live_instances("https://piped-instances.kavin.rocks/")
     invidious_instances = fetch_live_instances("https://api.invidious.io/instances.json?sort_by=health")
+    # Extra safety: if discovery yielded nothing, seed with static instances
+    if not piped_instances:
+        piped_instances = [
+            "https://pipedapi.kavin.rocks",
+            "https://pipedapi.adminforge.de",
+            "https://pipedapi.tokhmi.xyz",
+            "https://piped-api.privacy.com.de",
+            "https://api-piped.mha.fi",
+        ]
+    if not invidious_instances:
+        invidious_instances = [
+            "https://yewtu.be",
+            "https://vid.puffyan.us",
+            "https://inv.nadeko.net",
+        ]
 
     fetchers = [
         lambda vid=video_id: _piped_captions_direct(vid, piped_instances, languages=languages),
@@ -968,7 +992,7 @@ def _piped_captions_direct(video_id: str, hosts: list[str], languages: Optional[
         return None
     for host in hosts:
         try:
-            meta = session.get(f"{host}/api/v1/captions/{video_id}", timeout=4)
+            meta = session.get(f"{host}/api/v1/captions/{video_id}", timeout=4, proxies=get_proxy_dict())
             if meta.status_code == 404:
                 return None
             meta.raise_for_status()
@@ -989,7 +1013,7 @@ def _piped_captions_direct(video_id: str, hosts: list[str], languages: Optional[
                 continue
             if url.startswith("//"):
                 url = "https:" + url
-            raw = session.get(url, timeout=4).text
+            raw = session.get(url, timeout=4, proxies=get_proxy_dict()).text
             text = " ".join(html.unescape(t) for t in re.findall(r">([^<]+)</text>", raw)).strip()
             if text:
                 return text
@@ -1007,7 +1031,7 @@ def _piped_captions(video_id: str, hosts: list[str], languages: Optional[List[st
     # Use a simple round-robin, try each host in order
     for host in hosts:
         try:
-            resp = session.get(f"{host}/streams/{video_id}", timeout=4)
+            resp = session.get(f"{host}/streams/{video_id}", timeout=4, proxies=get_proxy_dict())
             if resp.status_code == 404:
                 continue
             resp.raise_for_status()
@@ -1026,7 +1050,7 @@ def _piped_captions(video_id: str, hosts: list[str], languages: Optional[List[st
             url = chosen.get("url")
             if not url:
                 continue
-            r = session.get(url, timeout=5)
+            r = session.get(url, timeout=5, proxies=get_proxy_dict())
             r.raise_for_status()
             data_text = r.text
             if url.endswith(".vtt"):
@@ -1057,7 +1081,7 @@ def _invidious_captions(video_id: str, hosts: list[str], languages: Optional[Lis
     for host in hosts:
         try:
             meta_url = f"{host}/api/v1/captions/{video_id}"
-            meta_resp = session.get(meta_url, timeout=5)
+            meta_resp = session.get(meta_url, timeout=5, proxies=get_proxy_dict())
             if meta_resp.status_code == 404:
                 # Video has no captions at all; no need to probe others
                 return None
@@ -1080,7 +1104,7 @@ def _invidious_captions(video_id: str, hosts: list[str], languages: Optional[Lis
                 continue
             # Some mirrors return a relative path → make it absolute
             caption_url = rel_url if rel_url.startswith("http") else urljoin(host, rel_url)
-            cap_resp = session.get(caption_url, timeout=5)
+            cap_resp = session.get(caption_url, timeout=5, proxies=get_proxy_dict())
             cap_resp.raise_for_status()
             raw = cap_resp.text
             # --- basic format sniffing / parsing ---
