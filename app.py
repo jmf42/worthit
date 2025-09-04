@@ -438,14 +438,28 @@ _YDL_OPTS_BASE = {
 }
 
 # ---------------------------------------------------------------------------
-# Webshare rotating residential gateway (new transcript logic)
+# Proxy configuration (supports Generic providers or Webshare)
 DISABLE_DIRECT = os.getenv("FORCE_PROXY", "false").lower() == "true"
 
 WS_USER = os.getenv("WEBSHARE_USER")
 WS_PASS = os.getenv("WEBSHARE_PASS")
 
+# Generic/DecoDo/Smartproxy style URLs
+GEN_HTTP = os.getenv("PROXY_HTTP_URL") or os.getenv("HTTP_PROXY")
+GEN_HTTPS = os.getenv("PROXY_HTTPS_URL") or os.getenv("HTTPS_PROXY")
+
 PROXY_CFG = None
-if WS_USER and WS_PASS:
+if GEN_HTTP or GEN_HTTPS:
+    try:
+        from youtube_transcript_api.proxies import GenericProxyConfig
+        PROXY_CFG = GenericProxyConfig(
+            http_url=GEN_HTTP or GEN_HTTPS,
+            https_url=GEN_HTTPS or GEN_HTTP,
+        )
+        logger.info("Using GenericProxyConfig (http=%s, https=%s)", bool(GEN_HTTP), bool(GEN_HTTPS))
+    except Exception as e:
+        logger.warning("Failed to create GenericProxyConfig: %s", e)
+elif WS_USER and WS_PASS:
     if not WS_USER.endswith("-rotate"):
         WS_USER = f"{WS_USER}-rotate"
     from youtube_transcript_api.proxies import WebshareProxyConfig
@@ -455,19 +469,24 @@ if WS_USER and WS_PASS:
     )
     logger.info("Using Webshare rotating residential proxies (username=%s)", WS_USER)
 else:
-    logger.info("No Webshare credentials – transcript requests will go direct")
+    logger.info("No proxy credentials – transcript requests will go direct unless FORCE_PROXY=true")
 
 # ---------------------------------------------------------------------------
 # Helper – build a single rotating Webshare gateway URL
 def _gateway_url() -> str | None:
+    # Prefer generic proxy URL if provided
+    if GEN_HTTPS:
+        return GEN_HTTPS
+    if GEN_HTTP:
+        return GEN_HTTP
     if WS_USER and WS_PASS:
         return f"http://{WS_USER}:{WS_PASS}@proxy.webshare.io:80"
     return None
 
 def get_proxy_dict() -> dict:
-    """Return {'https': gateway_url} if Webshare is configured, else {}."""
+    """Return requests proxy dict if a proxy is configured, else {}."""
     url = _gateway_url()
-    return {"https": url} if url else {}
+    return {"http": url, "https": url} if url else {}
 
 # Back‑compat shim for legacy helper names -------------------------------
 # Some old logic still refers to `rnd_proxy()` or `PROXY_ROTATION`.
