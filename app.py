@@ -547,7 +547,10 @@ def fetch_api_once(video_id: str,
 # yt‑dlp subtitle fallback ---------------------------------------------------
 # Simplified wrapper for yt-dlp to fetch subtitles
 # NOTE: yt-dlp has its own internal retries; this is a single call.
-def fetch_ytdlp(video_id: str, proxy_url: Optional[str], request_id: str = "") -> Optional[str]:
+def fetch_ytdlp(video_id: str,
+                proxy_url: Optional[str],
+                request_id: str = "",
+                languages: Optional[List[str]] = None) -> Optional[str]:
     """Fetch subtitles via yt-dlp, falling back to auto-generated if manual fails."""
     t0 = time.perf_counter()
     logger.info("Attempting transcript fetch via yt-dlp", extra={
@@ -557,12 +560,21 @@ def fetch_ytdlp(video_id: str, proxy_url: Optional[str], request_id: str = "") -
         "proxy_used": proxy_url is not None,
         "request_id": request_id
     })
+    # Map desired language codes into yt-dlp subtitle patterns (include auto and manual variants)
+    lang_list = languages or TRANSCRIPT_LANGS
+    sub_langs: List[str] = []
+    for code in lang_list:
+        c = (code or "").strip()
+        if not c:
+            continue
+        sub_langs.extend([f"{c}.*", c])
+
     opts = {
         "quiet": True,
         "skip_download": True,
         "writesubtitles": True,
         "writeautomaticsub": True,
-        "subtitleslangs": ["en.*", "en", "es.*", "es"],
+        "subtitleslangs": sub_langs or ["en.*", "en"],
         "subtitlesformat": "best[ext=srv3]",
         "proxy": proxy_url or None,
         "nocheckcertificate": True,
@@ -618,7 +630,7 @@ def fetch_live_instances(api_url):
         logger.warning(f"Failed to fetch instances from {api_url}: {e}")
         return []
 
-def _fetch_transcript_alternatives(video_id: str, request_id: str = "") -> str | None:
+def _fetch_transcript_alternatives(video_id: str, request_id: str = "", languages: Optional[List[str]] = None) -> str | None:
     """Try alternative APIs in parallel for transcript fetching."""
     t0 = time.perf_counter()
     logger.info("Attempting transcript fetch via alternative APIs", extra={
@@ -631,9 +643,9 @@ def _fetch_transcript_alternatives(video_id: str, request_id: str = "") -> str |
     invidious_instances = fetch_live_instances("https://api.invidious.io/instances.json?sort_by=health")
 
     fetchers = [
-        lambda vid=video_id: _piped_captions_direct(vid, piped_instances),
-        lambda vid=video_id: _piped_captions(vid, piped_instances),
-        lambda vid=video_id: _invidious_captions(vid, invidious_instances)
+        lambda vid=video_id: _piped_captions_direct(vid, piped_instances, languages=languages),
+        lambda vid=video_id: _piped_captions(vid, piped_instances, languages=languages),
+        lambda vid=video_id: _invidious_captions(vid, invidious_instances, languages=languages)
     ]
 
     with ThreadPoolExecutor(max_workers=3) as executor:
@@ -673,7 +685,9 @@ def _fetch_transcript_alternatives(video_id: str, request_id: str = "") -> str |
 
 # ---------------------------------------------------------------------------
 # Unified transcript fetching with clear fallback steps and logging
-def get_transcript(video_id: str, request_id: str = "") -> str:
+def get_transcript(video_id: str,
+                   request_id: str = "",
+                   languages: Optional[List[str]] = None) -> str:
     """
     Transcript fetch logic with explicit, concise fallback steps:
     1. Try youtube-transcript-api (proxy if configured)
@@ -691,7 +705,7 @@ def get_transcript(video_id: str, request_id: str = "") -> str:
 
     # Step 1: Try youtube-transcript-api (with proxy if configured)
     try:
-        txt = fetch_api_once(video_id, PROXY_CFG, request_id=request_id)
+        txt = fetch_api_once(video_id, PROXY_CFG, request_id=request_id, languages=languages)
         if txt:
             logger.info("Primary transcript fetch succeeded", extra={
                 "event": "transcript_step_success",
@@ -723,7 +737,7 @@ def get_transcript(video_id: str, request_id: str = "") -> str:
         })
 
     # Step 2: Try alternative APIs in parallel
-    txt = _fetch_transcript_alternatives(video_id, request_id=request_id)
+    txt = _fetch_transcript_alternatives(video_id, request_id=request_id, languages=languages)
     if txt:
         logger.info("Fallback transcript fetch succeeded via alternative APIs", extra={
             "event": "transcript_step_success",
@@ -746,7 +760,7 @@ def get_transcript(video_id: str, request_id: str = "") -> str:
         })
 
     # Step 3: Try yt-dlp (no proxy)
-    txt = fetch_ytdlp(video_id, None, request_id=request_id)
+    txt = fetch_ytdlp(video_id, None, request_id=request_id, languages=languages)
     if txt:
         logger.info("Fallback transcript fetch succeeded via yt-dlp (no proxy)", extra={
             "event": "transcript_step_success",
@@ -771,7 +785,7 @@ def get_transcript(video_id: str, request_id: str = "") -> str:
     # Step 4: Try yt-dlp (with proxy)
     proxy_url = _gateway_url()
     if proxy_url:
-        txt = fetch_ytdlp(video_id, proxy_url, request_id=request_id)
+        txt = fetch_ytdlp(video_id, proxy_url, request_id=request_id, languages=languages)
         if txt:
             logger.info("Fallback transcript fetch succeeded via yt-dlp (with proxy)", extra={
                 "event": "transcript_step_success",
@@ -816,7 +830,7 @@ def _strip_tags(text: str) -> str:
     """Remove HTML/XML tags from a string."""
     return re.sub(r"<[^>]+>", "", text)
 
-def _piped_captions_direct(video_id: str, hosts: list[str]) -> str | None:
+def _piped_captions_direct(video_id: str, hosts: list[str], languages: Optional[List[str]] = None) -> str | None:
     """
     Try to get captions directly from a list of Piped API instances.
     """
@@ -833,10 +847,14 @@ def _piped_captions_direct(video_id: str, hosts: list[str]) -> str | None:
             subs = data.get("captions") or []
             if not subs:
                 continue
-            chosen = next(
-                (s for s in subs if s.get("language", "").lower().startswith("en")),
-                subs[0]
-            )
+            prefs = [c.lower() for c in (languages or TRANSCRIPT_LANGS)]
+            chosen = None
+            for code in prefs:
+                chosen = next((s for s in subs if s.get("language", "").lower().startswith(code)), None)
+                if chosen:
+                    break
+            if not chosen:
+                chosen = subs[0]
             url = chosen.get("url")
             if not url:
                 continue
@@ -852,7 +870,7 @@ def _piped_captions_direct(video_id: str, hosts: list[str]) -> str | None:
     logger.warning("All direct Piped caption mirrors failed for %s", video_id)
     return None
 
-def _piped_captions(video_id: str, hosts: list[str]) -> str | None:
+def _piped_captions(video_id: str, hosts: list[str], languages: Optional[List[str]] = None) -> str | None:
     """Try to get captions from Piped API using a list of hosts."""
     if not hosts:
         logger.warning("No Piped hosts available for fallback captions for %s", video_id)
@@ -868,8 +886,14 @@ def _piped_captions(video_id: str, hosts: list[str]) -> str | None:
             if "subtitles" not in data or not data["subtitles"]:
                 continue
             subs = data["subtitles"]
-            en_sub = next((s for s in subs if s.get("language", "").lower().startswith("en")), None)
-            chosen = en_sub or subs[0]
+            prefs = [c.lower() for c in (languages or TRANSCRIPT_LANGS)]
+            chosen = None
+            for code in prefs:
+                chosen = next((s for s in subs if s.get("language", "").lower().startswith(code)), None)
+                if chosen:
+                    break
+            if not chosen:
+                chosen = subs[0]
             url = chosen.get("url")
             if not url:
                 continue
@@ -890,7 +914,7 @@ def _piped_captions(video_id: str, hosts: list[str]) -> str | None:
     logger.warning("All fallback Piped API hosts failed for %s", video_id)
     return None
 
-def _invidious_captions(video_id: str, hosts: list[str]) -> str | None:
+def _invidious_captions(video_id: str, hosts: list[str], languages: Optional[List[str]] = None) -> str | None:
     """
     Fetch captions from a list of Invidious mirrors.
     • One attempt per host (no endless cycle / retry storm)
@@ -913,11 +937,15 @@ def _invidious_captions(video_id: str, hosts: list[str]) -> str | None:
             subs = meta_json.get("captions") or []
             if not subs:
                 continue
-            # Prefer English, otherwise first available
-            chosen = next(
-                (s for s in subs if s.get("languageCode", "").lower().startswith("en")),
-                subs[0],
-            )
+            # Prefer requested languages, otherwise first available
+            prefs = [c.lower() for c in (languages or TRANSCRIPT_LANGS)]
+            chosen = None
+            for code in prefs:
+                chosen = next((s for s in subs if s.get("languageCode", "").lower().startswith(code)), None)
+                if chosen:
+                    break
+            if not chosen:
+                chosen = subs[0]
             rel_url = chosen.get("url")
             if not rel_url:
                 continue
@@ -1332,8 +1360,16 @@ def get_transcript_endpoint():
         log_event('warning', 'transcript_invalid_video_id', raw=video_url_or_id, ip=get_remote_address(), request_id=g.request_id)
         return jsonify({"error": "Invalid videoId format or URL"}), 400
 
+    # Parse preferred languages from query (CSV) → list of codes
+    raw_langs = request.args.get("languages")
+    languages: Optional[List[str]] = None
+    if raw_langs:
+        languages = [c.strip() for c in str(raw_langs).split(",") if c.strip()]
+        if not languages:
+            languages = None
+
     # Log the start of transcript fetching
-    log_event('info', 'transcript_fetch_workflow_start', video_id=video_id, languages=request.args.get("languages", TRANSCRIPT_LANGS), ip=get_remote_address(), request_id=g.request_id)
+    log_event('info', 'transcript_fetch_workflow_start', video_id=video_id, languages=languages or TRANSCRIPT_LANGS, ip=get_remote_address(), request_id=g.request_id)
 
     # Check RAM cache
     cached = transcript_cache.get(video_id)
@@ -1362,7 +1398,7 @@ def get_transcript_endpoint():
         try:
             # Log attempt start
             log_event('info', 'transcript_method_attempt', method='unified_fetch', attempt=attempts + 1, video_id=video_id, request_id=g.request_id)
-            text = get_transcript(video_id) # This calls the internal get_transcript function
+            text = get_transcript(video_id, request_id=g.request_id, languages=languages)
             transcript_cache[video_id] = text
             with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
                 db[video_id] = text
