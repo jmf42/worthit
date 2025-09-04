@@ -44,6 +44,7 @@ from urllib.parse import urljoin
 from yt_dlp import YoutubeDL
 
 import functools
+import random as _random
 
 # --- Patch for youtube-transcript-api compatibility ---
 import inspect
@@ -86,6 +87,7 @@ PERSISTENT_TRANSCRIPT_DB = os.path.join(PERSISTENT_CACHE_DIR, "transcript_cache.
 PERSISTENT_COMMENT_DB = os.path.join(PERSISTENT_CACHE_DIR, "comment_cache.db")
 # YTDL Cookie file configuration
 YTDL_COOKIE_FILE = os.getenv("YTDL_COOKIE_FILE", "/etc/secrets/cookies_chrome2.txt")
+CONSENT_COOKIE_HEADER = "CONSENT=YES+cb.20210328-17-p0.en+FX+888"
 
 # ------------------------------------------------------------------
 # Universal CONSENT cookie (avoids 204/empty captions from YouTube)
@@ -487,7 +489,27 @@ def fetch_api_once(video_id: str,
                    request_id: str = "") -> Optional[str]:
     """Single attempt using youtube-transcript-api. Returns plain text or None."""
     t0 = time.perf_counter()
-    languages = languages or TRANSCRIPT_LANGS
+    def _expand_langs(codes: List[str]) -> List[str]:
+        expanded: List[str] = []
+        seen = set()
+        mapping = {
+            'es': ['es', 'es-419', 'es-ES', 'es-MX', 'es-AR', 'es-CL', 'es-CO', 'es-PE', 'es-VE'],
+            'pt': ['pt', 'pt-BR', 'pt-PT'],
+            'en': ['en', 'en-US', 'en-GB', 'en-IN'],
+            'hi': ['hi', 'hi-IN'],
+            'ar': ['ar', 'ar-SA', 'ar-EG', 'ar-AE']
+        }
+        for c in (codes or []):
+            c = (c or '').strip()
+            if not c: continue
+            variants = mapping.get(c, [c])
+            for v in variants:
+                if v not in seen:
+                    expanded.append(v)
+                    seen.add(v)
+        return expanded or ['en']
+
+    languages = _expand_langs(languages or TRANSCRIPT_LANGS)
     log_event('info', 'transcript_method_attempt', extra={
         "method": "youtube-transcript-api",
         "video_id": video_id,
@@ -500,7 +522,15 @@ def fetch_api_once(video_id: str,
         "request_id": request_id
     })
     
-    ytt_api = YouTubeTranscriptApi(proxy_config=proxy_cfg)
+    # Build Accept-Language header with q-values
+    accept_lang = ", ".join(f"{code};q={1.0 - (idx*0.1):.1f}" for idx, code in enumerate(languages[:5]))
+    http_client = requests.Session()
+    http_client.headers.update({
+        "User-Agent": _random.choice(USER_AGENTS),
+        "Accept-Language": accept_lang,
+        "Cookie": CONSENT_COOKIE_HEADER
+    })
+    ytt_api = YouTubeTranscriptApi(http_client=http_client, proxy_config=proxy_cfg)
     try:
         ft = ytt_api.fetch(video_id, languages=languages)
     except NoTranscriptFound:
