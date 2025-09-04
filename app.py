@@ -506,7 +506,11 @@ def fetch_api_once(video_id: str,
     except NoTranscriptFound:
         # Try advanced fallback: list transcripts, then fetch/translate
         try:
-            tl = _list_transcripts_safe(video_id)
+            # Prefer instance method (respects proxy_config); fall back to classmethod
+            if hasattr(ytt_api, 'list'):
+                tl = ytt_api.list(video_id)
+            else:
+                tl = _list_transcripts_safe(video_id, proxy_config=proxy_cfg)
             # Prefer requested languages directly
             if languages:
                 try:
@@ -653,14 +657,30 @@ def fetch_live_instances(api_url):
         # For invidious, the API returns a list of [url, info] where info["health"] and info["monitor"]["status"] may exist
         if "piped" in api_url:
             # Piped API
-            return [instance["api_url"].rstrip("/") for instance in response.json() if instance.get("api_url") and instance.get("active")]
+            lst = [instance["api_url"].rstrip("/") for instance in response.json() if instance.get("api_url") and instance.get("active")]
+            if not lst:
+                lst = [
+                    "https://pipedapi.kavin.rocks",
+                    "https://pipedapi.adminforge.de",
+                    "https://pipedapi.tokhmi.xyz",
+                    "https://piped-api.privacy.com.de",
+                    "https://api-piped.mha.fi",
+                ]
+            return lst
         elif "invidious" in api_url:
             # Invidious API (https://api.invidious.io/instances.json?sort_by=health)
-            return [
+            lst = [
                 url.rstrip("/")
                 for url, info in response.json()
                 if info.get("type") == "https" and info.get("health", 0) > 0 and info.get("monitor", {}).get("status") == "online"
             ]
+            if not lst:
+                lst = [
+                    "https://yewtu.be",
+                    "https://vid.puffyan.us",
+                    "https://inv.nadeko.net",
+                ]
+            return lst
         else:
             return []
     except Exception as e:
