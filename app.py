@@ -908,9 +908,9 @@ def get_transcript(video_id: str,
         "request_id": request_id
     })
 
-    # Step 1: Try youtube-transcript-api (with proxy if configured)
+    # Step 1a: Try youtube-transcript-api DIRECT (preferred, keeps EN path unchanged, avoids flaky proxies)
     try:
-        txt = fetch_api_once(video_id, PROXY_CFG, request_id=request_id, languages=languages)
+        txt = fetch_api_once(video_id, None, request_id=request_id, languages=languages)
         if txt:
             logger.info("Primary transcript fetch succeeded", extra={
                 "event": "transcript_step_success",
@@ -932,7 +932,7 @@ def get_transcript(video_id: str,
                 "request_id": request_id
             })
     except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
-        logger.warning("Primary transcript fetch blocked or failed", extra={
+        logger.warning("Primary transcript fetch blocked or failed (direct)", extra={
             "event": "transcript_step_failure",
             "step": 1,
             "method": "youtube-transcript-api",
@@ -940,6 +940,40 @@ def get_transcript(video_id: str,
             "reason": str(e),
             "request_id": request_id
         })
+
+    # Step 1b: Retry youtube-transcript-api WITH PROXY (only if configured)
+    if PROXY_CFG is not None:
+        try:
+            txt = fetch_api_once(video_id, PROXY_CFG, request_id=request_id, languages=languages)
+            if txt:
+                logger.info("Primary transcript fetch succeeded (with proxy)", extra={
+                    "event": "transcript_step_success",
+                    "step": 1,
+                    "method": "youtube-transcript-api_proxy",
+                    "video_id": video_id,
+                    "text_len": len(txt),
+                    "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+                    "request_id": request_id
+                })
+                return txt
+            else:
+                logger.info("Primary transcript fetch failed (with proxy)", extra={
+                    "event": "transcript_step_failure",
+                    "step": 1,
+                    "method": "youtube-transcript-api_proxy",
+                    "video_id": video_id,
+                    "reason": "No transcript found",
+                    "request_id": request_id
+                })
+        except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
+            logger.warning("Primary transcript fetch blocked or failed (proxy)", extra={
+                "event": "transcript_step_failure",
+                "step": 1,
+                "method": "youtube-transcript-api_proxy",
+                "video_id": video_id,
+                "reason": str(e),
+                "request_id": request_id
+            })
 
     # Step 2: Try alternative APIs in parallel
     txt = _fetch_transcript_alternatives(video_id, request_id=request_id, languages=languages)
