@@ -437,6 +437,22 @@ _YDL_OPTS_BASE = {
 }
 
 # ---------------------------------------------------------------------------
+# Proxy health check (quick)
+def _proxy_is_healthy(url: Optional[str]) -> bool:
+    """Best-effort probe to skip obviously broken proxies before heavy calls.
+    Uses YouTube's generate_204 endpoint (very cheap). 3s timeout.
+    """
+    if not url:
+        return False
+    try:
+        r = requests.get(
+            "https://www.youtube.com/generate_204",
+            proxies={"http": url, "https": url},
+            timeout=3,
+        )
+        return 200 <= r.status_code < 400
+    except Exception:
+        return False
 # Proxy configuration (supports Generic providers or Webshare)
 DISABLE_DIRECT = os.getenv("FORCE_PROXY", "false").lower() == "true"
 
@@ -516,7 +532,24 @@ def fetch_api_once(video_id: str,
             'pt': ['pt', 'pt-BR', 'pt-PT'],
             'en': ['en', 'en-US', 'en-GB', 'en-IN'],
             'hi': ['hi', 'hi-IN'],
-            'ar': ['ar', 'ar-SA', 'ar-EG', 'ar-AE']
+            'ar': ['ar', 'ar-SA', 'ar-EG', 'ar-AE'],
+            'fr': ['fr', 'fr-FR', 'fr-CA'],
+            'de': ['de', 'de-DE'],
+            'it': ['it', 'it-IT'],
+            'ru': ['ru', 'ru-RU'],
+            'tr': ['tr', 'tr-TR'],
+            'id': ['id', 'id-ID'],
+            'ja': ['ja', 'ja-JP'],
+            'ko': ['ko', 'ko-KR'],
+            'zh': ['zh', 'zh-Hans', 'zh-Hant', 'zh-CN', 'zh-TW'],
+            'vi': ['vi', 'vi-VN'],
+            'pl': ['pl', 'pl-PL'],
+            'nl': ['nl', 'nl-NL'],
+            'fa': ['fa', 'fa-IR'],
+            'ur': ['ur', 'ur-PK', 'ur-IN'],
+            'bn': ['bn', 'bn-BD', 'bn-IN'],
+            'ta': ['ta', 'ta-IN'],
+            'te': ['te', 'te-IN'],
         }
         for c in (codes or []):
             c = (c or '').strip()
@@ -526,6 +559,10 @@ def fetch_api_once(video_id: str,
                 if v not in seen:
                     expanded.append(v)
                     seen.add(v)
+        # Always include English as a last‑resort fallback without changing
+        # the existing priority order.
+        if 'en' not in seen:
+            expanded.append('en')
         return expanded or ['en']
 
     languages = _expand_langs(languages or TRANSCRIPT_LANGS)
@@ -689,6 +726,21 @@ def fetch_ytdlp(video_id: str,
     # generated consent cookie), pass it to yt-dlp to reduce bot challenges.
     if YTDL_COOKIE_FILE:
         opts["cookiefile"] = YTDL_COOKIE_FILE
+    # Ensure English is always a last‑resort subtitle option
+    if "en" not in (languages or []):
+        langs = (languages or []) + ["en"]
+    else:
+        langs = (languages or [])
+    # Expand subtitle patterns accordingly
+    sub_langs = []
+    for code in langs:
+        c = (code or "").strip()
+        if not c:
+            continue
+        if c not in opts.get("subtitleslangs", []):
+            sub_langs.extend([f"{c}.*", c])
+    if sub_langs:
+        opts["subtitleslangs"] = sub_langs
     with tempfile.TemporaryDirectory() as td:
         opts["outtmpl"] = f"{td}/%(id)s.%(ext)s"
         try:
@@ -938,27 +990,38 @@ def get_transcript(video_id: str,
     # Step 4: Try yt-dlp (with proxy)
     proxy_url = _gateway_url()
     if proxy_url:
-        txt = fetch_ytdlp(video_id, proxy_url, request_id=request_id, languages=languages)
-        if txt:
-            logger.info("Fallback transcript fetch succeeded via yt-dlp (with proxy)", extra={
-                "event": "transcript_step_success",
+        # Validate proxy before using to avoid noisy CONNECT failures
+        if not _proxy_is_healthy(proxy_url):
+            logger.warning("Proxy health check failed — skipping yt-dlp proxy fallback", extra={
+                "event": "transcript_step_skipped",
                 "step": 4,
                 "method": "yt-dlp_with_proxy",
                 "video_id": video_id,
-                "text_len": len(txt),
-                "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+                "proxy_url": proxy_url,
                 "request_id": request_id
             })
-            return txt
         else:
-            logger.info("yt-dlp (with proxy) fallback failed (no transcript found)", extra={
-                "event": "transcript_step_failure",
-                "step": 4,
-                "method": "yt-dlp_with_proxy",
-                "video_id": video_id,
-                "reason": "No transcript found",
-                "request_id": request_id
-            })
+            txt = fetch_ytdlp(video_id, proxy_url, request_id=request_id, languages=languages)
+            if txt:
+                logger.info("Fallback transcript fetch succeeded via yt-dlp (with proxy)", extra={
+                    "event": "transcript_step_success",
+                    "step": 4,
+                    "method": "yt-dlp_with_proxy",
+                    "video_id": video_id,
+                    "text_len": len(txt),
+                    "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+                    "request_id": request_id
+                })
+                return txt
+            else:
+                logger.info("yt-dlp (with proxy) fallback failed (no transcript found)", extra={
+                    "event": "transcript_step_failure",
+                    "step": 4,
+                    "method": "yt-dlp_with_proxy",
+                    "video_id": video_id,
+                    "reason": "No transcript found",
+                    "request_id": request_id
+                })
     else:
         logger.info("yt-dlp (with proxy) skipped: No proxy URL available", extra={
             "event": "transcript_step_skipped",
