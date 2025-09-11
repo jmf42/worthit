@@ -425,6 +425,58 @@ def _fetch_from_alternative_api(hosts: deque, path: str, cooldown_map: dict[str,
     log_event('warning', 'alternative_api_all_hosts_failed', path=path, duration_ms=int((time.perf_counter() - t0_workflow) * 1000), request_id=request_id)
     return None
 
+# --- Language preferences helper (shared) ---
+def expand_preferred_langs(codes: Optional[List[str]]) -> List[str]:
+    if not codes:
+        codes = TRANSCRIPT_LANGS
+    mapping = {
+        'es': ['es', 'es-419', 'es-ES', 'es-MX', 'es-AR', 'es-CL', 'es-CO', 'es-PE', 'es-VE'],
+        'pt': ['pt', 'pt-BR', 'pt-PT'],
+        'en': ['en', 'en-US', 'en-GB', 'en-IN'],
+        'hi': ['hi', 'hi-IN'],
+        'ar': ['ar', 'ar-SA', 'ar-EG', 'ar-AE'],
+        'fr': ['fr', 'fr-FR', 'fr-CA'],
+        'de': ['de', 'de-DE'],
+        'it': ['it', 'it-IT'],
+        'ru': ['ru', 'ru-RU'],
+        'tr': ['tr', 'tr-TR'],
+        'id': ['id', 'id-ID'],
+        'ja': ['ja', 'ja-JP'],
+        'ko': ['ko', 'ko-KR'],
+        'zh': ['zh', 'zh-Hans', 'zh-Hant', 'zh-CN', 'zh-TW'],
+        'vi': ['vi', 'vi-VN'],
+        'pl': ['pl', 'pl-PL'],
+        'nl': ['nl', 'nl-NL'],
+        'fa': ['fa', 'fa-IR'],
+        'ur': ['ur', 'ur-PK', 'ur-IN'],
+        'bn': ['bn', 'bn-BD', 'bn-IN'],
+        'ta': ['ta', 'ta-IN'],
+        'te': ['te', 'te-IN'],
+    }
+    # 1) De-dup while preserving order
+    seen = set()
+    ordered = []
+    for c in codes:
+        c = (c or '').strip()
+        if not c or c in seen:
+            continue
+        ordered.append(c)
+        seen.add(c)
+    # 2) Ensure English first
+    if 'en' in ordered:
+        ordered.remove('en')
+    ordered.insert(0, 'en')
+    # 3) Expand variants
+    out = []
+    seen = set()
+    for c in ordered:
+        variants = mapping.get(c, [c])
+        for v in variants:
+            if v not in seen:
+                out.append(v)
+                seen.add(v)
+    return out
+
 # --- yt-dlp Helper ---
 _YDL_OPTS_BASE = {
     "quiet": True, "skip_download": True, "extract_flat": "discard_in_playlist",
@@ -746,13 +798,24 @@ def fetch_ytdlp(video_id: str,
         try:
             with YoutubeDL(opts) as ydl:
                 ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
-            fpath = next(pathlib.Path(td).glob(f"{video_id}*.srv3"), None)
+            # Pick best available subtitle file, preferring srv3, then vtt, then srt
+            fpath = None
+            for ext in ("srv3", "vtt", "srt"):
+                fpath = next(pathlib.Path(td).glob(f"{video_id}*.{ext}"), None)
+                if fpath:
+                    break
             if not fpath:
                 return None
-            xml = fpath.read_text(encoding="utf-8", errors="ignore")
-            return " ".join(
-                html.unescape(t) for t in re.findall(r">([^<]+)</text>", xml)
-            )
+            raw = fpath.read_text(encoding="utf-8", errors="ignore")
+            if fpath.suffix == ".srv3" or "<text" in raw:
+                return " ".join(html.unescape(t) for t in re.findall(r">([^<]+)</text>", raw))
+            if fpath.suffix == ".vtt":
+                lines = [l.strip() for l in raw.splitlines() if l and not l.startswith("WEBVTT") and "-->" not in l]
+                return " ".join(lines)
+            if fpath.suffix == ".srt":
+                lines = [l.strip() for l in raw.splitlines() if l and "-->" not in l and not re.match(r"^\d+$", l)]
+                return " ".join(lines)
+            return None
         except Exception as e:
             logger.warning("yt-dlp failed for %s: %s", video_id, e)
             return None
@@ -1614,9 +1677,10 @@ def get_transcript_endpoint():
     raw_langs = request.args.get("languages")
     languages: Optional[List[str]] = None
     if raw_langs:
-        languages = [c.strip() for c in str(raw_langs).split(",") if c.strip()]
-        if not languages:
-            languages = None
+        base_list = [c.strip() for c in str(raw_langs).split(",") if c.strip()]
+        languages = expand_preferred_langs(base_list)
+    else:
+        languages = expand_preferred_langs(TRANSCRIPT_LANGS)
 
     # Log the start of transcript fetching
     log_event('info', 'transcript_fetch_workflow_start', video_id=video_id, languages=languages or TRANSCRIPT_LANGS, ip=get_remote_address(), request_id=g.request_id)
@@ -1902,33 +1966,15 @@ def get_openai_response(response_id):
 # --- Render root health check ------------------------------------------------
 @app.route("/", methods=["GET"])
 def root_ok():
-    """Landing page.
-    - HTML marketing page by default (index.html)
-    - Searches common locations: youtube-transcript-service/static, worthit/static
-    - JSON uptime if `?format=json` or `Accept: application/json`
-    """
-    want_json = request.args.get("format") == "json" or \
-                "application/json" in (request.headers.get("Accept") or "")
-    if want_json:
-        uptime = round(time.time() - app_start_time)
-        return jsonify({"status": "ok", "uptime": uptime}), 200
+    """Landing page: always serve index.html"""
+    return app.send_static_file("index.html")
 
-    # Try multiple candidate paths for index.html
-    try:
-        base = pathlib.Path(__file__).resolve().parent
-        candidates = [
-            base / "static" / "index.html",                   # youtube-transcript-service/static/index.html
-            base.parent / "worthit" / "static" / "index.html", # ../worthit/static/index.html
-            base.parent / "static" / "index.html"              # ../static/index.html
-        ]
-        for p in candidates:
-            if p.is_file():
-                return send_from_directory(str(p.parent), p.name)
-    except Exception:
-        pass
-    # Fallback: minimal JSON ok when no index found
+
+@app.route("/_health", methods=["GET"])
+def health():
+    """JSON uptime check"""
     uptime = round(time.time() - app_start_time)
-    return jsonify({"status": "ok", "uptime": uptime, "note": "index.html not found"}), 200
+    return jsonify({"status": "ok", "uptime": uptime}), 200
 
 def _send_static_multi(filename: str):
     base = pathlib.Path(__file__).resolve().parent
