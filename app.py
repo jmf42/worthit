@@ -284,7 +284,9 @@ def _timedtext_fetch_vtt(video_id: str, lang: str, asr: bool, use_proxy: bool = 
     return None
 
 def _timedtext_list_tracks(video_id: str, use_proxy: bool = False, request_id: str = "") -> list[tuple[str, str]]:
-    """Return list of (lang_code, kind) for available timedtext tracks."""
+    """Return list of (lang_code, kind) for available timedtext tracks.
+    Robustly parses <track ...> elements and infers kind=manual when missing.
+    """
     try:
         params = {"v": video_id, "type": "list"}
         proxies = get_proxy_dict() if use_proxy else {}
@@ -292,12 +294,20 @@ def _timedtext_list_tracks(video_id: str, use_proxy: bool = False, request_id: s
         if r.status_code != 200:
             return []
         xml = r.text
-        tracks = re.findall(r"<track[^>]*lang_code=\"([^\"]+)\"[^>]*kind=\"?([^\"\s>]*)", xml)
-        # kind may be empty (manual); normalize empty to 'manual'
+        # Extract each <track ...> tag
+        tags = re.findall(r"<track\s+([^>]+)>", xml)
         out: list[tuple[str, str]] = []
-        for code, kind in tracks:
-            k = kind.strip() or 'manual'
-            out.append((code, k))
+        for attrs in tags:
+            # lang_code is required
+            m_lang = re.search(r"lang_code=\"([^\"]+)\"", attrs)
+            if not m_lang:
+                continue
+            code = m_lang.group(1)
+            # kind may be missing; treat as manual unless explicitly 'asr'
+            kind = 'manual'
+            if re.search(r"kind=\"asr\"", attrs):
+                kind = 'asr'
+            out.append((code, kind))
         return out
     except Exception as e:
         log_event('debug', 'timedtext_list_error', extra={"video_id": video_id, "error": str(e), "request_id": request_id})
@@ -561,6 +571,7 @@ _PIPE_COOLDOWN: dict[str, float] = {}
 
 def _fetch_from_alternative_api(hosts: deque, path: str, cooldown_map: dict[str, float], timeout: float = 2.0, request_id: str = "") -> dict | None:
     deadline = time.time() + timeout
+    t_flow_start = time.perf_counter()
     log_event('info', 'alternative_api_attempt_flow_start', path=path, host_count=len(hosts), request_id=request_id)
     # Simple round-robin with cooldown
     for _ in range(len(hosts)):
@@ -594,7 +605,7 @@ def _fetch_from_alternative_api(hosts: deque, path: str, cooldown_map: dict[str,
         except Exception as e:
             log_event('error', 'alternative_api_host_unexpected_error', url=url, host=host, error=str(e), duration_ms=int((time.perf_counter() - t_host_attempt) * 1000), request_id=request_id, exc_info=LOG_LEVEL=="DEBUG")
             cooldown_map[host] = time.time() + 300
-    log_event('warning', 'alternative_api_all_hosts_failed', path=path, duration_ms=int((time.perf_counter() - t0_workflow) * 1000), request_id=request_id)
+    log_event('warning', 'alternative_api_all_hosts_failed', path=path, duration_ms=int((time.perf_counter() - t_flow_start) * 1000), request_id=request_id)
     return None
 
 # --- Language preferences helper (shared) ---
@@ -748,48 +759,8 @@ def fetch_api_once(video_id: str,
                    request_id: str = "") -> Optional[str]:
     """Single attempt using youtube-transcript-api. Returns plain text or None."""
     t0 = time.perf_counter()
-    def _expand_langs(codes: List[str]) -> List[str]:
-        expanded: List[str] = []
-        seen = set()
-        mapping = {
-            'es': ['es', 'es-419', 'es-ES', 'es-MX', 'es-AR', 'es-CL', 'es-CO', 'es-PE', 'es-VE'],
-            'pt': ['pt', 'pt-BR', 'pt-PT'],
-            'en': ['en', 'en-US', 'en-GB', 'en-IN'],
-            'hi': ['hi', 'hi-IN'],
-            'ar': ['ar', 'ar-SA', 'ar-EG', 'ar-AE'],
-            'fr': ['fr', 'fr-FR', 'fr-CA'],
-            'de': ['de', 'de-DE'],
-            'it': ['it', 'it-IT'],
-            'ru': ['ru', 'ru-RU'],
-            'tr': ['tr', 'tr-TR'],
-            'id': ['id', 'id-ID'],
-            'ja': ['ja', 'ja-JP'],
-            'ko': ['ko', 'ko-KR'],
-            'zh': ['zh', 'zh-Hans', 'zh-Hant', 'zh-CN', 'zh-TW'],
-            'vi': ['vi', 'vi-VN'],
-            'pl': ['pl', 'pl-PL'],
-            'nl': ['nl', 'nl-NL'],
-            'fa': ['fa', 'fa-IR'],
-            'ur': ['ur', 'ur-PK', 'ur-IN'],
-            'bn': ['bn', 'bn-BD', 'bn-IN'],
-            'ta': ['ta', 'ta-IN'],
-            'te': ['te', 'te-IN'],
-        }
-        for c in (codes or []):
-            c = (c or '').strip()
-            if not c: continue
-            variants = mapping.get(c, [c])
-            for v in variants:
-                if v not in seen:
-                    expanded.append(v)
-                    seen.add(v)
-        # Always include English as a last‑resort fallback without changing
-        # the existing priority order.
-        if 'en' not in seen:
-            expanded.append('en')
-        return expanded or ['en']
-
-    languages = _expand_langs(languages or TRANSCRIPT_LANGS)
+    # Use shared normalization: always try English first, then base+variant expansions
+    languages = expand_preferred_langs(languages or TRANSCRIPT_LANGS)
     log_event('info', 'transcript_method_attempt', extra={
         "method": "youtube-transcript-api",
         "video_id": video_id,
@@ -818,8 +789,6 @@ def fetch_api_once(video_id: str,
         "Accept-Language": accept_lang,
         "Cookie": CONSENT_COOKIE_HEADER
     })
-    # Load full cookies if available (can bypass bot checks / age gates)
-    _load_cookies_from_netscape(YTDL_COOKIE_FILE, http_client)
     ytt_api = YouTubeTranscriptApi(http_client=http_client, proxy_config=proxy_cfg)
     try:
         ft = ytt_api.fetch(video_id, languages=languages)
