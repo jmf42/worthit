@@ -1,0 +1,9 @@
+# Ignore git and Python junk
+.git
+.gitignore
+__pycache__/
+*.pyc
+
+# KEEP the static folder (important!)
+!static/**
+
