@@ -1902,12 +1902,16 @@ def get_openai_response(response_id):
 # --- Render root health check ------------------------------------------------
 @app.route("/", methods=["GET"])
 def root_ok():
+    """Landing page.
+    - HTML marketing page by default (static/index.html)
+    - JSON uptime if `?format=json` or `Accept: application/json`
     """
-    Simple 200 OK for Render's default health check.
-    Returns minimal JSON with uptime in seconds.
-    """
-    uptime = round(time.time() - app_start_time)
-    return jsonify({"status": "ok", "uptime": uptime}), 200
+    want_json = request.args.get("format") == "json" or \
+                "application/json" in (request.headers.get("Accept") or "")
+    if want_json:
+        uptime = round(time.time() - app_start_time)
+        return jsonify({"status": "ok", "uptime": uptime}), 200
+    return send_from_directory("static", "index.html")
 
 @app.route("/privacy")
 def privacy(): return send_from_directory("static", "privacy.html")
