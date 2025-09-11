@@ -1903,7 +1903,8 @@ def get_openai_response(response_id):
 @app.route("/", methods=["GET"])
 def root_ok():
     """Landing page.
-    - HTML marketing page by default (static/index.html)
+    - HTML marketing page by default (index.html)
+    - Searches common locations: youtube-transcript-service/static, worthit/static
     - JSON uptime if `?format=json` or `Accept: application/json`
     """
     want_json = request.args.get("format") == "json" or \
@@ -1911,16 +1912,43 @@ def root_ok():
     if want_json:
         uptime = round(time.time() - app_start_time)
         return jsonify({"status": "ok", "uptime": uptime}), 200
-    return send_from_directory("static", "index.html")
+
+    # Try multiple candidate paths for index.html
+    try:
+        base = pathlib.Path(__file__).resolve().parent
+        candidates = [
+            base / "static" / "index.html",                   # youtube-transcript-service/static/index.html
+            base.parent / "worthit" / "static" / "index.html", # ../worthit/static/index.html
+            base.parent / "static" / "index.html"              # ../static/index.html
+        ]
+        for p in candidates:
+            if p.is_file():
+                return send_from_directory(str(p.parent), p.name)
+    except Exception:
+        pass
+    # Fallback: minimal JSON ok when no index found
+    uptime = round(time.time() - app_start_time)
+    return jsonify({"status": "ok", "uptime": uptime, "note": "index.html not found"}), 200
+
+def _send_static_multi(filename: str):
+    base = pathlib.Path(__file__).resolve().parent
+    for d in [base / "static", base.parent / "worthit" / "static", base.parent / "static"]:
+        f = d / filename
+        if f.is_file():
+            return send_from_directory(str(d), filename)
+    return ("Not Found", 404)
 
 @app.route("/privacy")
-def privacy(): return send_from_directory("static", "privacy.html")
+def privacy():
+    return _send_static_multi("privacy.html")
 
 @app.route("/terms")
-def terms(): return send_from_directory("static", "terms.html")
+def terms():
+    return _send_static_multi("terms.html")
 
 @app.route("/support")
-def support(): return send_from_directory("static", "support.html")
+def support():
+    return _send_static_multi("support.html")
 
 @app.route('/favicon.ico')
 def favicon():
