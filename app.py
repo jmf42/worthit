@@ -222,8 +222,36 @@ def get_random_user_agent_header():
         "Accept-Language": "en-US,en;q=0.8"
     }
 
+# --- Cookies loader (Netscape format) ---------------------------------------
+def _load_cookies_from_netscape(path: Optional[str], session: requests.Session) -> None:
+    if not path or not os.path.isfile(path):
+        return
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as fh:
+            for line in fh:
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.strip().split('\t')
+                if len(parts) != 7:
+                    continue
+                domain, flag, cookie_path, secure, expiry, name, value = parts
+                # Only apply YouTube/Google cookies
+                if ".youtube.com" not in domain and ".google.com" not in domain:
+                    continue
+                c = requests.cookies.create_cookie(
+                    domain=domain,
+                    name=name,
+                    value=value,
+                    path=cookie_path,
+                    secure=(secure.upper() == 'TRUE')
+                )
+                session.cookies.set_cookie(c)
+        logger.info("Loaded cookies from %s into session", path)
+    except Exception as e:
+        logger.warning("Failed to load cookies from %s: %s", path, e)
+
 # --- Minimal timedtext direct fetch (non-official) ---------------------------
-def _timedtext_fetch_vtt(video_id: str, lang: str, asr: bool, request_id: str = "") -> Optional[str]:
+def _timedtext_fetch_vtt(video_id: str, lang: str, asr: bool, use_proxy: bool = False, request_id: str = "") -> Optional[str]:
     try:
         params = {
             "v": video_id,
@@ -232,7 +260,14 @@ def _timedtext_fetch_vtt(video_id: str, lang: str, asr: bool, request_id: str = 
         }
         if asr:
             params["kind"] = "asr"
-        r = youtube_http.get("https://www.youtube.com/api/timedtext", params=params, timeout=8, proxies=get_proxy_dict())
+        # Prefer per-request Accept-Language reflecting current attempt
+        headers = {
+            "Accept-Language": f"{lang};q=1.0, en;q=0.8",
+            "User-Agent": random.choice(USER_AGENTS)
+        }
+        # Use proxy only if requested and configured (no cookies required)
+        proxies = get_proxy_dict() if use_proxy else {}
+        r = youtube_http.get("https://www.youtube.com/api/timedtext", params=params, headers=headers, timeout=8, proxies=proxies)
         if r.status_code != 200:
             return None
         txt = r.text.strip()
@@ -247,17 +282,33 @@ def _timedtext_fetch_vtt(video_id: str, lang: str, asr: bool, request_id: str = 
         return None
 
 def timedtext_try_languages(video_id: str, languages: List[str], request_id: str = "") -> Optional[str]:
-    # Try manual tracks first per language; then ASR per language
+    """Try timedtext manual first then ASR; attempt direct, then with proxy (if configured)."""
+    # Manual direct
     for code in languages:
-        out = _timedtext_fetch_vtt(video_id, code, asr=False, request_id=request_id)
+        out = _timedtext_fetch_vtt(video_id, code, asr=False, use_proxy=False, request_id=request_id)
         if out:
-            log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "manual", "request_id": request_id})
+            log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "manual", "proxy": False, "request_id": request_id})
             return out
+    # Manual via proxy
+    if get_proxy_dict():
+        for code in languages:
+            out = _timedtext_fetch_vtt(video_id, code, asr=False, use_proxy=True, request_id=request_id)
+            if out:
+                log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "manual", "proxy": True, "request_id": request_id})
+                return out
+    # ASR direct
     for code in languages:
-        out = _timedtext_fetch_vtt(video_id, code, asr=True, request_id=request_id)
+        out = _timedtext_fetch_vtt(video_id, code, asr=True, use_proxy=False, request_id=request_id)
         if out:
-            log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "asr", "request_id": request_id})
+            log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "asr", "proxy": False, "request_id": request_id})
             return out
+    # ASR via proxy
+    if get_proxy_dict():
+        for code in languages:
+            out = _timedtext_fetch_vtt(video_id, code, asr=True, use_proxy=True, request_id=request_id)
+            if out:
+                log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "asr", "proxy": True, "request_id": request_id})
+                return out
     return None
 
 # Requires youtube-transcript-api >= 1.0.4 for ProxyConfig support
@@ -684,6 +735,8 @@ def fetch_api_once(video_id: str,
         "Accept-Language": accept_lang,
         "Cookie": CONSENT_COOKIE_HEADER
     })
+    # Load full cookies if available (can bypass bot checks / age gates)
+    _load_cookies_from_netscape(YTDL_COOKIE_FILE, http_client)
     ytt_api = YouTubeTranscriptApi(http_client=http_client, proxy_config=proxy_cfg)
     try:
         ft = ytt_api.fetch(video_id, languages=languages)
