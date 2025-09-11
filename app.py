@@ -279,35 +279,99 @@ def _timedtext_fetch_vtt(video_id: str, lang: str, asr: bool, use_proxy: bool = 
         return out or None
     except Exception as e:
         log_event('debug', 'timedtext_fetch_error', extra={"video_id": video_id, "lang": lang, "asr": asr, "error": str(e), "request_id": request_id})
-        return None
+    return None
+
+def _timedtext_list_tracks(video_id: str, use_proxy: bool = False, request_id: str = "") -> list[tuple[str, str]]:
+    """Return list of (lang_code, kind) for available timedtext tracks."""
+    try:
+        params = {"v": video_id, "type": "list"}
+        proxies = get_proxy_dict() if use_proxy else {}
+        r = youtube_http.get("https://www.youtube.com/api/timedtext", params=params, timeout=6, proxies=proxies)
+        if r.status_code != 200:
+            return []
+        xml = r.text
+        tracks = re.findall(r"<track[^>]*lang_code=\"([^\"]+)\"[^>]*kind=\"?([^\"\s>]*)", xml)
+        # kind may be empty (manual); normalize empty to 'manual'
+        out: list[tuple[str, str]] = []
+        for code, kind in tracks:
+            k = kind.strip() or 'manual'
+            out.append((code, k))
+        return out
+    except Exception as e:
+        log_event('debug', 'timedtext_list_error', extra={"video_id": video_id, "error": str(e), "request_id": request_id})
+        return []
 
 def timedtext_try_languages(video_id: str, languages: List[str], request_id: str = "") -> Optional[str]:
-    """Try timedtext manual first then ASR; attempt direct, then with proxy (if configured)."""
-    # Manual direct
+    """Try timedtext using discovery: list tracks, pick by base language; manual first, then ASR. Direct then proxy."""
+    # Build base language set (e.g., 'es' from 'es-419') preserving order
+    base_langs: list[str] = []
+    seen = set()
     for code in languages:
-        out = _timedtext_fetch_vtt(video_id, code, asr=False, use_proxy=False, request_id=request_id)
-        if out:
-            log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "manual", "proxy": False, "request_id": request_id})
+        base = code.split('-')[0].lower()
+        if base and base not in seen:
+            base_langs.append(base)
+            seen.add(base)
+
+    # Try direct list
+    tracks = _timedtext_list_tracks(video_id, use_proxy=False, request_id=request_id)
+    if not tracks and get_proxy_dict():
+        # Try via proxy if no tracks direct
+        tracks = _timedtext_list_tracks(video_id, use_proxy=True, request_id=request_id)
+
+    if tracks:
+        # Prefer manual tracks in requested base languages
+        for base in base_langs:
+            for code, kind in tracks:
+                if kind == 'manual' and code.startswith(base):
+                    out = _timedtext_fetch_vtt(video_id, code, asr=False, use_proxy=False, request_id=request_id)
+                    if out:
+                        log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "manual", "proxy": False, "request_id": request_id})
+                        return out
+        # Try manual via proxy
+        if get_proxy_dict():
+            for base in base_langs:
+                for code, kind in tracks:
+                    if kind == 'manual' and code.startswith(base):
+                        out = _timedtext_fetch_vtt(video_id, code, asr=False, use_proxy=True, request_id=request_id)
+                        if out:
+                            log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "manual", "proxy": True, "request_id": request_id})
+                            return out
+        # Try ASR in requested base languages
+        for base in base_langs:
+            for code, kind in tracks:
+                if kind == 'asr' and code.startswith(base):
+                    out = _timedtext_fetch_vtt(video_id, code, asr=True, use_proxy=False, request_id=request_id)
+                    if out:
+                        log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "asr", "proxy": False, "request_id": request_id})
+                        return out
+        # Try ASR via proxy
+        if get_proxy_dict():
+            for base in base_langs:
+                for code, kind in tracks:
+                    if kind == 'asr' and code.startswith(base):
+                        out = _timedtext_fetch_vtt(video_id, code, asr=True, use_proxy=True, request_id=request_id)
+                        if out:
+                            log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "asr", "proxy": True, "request_id": request_id})
+                            return out
+
+    # If list failed or nothing matched, do a simple brute force (manual then ASR; direct then proxy)
+    for base in base_langs:
+        if out := _timedtext_fetch_vtt(video_id, base, asr=False, use_proxy=False, request_id=request_id):
+            log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": base, "kind": "manual", "proxy": False, "request_id": request_id})
             return out
-    # Manual via proxy
     if get_proxy_dict():
-        for code in languages:
-            out = _timedtext_fetch_vtt(video_id, code, asr=False, use_proxy=True, request_id=request_id)
-            if out:
-                log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "manual", "proxy": True, "request_id": request_id})
+        for base in base_langs:
+            if out := _timedtext_fetch_vtt(video_id, base, asr=False, use_proxy=True, request_id=request_id):
+                log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": base, "kind": "manual", "proxy": True, "request_id": request_id})
                 return out
-    # ASR direct
-    for code in languages:
-        out = _timedtext_fetch_vtt(video_id, code, asr=True, use_proxy=False, request_id=request_id)
-        if out:
-            log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "asr", "proxy": False, "request_id": request_id})
+    for base in base_langs:
+        if out := _timedtext_fetch_vtt(video_id, base, asr=True, use_proxy=False, request_id=request_id):
+            log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": base, "kind": "asr", "proxy": False, "request_id": request_id})
             return out
-    # ASR via proxy
     if get_proxy_dict():
-        for code in languages:
-            out = _timedtext_fetch_vtt(video_id, code, asr=True, use_proxy=True, request_id=request_id)
-            if out:
-                log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "asr", "proxy": True, "request_id": request_id})
+        for base in base_langs:
+            if out := _timedtext_fetch_vtt(video_id, base, asr=True, use_proxy=True, request_id=request_id):
+                log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": base, "kind": "asr", "proxy": True, "request_id": request_id})
                 return out
     return None
 
