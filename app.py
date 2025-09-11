@@ -222,6 +222,44 @@ def get_random_user_agent_header():
         "Accept-Language": "en-US,en;q=0.8"
     }
 
+# --- Minimal timedtext direct fetch (non-official) ---------------------------
+def _timedtext_fetch_vtt(video_id: str, lang: str, asr: bool, request_id: str = "") -> Optional[str]:
+    try:
+        params = {
+            "v": video_id,
+            "fmt": "vtt",
+            "lang": lang
+        }
+        if asr:
+            params["kind"] = "asr"
+        r = youtube_http.get("https://www.youtube.com/api/timedtext", params=params, timeout=8, proxies=get_proxy_dict())
+        if r.status_code != 200:
+            return None
+        txt = r.text.strip()
+        if not txt or txt.startswith("<?xml") and "<transcript/>" in txt:
+            return None
+        # Basic VTT parsing: drop headers and timestamps
+        lines = [l.strip() for l in txt.splitlines() if l and "-->" not in l and not l.startswith("WEBVTT") and not l.startswith("Kind:")]
+        out = " ".join(lines).strip()
+        return out or None
+    except Exception as e:
+        log_event('debug', 'timedtext_fetch_error', extra={"video_id": video_id, "lang": lang, "asr": asr, "error": str(e), "request_id": request_id})
+        return None
+
+def timedtext_try_languages(video_id: str, languages: List[str], request_id: str = "") -> Optional[str]:
+    # Try manual tracks first per language; then ASR per language
+    for code in languages:
+        out = _timedtext_fetch_vtt(video_id, code, asr=False, request_id=request_id)
+        if out:
+            log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "manual", "request_id": request_id})
+            return out
+    for code in languages:
+        out = _timedtext_fetch_vtt(video_id, code, asr=True, request_id=request_id)
+        if out:
+            log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "asr", "request_id": request_id})
+            return out
+    return None
+
 # Requires youtube-transcript-api >= 1.0.4 for ProxyConfig support
 
 
@@ -1038,12 +1076,36 @@ def get_transcript(video_id: str,
                 "request_id": request_id
             })
 
-    # Step 2: Try alternative APIs in parallel
+    # Step 2: Timedtext direct (manual → asr), English-first ordering
+    try:
+        tt = timedtext_try_languages(video_id, languages, request_id=request_id)
+        if tt:
+            logger.info("Timedtext fetch succeeded", extra={
+                "event": "transcript_step_success",
+                "step": 2,
+                "method": "timedtext",
+                "video_id": video_id,
+                "text_len": len(tt),
+                "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+                "request_id": request_id
+            })
+            return tt
+    except Exception as e:
+        logger.info("Timedtext fetch not available: %s", str(e), extra={
+            "event": "transcript_step_failure",
+            "step": 2,
+            "method": "timedtext",
+            "video_id": video_id,
+            "reason": str(e),
+            "request_id": request_id
+        })
+
+    # Step 3: Try alternative APIs in parallel
     txt = _fetch_transcript_alternatives(video_id, request_id=request_id, languages=languages)
     if txt:
         logger.info("Fallback transcript fetch succeeded via alternative APIs", extra={
             "event": "transcript_step_success",
-            "step": 2,
+            "step": 3,
             "method": "alternative_apis",
             "video_id": video_id,
             "text_len": len(txt),
@@ -1054,19 +1116,19 @@ def get_transcript(video_id: str,
     else:
         logger.info("Alternative APIs fallback failed (no transcript found)", extra={
             "event": "transcript_step_failure",
-            "step": 2,
+            "step": 3,
             "method": "alternative_apis",
             "video_id": video_id,
             "reason": "No transcript found",
             "request_id": request_id
         })
 
-    # Step 3: Try yt-dlp (no proxy)
+    # Step 4: Try yt-dlp (no proxy)
     txt = fetch_ytdlp(video_id, None, request_id=request_id, languages=languages)
     if txt:
         logger.info("Fallback transcript fetch succeeded via yt-dlp (no proxy)", extra={
             "event": "transcript_step_success",
-            "step": 3,
+            "step": 4,
             "method": "yt-dlp_no_proxy",
             "video_id": video_id,
             "text_len": len(txt),
@@ -1077,21 +1139,21 @@ def get_transcript(video_id: str,
     else:
         logger.info("yt-dlp (no proxy) fallback failed (no transcript found)", extra={
             "event": "transcript_step_failure",
-            "step": 3,
+            "step": 4,
             "method": "yt-dlp_no_proxy",
             "video_id": video_id,
             "reason": "No transcript found",
             "request_id": request_id
         })
 
-    # Step 4: Try yt-dlp (with proxy)
+    # Step 5: Try yt-dlp (with proxy)
     proxy_url = _gateway_url()
     if proxy_url:
         # Validate proxy before using to avoid noisy CONNECT failures
         if not _proxy_is_healthy(proxy_url):
             logger.warning("Proxy health check failed — skipping yt-dlp proxy fallback", extra={
                 "event": "transcript_step_skipped",
-                "step": 4,
+                "step": 5,
                 "method": "yt-dlp_with_proxy",
                 "video_id": video_id,
                 "proxy_url": proxy_url,
@@ -1102,7 +1164,7 @@ def get_transcript(video_id: str,
             if txt:
                 logger.info("Fallback transcript fetch succeeded via yt-dlp (with proxy)", extra={
                     "event": "transcript_step_success",
-                    "step": 4,
+                    "step": 5,
                     "method": "yt-dlp_with_proxy",
                     "video_id": video_id,
                     "text_len": len(txt),
@@ -1113,7 +1175,7 @@ def get_transcript(video_id: str,
             else:
                 logger.info("yt-dlp (with proxy) fallback failed (no transcript found)", extra={
                     "event": "transcript_step_failure",
-                    "step": 4,
+                    "step": 5,
                     "method": "yt-dlp_with_proxy",
                     "video_id": video_id,
                     "reason": "No transcript found",
@@ -1122,7 +1184,7 @@ def get_transcript(video_id: str,
     else:
         logger.info("yt-dlp (with proxy) skipped: No proxy URL available", extra={
             "event": "transcript_step_skipped",
-            "step": 4,
+            "step": 5,
             "method": "yt-dlp_with_proxy",
             "video_id": video_id,
             "reason": "No proxy URL",
@@ -1963,11 +2025,24 @@ def get_openai_response(response_id):
         return jsonify({'error': 'OpenAI service unavailable'}), 503
 
 
-# --- Render root health check ------------------------------------------------
+# --- Static and landing routes ----------------------------------------------
 @app.route("/", methods=["GET"])
 def root_ok():
-    """Landing page: always serve index.html"""
-    return app.send_static_file("index.html")
+    """Landing page.
+    Attempts multiple static locations for index.html; if none, returns JSON uptime.
+    """
+    base = pathlib.Path(__file__).resolve().parent
+    candidates = [
+        base / "static" / "index.html",                    # youtube-transcript-service/static/index.html
+        base.parent / "WorthIt" / "static" / "index.html", # ../WorthIt/static/index.html (case-sensitive envs)
+        base.parent / "worthit" / "static" / "index.html", # ../worthit/static/index.html
+        base.parent / "static" / "index.html"              # ../static/index.html
+    ]
+    for p in candidates:
+        if p.is_file():
+            return send_from_directory(str(p.parent), p.name)
+    uptime = round(time.time() - app_start_time)
+    return jsonify({"status": "ok", "uptime": uptime, "note": "index.html not found"}), 200
 
 
 @app.route("/_health", methods=["GET"])
@@ -1978,7 +2053,7 @@ def health():
 
 def _send_static_multi(filename: str):
     base = pathlib.Path(__file__).resolve().parent
-    for d in [base / "static", base.parent / "worthit" / "static", base.parent / "static"]:
+    for d in [base / "static", base.parent / "WorthIt" / "static", base.parent / "worthit" / "static", base.parent / "static"]:
         f = d / filename
         if f.is_file():
             return send_from_directory(str(d), filename)
