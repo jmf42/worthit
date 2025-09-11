@@ -251,7 +251,7 @@ def _load_cookies_from_netscape(path: Optional[str], session: requests.Session) 
         logger.warning("Failed to load cookies from %s: %s", path, e)
 
 # --- Minimal timedtext direct fetch (non-official) ---------------------------
-def _timedtext_fetch_vtt(video_id: str, lang: str, asr: bool, use_proxy: bool = False, request_id: str = "") -> Optional[str]:
+def _timedtext_fetch_vtt(video_id: str, lang: str, asr: bool, use_proxy: bool = False, request_id: str = "", tlang: Optional[str] = None) -> Optional[str]:
     try:
         params = {
             "v": video_id,
@@ -260,6 +260,8 @@ def _timedtext_fetch_vtt(video_id: str, lang: str, asr: bool, use_proxy: bool = 
         }
         if asr:
             params["kind"] = "asr"
+        if tlang:
+            params["tlang"] = tlang
         # Prefer per-request Accept-Language reflecting current attempt
         headers = {
             "Accept-Language": f"{lang};q=1.0, en;q=0.8",
@@ -319,6 +321,7 @@ def timedtext_try_languages(video_id: str, languages: List[str], request_id: str
         tracks = _timedtext_list_tracks(video_id, use_proxy=True, request_id=request_id)
 
     if tracks:
+        log_event('info', 'timedtext_tracks_found', extra={"video_id": video_id, "count": len(tracks), "sample": tracks[:3], "request_id": request_id})
         # Prefer manual tracks in requested base languages
         for base in base_langs:
             for code, kind in tracks:
@@ -335,6 +338,22 @@ def timedtext_try_languages(video_id: str, languages: List[str], request_id: str
                         out = _timedtext_fetch_vtt(video_id, code, asr=False, use_proxy=True, request_id=request_id)
                         if out:
                             log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "manual", "proxy": True, "request_id": request_id})
+                            return out
+        # Try translating a non-English manual track to English (target)
+        if 'en' in base_langs:
+            for code, kind in tracks:
+                if kind == 'manual' and not code.startswith('en'):
+                    # Try direct translation to English
+                    out = _timedtext_fetch_vtt(video_id, code, asr=False, use_proxy=False, request_id=request_id, tlang='en')
+                    if out:
+                        log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "manual_translate_en", "proxy": False, "request_id": request_id})
+                        return out
+            if get_proxy_dict():
+                for code, kind in tracks:
+                    if kind == 'manual' and not code.startswith('en'):
+                        out = _timedtext_fetch_vtt(video_id, code, asr=False, use_proxy=True, request_id=request_id, tlang='en')
+                        if out:
+                            log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "manual_translate_en", "proxy": True, "request_id": request_id})
                             return out
         # Try ASR in requested base languages
         for base in base_langs:
