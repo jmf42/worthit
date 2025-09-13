@@ -25,12 +25,6 @@ from youtube_transcript_api import (
     AgeRestricted
 )
 from youtube_transcript_api._errors import CouldNotRetrieveTranscript
-# Shim for TooManyRequests across library versions
-try:  # youtube_transcript_api >= some versions
-    from youtube_transcript_api import TooManyRequests  # type: ignore
-except Exception:
-    class TooManyRequests(Exception):  # pragma: no cover
-        pass
 from cachetools import TTLCache
 from flask_cors import CORS
 from flask_limiter import Limiter
@@ -75,10 +69,13 @@ TRANSCRIPT_CACHE_TTL = int(os.getenv("TRANSCRIPT_CACHE_TTL", "7200")) # 2 hours
 # Preferred languages for transcript API (comma‑separated env var)
 # Default priority (override via env in prod if needed):
 # en, hi, es, pt, id, ja, ru, ar, bn, tr, de, fr, vi, ko, th
-TRANSCRIPT_LANGS = os.getenv(
-    "TRANSCRIPT_LANGS",
-    "en,hi,es,pt,id,ja,ru,ar,bn,tr,de,fr,vi,ko,th"
-).split(",")
+# Parse preferred languages from env and sanitize (trim + drop empties)
+TRANSCRIPT_LANGS = [
+    c.strip() for c in os.getenv(
+        "TRANSCRIPT_LANGS",
+        "en,hi,es,pt,id,ja,ru,ar,bn,tr,de,fr,vi,ko,th"
+    ).split(",") if c.strip()
+]
 #
 # Transcript tuning
 TRANSCRIPT_HTTP_TIMEOUT   = int(os.getenv("TRANSCRIPT_HTTP_TIMEOUT", "15"))
@@ -88,6 +85,8 @@ COMMENT_CACHE_TTL = int(os.getenv("COMMENT_CACHE_TTL", "7200")) # 2 hours
 PERSISTENT_CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/persistent_cache")
 PERSISTENT_TRANSCRIPT_DB = os.path.join(PERSISTENT_CACHE_DIR, "transcript_cache.db")
 PERSISTENT_COMMENT_DB = os.path.join(PERSISTENT_CACHE_DIR, "comment_cache.db")
+# Cap per-pull items when iterating comment generators (safety net)
+MAX_COMMENTS_FETCH = int(os.getenv("MAX_COMMENTS_FETCH", str(COMMENT_LIMIT)))
 # YTDL Cookie file configuration
 YTDL_COOKIE_FILE = os.getenv("YTDL_COOKIE_FILE", "/etc/secrets/cookies_chrome2.txt")
 CONSENT_COOKIE_HEADER = "CONSENT=YES+cb.20210328-17-p0.en+FX+888"
@@ -538,14 +537,15 @@ def extract_video_id(url_or_id: str) -> str | None:
     logger.warning("Failed to extract valid video ID from: %s", url_or_id)
     return None
 
-# --- Piped/Invidious API Helpers (for potential future use, currently not primary) ---
-PIPED_HOSTS = deque([
-    "https://pipedapi.kavin.rocks", "https://pipedapi.adminforge.de", "https://pipedapi.tokhmi.xyz",
-    "https://piped-api.privacy.com.de", "https://api-piped.mha.fi" 
-])
+# --- Piped/Invidious API Helpers ---
 _PIPE_COOLDOWN: dict[str, float] = {}
 
-def _fetch_from_alternative_api(hosts: deque, path: str, cooldown_map: dict[str, float], timeout: float = 2.0, request_id: str = "") -> dict | None:
+def _fetch_from_alternative_api(hosts, path: str, cooldown_map: dict[str, float], timeout: float = 2.0, request_id: str = "") -> dict | None:
+    """Fetch JSON from a list/deque of alternative API hosts with simple round-robin + cooldown.
+    Accepts a list of host URLs or a deque. Converts to deque internally as needed.
+    """
+    if not isinstance(hosts, deque):
+        hosts = deque(hosts or [])
     deadline = time.time() + timeout
     t_flow_start = time.perf_counter()
     log_event('info', 'alternative_api_attempt_flow_start', path=path, host_count=len(hosts), request_id=request_id)
@@ -586,26 +586,12 @@ def _fetch_from_alternative_api(hosts: deque, path: str, cooldown_map: dict[str,
 
 # --- Language preferences helper (shared) ---
 def expand_preferred_langs(codes: Optional[List[str]], force_en_first: bool = False) -> List[str]:
-    """Expand/normalize language preferences while preserving caller intent.
-    - None/empty → use env default and optionally put English first.
-    - Explicit list → keep given priority; no forced English unless requested.
-    - Normalizes common aliases (e.g., 'in'→'id', 'jp'→'ja', 'zh-cn'→'zh-Hans').
+    """Expand language preferences into variants while preserving caller intent.
+    - When `codes` is None/empty: fall back to env default and optionally force English first.
+    - When caller provides explicit `codes`: DO NOT force English unless requested.
     """
     if not codes:
         codes = TRANSCRIPT_LANGS
-
-    def _norm(code: str) -> str:
-        c = (code or '').strip().replace('_', '-').lower()
-        # Common legacy/alias normalizations
-        alias = {
-            'jp': 'ja',
-            'iw': 'he',  # old Hebrew
-            'in': 'id',  # old Indonesian
-            'zh-cn': 'zh-hans', 'zh-sg': 'zh-hans', 'zh-hans': 'zh-hans',
-            'zh-tw': 'zh-hant', 'zh-hk': 'zh-hant', 'zh-mo': 'zh-hant', 'zh-hant': 'zh-hant',
-        }
-        return alias.get(c, c)
-
     mapping = {
         'es': ['es', 'es-419', 'es-ES', 'es-MX', 'es-AR', 'es-CL', 'es-CO', 'es-PE', 'es-VE'],
         'pt': ['pt', 'pt-BR', 'pt-PT'],
@@ -621,8 +607,6 @@ def expand_preferred_langs(codes: Optional[List[str]], force_en_first: bool = Fa
         'ja': ['ja', 'ja-JP'],
         'ko': ['ko', 'ko-KR'],
         'zh': ['zh', 'zh-Hans', 'zh-Hant', 'zh-CN', 'zh-TW'],
-        'zh-hans': ['zh-Hans', 'zh', 'zh-CN', 'zh-SG'],
-        'zh-hant': ['zh-Hant', 'zh', 'zh-TW', 'zh-HK', 'zh-MO'],
         'vi': ['vi', 'vi-VN'],
         'pl': ['pl', 'pl-PL'],
         'nl': ['nl', 'nl-NL'],
@@ -633,28 +617,24 @@ def expand_preferred_langs(codes: Optional[List[str]], force_en_first: bool = Fa
         'te': ['te', 'te-IN'],
         'th': ['th', 'th-TH'],
     }
-
-    # 1) Normalize + de-dup preserving order
+    # 1) De-dup while preserving order
     seen = set()
-    ordered: List[str] = []
+    ordered = []
     for c in codes:
-        cn = _norm(c)
-        if not cn or cn in seen:
+        c = (c or '').strip()
+        if not c or c in seen:
             continue
-        ordered.append(cn)
-        seen.add(cn)
-
-    # 2) Optionally ensure English first
+        ordered.append(c)
+        seen.add(c)
+    # 2) Optionally ensure English first (only when explicitly requested or using defaults)
     if force_en_first and 'en' in ordered:
         ordered.remove('en')
         ordered.insert(0, 'en')
-
     # 3) Expand variants
-    out: List[str] = []
+    out = []
     seen = set()
     for c in ordered:
-        base = c.split('-', 1)[0]
-        variants = mapping.get(c, mapping.get(base, [c]))
+        variants = mapping.get(c, [c])
         for v in variants:
             if v not in seen:
                 out.append(v)
@@ -720,25 +700,14 @@ def _proxy_is_healthy(url: Optional[str]) -> bool:
 DISABLE_DIRECT = os.getenv("FORCE_PROXY", "false").lower() == "true"
 
 WS_USER = os.getenv("WEBSHARE_USER")
-# Accept both WEBSHARE_PASS and WEBSHARE_PASSWORD for compatibility
-WS_PASS = os.getenv("WEBSHARE_PASS") or os.getenv("WEBSHARE_PASSWORD")
+WS_PASS = os.getenv("WEBSHARE_PASS")
 
 # Generic/DecoDo/Smartproxy style URLs
 GEN_HTTP = os.getenv("PROXY_HTTP_URL") or os.getenv("HTTP_PROXY")
 GEN_HTTPS = os.getenv("PROXY_HTTPS_URL") or os.getenv("HTTPS_PROXY")
 
 PROXY_CFG = None
-# Prefer Webshare if configured; fall back to generic proxy URLs if not.
-if WS_USER and WS_PASS:
-    if not WS_USER.endswith("-rotate"):
-        WS_USER = f"{WS_USER}-rotate"
-    from youtube_transcript_api.proxies import WebshareProxyConfig
-    PROXY_CFG = WebshareProxyConfig(
-        proxy_username=WS_USER,
-        proxy_password=WS_PASS
-    )
-    logger.info("Using Webshare rotating residential proxies (username=%s)", WS_USER)
-elif GEN_HTTP or GEN_HTTPS:
+if GEN_HTTP or GEN_HTTPS:
     try:
         from youtube_transcript_api.proxies import GenericProxyConfig
         PROXY_CFG = GenericProxyConfig(
@@ -748,20 +717,29 @@ elif GEN_HTTP or GEN_HTTPS:
         logger.info("Using GenericProxyConfig (http=%s, https=%s)", bool(GEN_HTTP), bool(GEN_HTTPS))
     except Exception as e:
         logger.warning("Failed to create GenericProxyConfig: %s", e)
+elif WS_USER and WS_PASS:
+    if not WS_USER.endswith("-rotate"):
+        WS_USER = f"{WS_USER}-rotate"
+    from youtube_transcript_api.proxies import WebshareProxyConfig
+    PROXY_CFG = WebshareProxyConfig(
+        proxy_username=WS_USER,
+        proxy_password=WS_PASS
+    )
+    logger.info("Using Webshare rotating residential proxies (username=%s)", WS_USER)
 else:
     logger.info("No proxy credentials – transcript requests will go direct unless FORCE_PROXY=true")
 
 # ---------------------------------------------------------------------------
 # Helper – build a single rotating Webshare gateway URL
 def _gateway_url() -> str | None:
-    # Prefer Webshare rotating gateway when available
-    if WS_USER and WS_PASS:
-        return f"http://{WS_USER}:{WS_PASS}@p.webshare.io:80"
-    # Otherwise fall back to generic proxy URLs
+    # Prefer generic proxy URL if provided
     if GEN_HTTPS:
         return GEN_HTTPS
     if GEN_HTTP:
         return GEN_HTTP
+    if WS_USER and WS_PASS:
+        # Webshare rotating residential gateway host
+        return f"http://{WS_USER}:{WS_PASS}@p.webshare.io:80"
     return None
 
 def get_proxy_dict() -> dict:
@@ -820,35 +798,6 @@ def fetch_api_once(video_id: str,
         "Cookie": CONSENT_COOKIE_HEADER
     })
     ytt_api = YouTubeTranscriptApi(http_client=http_client, proxy_config=proxy_cfg)
-
-    # If English appears to be available as an original transcript, move it to front
-    # so we "try English first if it's the original video language", then others.
-    try:
-        if any(c.startswith('en') for c in languages_final):
-            # Prefer instance method (respects proxy_config); fall back to classmethod
-            if hasattr(ytt_api, 'list'):
-                tl = ytt_api.list(video_id)
-            else:
-                tl = _list_transcripts_safe(video_id, proxy_config=proxy_cfg)
-            en_present = False
-            for tr in tl:
-                code = getattr(tr, 'language_code', '') or ''
-                if code.lower().startswith('en'):
-                    en_present = True
-                    break
-            if en_present:
-                orig = languages_final[:]
-                languages_final = [c for c in languages_final if c.startswith('en')] + [c for c in languages_final if not c.startswith('en')]
-                if languages_final != orig:
-                    log_event('info', 'language_order_adjusted_en_first', extra={
-                        "video_id": video_id,
-                        "request_id": request_id,
-                        "reason": "english_transcript_present",
-                        "new_order": languages_final
-                    })
-    except Exception:
-        # Non-fatal – continue with existing order
-        pass
     try:
         ft = ytt_api.fetch(video_id, languages=languages_final)
     except NoTranscriptFound:
@@ -931,154 +880,6 @@ def fetch_api_once(video_id: str,
             "request_id": request_id
         })
     return text_content
-
-# ---- Multilang transcript helpers (compat new/old API) ----
-# These helpers provide a self-contained fetch that tries direct first,
-# then retries via Webshare if configured, honoring language priority.
-try:
-    from youtube_transcript_api.proxies import GenericProxyConfig  # type: ignore
-    _GENERIC_PROXY_AVAILABLE = True
-except Exception:
-    _GENERIC_PROXY_AVAILABLE = False
-
-_LANG_FALLBACKS = [
-    "es", "es-419",
-    "pt", "pt-BR", "pt-PT",
-    "ar",
-    "zh-Hans", "zh-CN", "zh", "zh-Hant", "zh-TW", "zh-HK",
-    "en",
-]
-
-def _best_langs_for_helper(langs: Optional[List[str]]) -> List[str]:
-    # Merge caller list with env-priority list, then common fallbacks
-    env_list = TRANSCRIPT_LANGS or []
-    seen, out = set(), []
-    for code in (langs or []) + env_list + _LANG_FALLBACKS:
-        if code and code not in seen:
-            seen.add(code)
-            out.append(code)
-    # Expand common variants using existing helper
-    return expand_preferred_langs(out, force_en_first=False)
-
-def _build_yta_client_for_helper(mode: str, ws_user: Optional[str], ws_pass: Optional[str],
-                                 ws_host: str = "p.webshare.io", ws_port: int = 80):
-    if mode == "webshare" and _GENERIC_PROXY_AVAILABLE and ws_user and ws_pass:
-        http_url = f"http://{ws_user}:{ws_pass}@{ws_host}:{ws_port}"
-        https_url = http_url
-        try:
-            return YouTubeTranscriptApi(proxy_config=GenericProxyConfig(http_url=http_url, https_url=https_url))
-        except Exception:
-            logger.warning("ProxyConfig not supported by this youtube-transcript-api version; using plain client.")
-    return YouTubeTranscriptApi()
-
-def _join_segments_text(segs: List[dict]) -> str:
-    return "\n".join((s.get("text") or "").strip() for s in segs if s.get("text"))
-
-def _fetch_with_new_api_helper(yta, vid: str, langs: List[str], prefer_manual: bool) -> Optional[dict]:
-    tl = yta.list(vid)
-
-    if prefer_manual:
-        try:
-            t = tl.find_manually_created_transcript(langs)
-            ft = t.fetch()
-            raw = ft.to_raw_data() if hasattr(ft, "to_raw_data") else ft
-            return {
-                "source": "yta", "mode": "manual", "language": t.language_code,
-                "translated": False, "text": _join_segments_text(raw), "segments": raw
-            }
-        except NoTranscriptFound:
-            pass
-
-    try:
-        t = tl.find_generated_transcript(langs)
-        ft = t.fetch()
-        raw = ft.to_raw_data() if hasattr(ft, "to_raw_data") else ft
-        return {
-            "source": "yta", "mode": "auto", "language": t.language_code,
-            "translated": False, "text": _join_segments_text(raw), "segments": raw
-        }
-    except NoTranscriptFound:
-        pass
-
-    any_t = None
-    for tr in tl:
-        if not getattr(tr, "is_generated", False):
-            any_t = tr; break
-    if not any_t:
-        for tr in tl:
-            if getattr(tr, "is_generated", False):
-                any_t = tr; break
-    if any_t:
-        for lg in langs:
-            try:
-                if getattr(any_t, "is_translatable", False):
-                    tr = any_t.translate(lg)
-                    ft = tr.fetch()
-                    raw = ft.to_raw_data() if hasattr(ft, "to_raw_data") else ft
-                    return {
-                        "source": "yta", "mode": "translated", "language": lg, "translated": True,
-                        "translated_from": any_t.language_code, "text": _join_segments_text(raw), "segments": raw
-                    }
-            except Exception:
-                continue
-        ft = any_t.fetch()
-        raw = ft.to_raw_data() if hasattr(ft, "to_raw_data") else ft
-        return {
-            "source": "yta", "mode": "original-fallback", "language": any_t.language_code,
-            "translated": False, "text": _join_segments_text(raw), "segments": raw
-        }
-    return None
-
-def _fetch_with_old_api_helper(yta, vid: str, langs: List[str]) -> Optional[dict]:
-    try:
-        ft = yta.fetch(vid, languages=langs)
-        raw = ft.to_raw_data() if hasattr(ft, "to_raw_data") else ft
-        return {
-            "source": "yta", "mode": "manual-or-auto", "language": getattr(ft, "language_code", "unknown"),
-            "translated": False, "text": _join_segments_text(raw), "segments": raw
-        }
-    except NoTranscriptFound:
-        return None
-
-def fetch_transcript_multilang_in_app(video_or_id: str,
-                                      langs: Optional[List[str]] = None,
-                                      prefer_manual: bool = True) -> dict:
-    """Fetch transcript with language priority and Webshare retry. Returns a detailed dict or raises NoTranscriptFound."""
-    video_id = extract_video_id(video_or_id) or video_or_id
-    L = _best_langs_for_helper(langs)
-    ws_user = os.getenv("WEBSHARE_USER")
-    ws_pass = os.getenv("WEBSHARE_PASSWORD") or os.getenv("WEBSHARE_PASS")
-
-    # Attempt without proxy
-    yta = _build_yta_client_for_helper("plain", None, None)
-    try:
-        if hasattr(yta, "list"):
-            r = _fetch_with_new_api_helper(yta, video_id, L, prefer_manual)
-        else:
-            r = _fetch_with_old_api_helper(yta, video_id, L)
-        if r and r.get("text"):
-            logger.info("Transcript OK via yta/plain (%s, %s)", r.get("mode"), r.get("language"))
-            r["video_id"] = video_id
-            return r
-    except (RequestBlocked, TooManyRequests):
-        logger.warning("Plain request blocked; will retry with Webshare")
-
-    # Retry via Webshare if available
-    if ws_user and ws_pass:
-        yta_ws = _build_yta_client_for_helper("webshare", ws_user, ws_pass)
-        try:
-            if hasattr(yta_ws, "list"):
-                r = _fetch_with_new_api_helper(yta_ws, video_id, L, prefer_manual)
-            else:
-                r = _fetch_with_old_api_helper(yta_ws, video_id, L)
-            if r and r.get("text"):
-                logger.info("Transcript OK via yta/webshare (%s, %s)", r.get("mode"), r.get("language"))
-                r["video_id"] = video_id
-                return r
-        except (RequestBlocked, TooManyRequests):
-            logger.warning("Webshare request blocked too.")
-
-    raise NoTranscriptFound("No transcript found in requested languages (plain+webshare).")
 
 # ---------------------------------------------------------------------------
 # yt‑dlp subtitle fallback ---------------------------------------------------
@@ -1401,9 +1202,7 @@ def get_transcript(video_id: str,
 
     # Step 2: Timedtext direct (manual → asr), English-first ordering
     try:
-        # Ensure we never pass None into timedtext flow; preserve caller's order
-        langs_for_timedtext = languages or expand_preferred_langs(TRANSCRIPT_LANGS, force_en_first=True)
-        tt = timedtext_try_languages(video_id, langs_for_timedtext, request_id=request_id)
+        tt = timedtext_try_languages(video_id, languages, request_id=request_id)
         if tt:
             logger.info("Timedtext fetch succeeded", extra={
                 "event": "transcript_step_success",
@@ -1547,7 +1346,8 @@ def _piped_captions_direct(video_id: str, hosts: list[str], languages: Optional[
             subs = data.get("captions") or []
             if not subs:
                 continue
-            prefs = [c.lower() for c in (languages or TRANSCRIPT_LANGS)]
+            # Normalize language preferences for matching
+            prefs = [c.strip().lower() for c in (languages or TRANSCRIPT_LANGS)]
             chosen = None
             for code in prefs:
                 chosen = next((s for s in subs if s.get("language", "").lower().startswith(code)), None)
@@ -1586,7 +1386,8 @@ def _piped_captions(video_id: str, hosts: list[str], languages: Optional[List[st
             if "subtitles" not in data or not data["subtitles"]:
                 continue
             subs = data["subtitles"]
-            prefs = [c.lower() for c in (languages or TRANSCRIPT_LANGS)]
+            # Normalize language preferences for matching
+            prefs = [c.strip().lower() for c in (languages or TRANSCRIPT_LANGS)]
             chosen = None
             for code in prefs:
                 chosen = next((s for s in subs if s.get("language", "").lower().startswith(code)), None)
@@ -1637,8 +1438,8 @@ def _invidious_captions(video_id: str, hosts: list[str], languages: Optional[Lis
             subs = meta_json.get("captions") or []
             if not subs:
                 continue
-            # Prefer requested languages, otherwise first available
-            prefs = [c.lower() for c in (languages or TRANSCRIPT_LANGS)]
+            # Prefer requested languages, otherwise first available. Normalize codes.
+            prefs = [c.strip().lower() for c in (languages or TRANSCRIPT_LANGS)]
             chosen = None
             for code in prefs:
                 chosen = next((s for s in subs if s.get("languageCode", "").lower().startswith(code)), None)
@@ -2050,8 +1851,7 @@ def _background_comment_worker(video_id: str):
 @limiter.limit("1000/hour;200/minute")  # Increased limits for transcript endpoint
 def get_transcript_endpoint():
     g.request_start_time = time.perf_counter() # Mark request start time
-    # Accept multiple param names for compatibility: videoId (existing), v, video
-    video_url_or_id = request.args.get("videoId") or request.args.get("v") or request.args.get("video") or ""
+    video_url_or_id = request.args.get("videoId", "")
     if not video_url_or_id:
         log_event('warning', 'transcript_missing_video_id', video_id=video_url_or_id, ip=get_remote_address(), request_id=g.request_id)
         return jsonify({"error": "videoId parameter is missing"}), 400
@@ -2062,8 +1862,7 @@ def get_transcript_endpoint():
         return jsonify({"error": "Invalid videoId format or URL"}), 400
 
     # Parse preferred languages from query (CSV) → list of codes
-    # Accept both 'languages' and 'langs' as CSV of language codes
-    raw_langs = request.args.get("languages") or request.args.get("langs")
+    raw_langs = request.args.get("languages")
     languages: Optional[List[str]] = None
     # Build a language-aware cache key that respects caller intent
     cache_key = video_id
@@ -2173,43 +1972,6 @@ def get_transcript_endpoint():
     resp = make_response(jsonify({"error": "Transcript not available"}), 404)
     resp.headers['Cache-Control'] = 'public, max-age=600'
     return resp
-
-# --- Simple API-style transcript endpoint (compatible with ?v & ?langs=) ---
-@app.get("/api/transcript")
-@limiter.limit("1000/hour;200/minute")
-def api_get_transcript_simple():
-    video = request.args.get("v") or request.args.get("video") or request.args.get("videoId")
-    if not video:
-        return jsonify({"error": "missing video id/url param 'v'"}), 400
-
-    langs_q = request.args.get("langs") or request.args.get("languages") or ""
-    if langs_q:
-        langs = [s.strip() for s in langs_q.split(",") if s.strip()]
-    else:
-        al = (request.headers.get("Accept-Language") or "").split(",")
-        langs = [al[0].split(";")[0]] if al and al[0] else []
-
-    prefer_manual = request.args.get("prefer_manual", "1") not in ("0", "false", "False")
-
-    try:
-        data = fetch_transcript_multilang_in_app(video, langs=langs, prefer_manual=prefer_manual)
-        return jsonify({
-            "ok": True,
-            "video_id": data.get("video_id"),
-            "language": data.get("language"),
-            "mode": data.get("mode"),
-            "translated": data.get("translated"),
-            "text": data.get("text"),
-        })
-    except TranscriptsDisabled:
-        return jsonify({"ok": False, "error": "TranscriptsDisabled"}), 409
-    except NoTranscriptFound as e:
-        return jsonify({"ok": False, "error": "NoTranscriptFound", "detail": str(e)}), 404
-    except (RequestBlocked, TooManyRequests):
-        return jsonify({"ok": False, "error": "Blocked"}), 429
-    except Exception as e:
-        logger.exception("transcript endpoint error")
-        return jsonify({"ok": False, "error": "InternalError", "detail": str(e)}), 500
 
 @app.route("/comments", methods=["GET"])
 @limiter.limit("120/hour;20/minute")  # Limits for comments endpoint
