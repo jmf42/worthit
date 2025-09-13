@@ -12,7 +12,7 @@ import pathlib
 from typing import List, Optional
 from functools import lru_cache
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, Future, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flask import Flask, request, jsonify, g, make_response
 import uuid
@@ -76,9 +76,7 @@ TRANSCRIPT_LANGS = [
         "en,hi,es,pt,id,ja,ru,ar,bn,tr,de,fr,vi,ko,th"
     ).split(",") if c.strip()
 ]
-#
-# Transcript tuning
-TRANSCRIPT_HTTP_TIMEOUT   = int(os.getenv("TRANSCRIPT_HTTP_TIMEOUT", "15"))
+# (Deprecated) TRANSCRIPT_HTTP_TIMEOUT was unused; per-request timeouts are set on sessions.
 COMMENT_CACHE_SIZE = int(os.getenv("COMMENT_CACHE_SIZE", "150"))
 COMMENT_CACHE_TTL = int(os.getenv("COMMENT_CACHE_TTL", "7200")) # 2 hours
 # In Cloud Run, only /tmp is writable. Allow override via env.
@@ -288,8 +286,11 @@ def _timedtext_list_tracks(video_id: str, use_proxy: bool = False, request_id: s
         log_event('debug', 'timedtext_list_error', extra={"video_id": video_id, "error": str(e), "request_id": request_id})
         return []
 
-def timedtext_try_languages(video_id: str, languages: List[str], request_id: str = "") -> Optional[str]:
+def timedtext_try_languages(video_id: str, languages: Optional[List[str]], request_id: str = "") -> Optional[str]:
     """Try timedtext using discovery: list tracks, pick by base language; manual first, then ASR. Direct then proxy."""
+    # Default to configured preferences if caller provided none
+    if not languages:
+        languages = TRANSCRIPT_LANGS
     # Build base language set (e.g., 'es' from 'es-419') preserving order
     base_langs: list[str] = []
     seen = set()
@@ -501,11 +502,9 @@ def _after_request(response):
         pass
     return response
 
-# --- Caches & Worker Pool ---
+# --- Caches ---
 transcript_cache = TTLCache(maxsize=TRANSCRIPT_CACHE_SIZE, ttl=TRANSCRIPT_CACHE_TTL)
 comment_cache = TTLCache(maxsize=COMMENT_CACHE_SIZE, ttl=COMMENT_CACHE_TTL)
-executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-_pending_futures: dict[str, Future] = {}
 
 logger.info(f"App initialized. Max workers: {MAX_WORKERS}. Comment limit: {COMMENT_LIMIT}")
 logger.info(f"Transcript Cache: size={TRANSCRIPT_CACHE_SIZE}, ttl={TRANSCRIPT_CACHE_TTL}s")
@@ -747,13 +746,7 @@ def get_proxy_dict() -> dict:
     url = _gateway_url()
     return {"http": url, "https": url} if url else {}
 
-# Back‑compat shim for legacy helper names -------------------------------
-# Some old logic still refers to `rnd_proxy()` or `PROXY_ROTATION`.
-PROXY_ROTATION: list[dict] = [get_proxy_dict()] if get_proxy_dict() else []
-
-def rnd_proxy() -> dict:
-    """Return a proxy mapping compatible with old code paths."""
-    return get_proxy_dict()
+# (Back-compat helpers previously lived here; removed as unused.)
 
 
 
@@ -799,34 +792,40 @@ def fetch_api_once(video_id: str,
     })
     ytt_api = YouTubeTranscriptApi(http_client=http_client, proxy_config=proxy_cfg)
     try:
-        ft = ytt_api.fetch(video_id, languages=languages_final)
-    except NoTranscriptFound:
-        # Try advanced fallback: list transcripts, then fetch/translate
-        try:
-            # Prefer instance method (respects proxy_config); fall back to classmethod
-            if hasattr(ytt_api, 'list'):
-                tl = ytt_api.list(video_id)
-            else:
-                tl = _list_transcripts_safe(video_id, proxy_config=proxy_cfg)
-            # Prefer requested languages directly
+        # Prefer list-based selection for finer control. Fallback to simple fetch if list is unavailable.
+        if hasattr(ytt_api, 'list'):
+            tl = ytt_api.list(video_id)
+            ft = None
+            # 1) If user provided languages, try manual in that order
             if languages_final:
                 try:
-                    t = tl.find_transcript(languages_final)
+                    t = tl.find_manually_created_transcript(languages_final)
                     ft = t.fetch()
                 except Exception:
-                    t = None
-            else:
-                t = None
-
-            # If no direct match, pick any transcript then translate to first preferred language if possible
-            if not 'ft' in locals() or ft is None:
-                # Pick a manually created transcript first, otherwise any
-                t = t or (getattr(tl, 'find_manually_created_transcript', lambda langs: None)(languages or []))
-                t = t or (getattr(tl, 'find_generated_transcript', lambda langs: None)(languages or []))
-                t = t or (next(iter(tl), None))
+                    ft = None
+            # 2) If exactly one manual transcript exists, prioritize it (assume original language)
+            if ft is None:
+                try:
+                    manual = [tr for tr in tl if not getattr(tr, 'is_generated', False)]
+                except Exception:
+                    manual = []
+                if len(manual) == 1:
+                    try:
+                        ft = manual[0].fetch()
+                    except Exception:
+                        ft = None
+            # 3) Otherwise, try generated in user order
+            if ft is None and languages_final:
+                try:
+                    t = tl.find_generated_transcript(languages_final)
+                    ft = t.fetch()
+                except Exception:
+                    ft = None
+            # 4) Last resort: take any transcript then translate to first preferred language if possible
+            if ft is None:
+                t = next(iter(tl), None)
                 if t is None:
                     raise NoTranscriptFound
-                # Translate if caller provided preferred languages and translation is supported
                 if languages_final and getattr(t, 'is_translatable', False):
                     translated = None
                     for lang in languages_final:
@@ -841,16 +840,18 @@ def fetch_api_once(video_id: str,
                         ft = t.fetch()
                 else:
                     ft = t.fetch()
-        except Exception:
-            log_event('warning', 'transcript_method_failure', extra={
-                "method": "youtube-transcript-api",
-                "video_id": video_id,
-                "reason": "NoTranscriptFound",
-                "languages_attempted": languages_final,
-                "duration_ms": int((time.perf_counter() - t0) * 1000),
-                "request_id": request_id
-            })
-            return None
+        else:
+            ft = ytt_api.fetch(video_id, languages=languages_final)
+    except Exception:
+        log_event('warning', 'transcript_method_failure', extra={
+            "method": "youtube-transcript-api",
+            "video_id": video_id,
+            "reason": "NoTranscriptFound",
+            "languages_attempted": languages_final,
+            "duration_ms": int((time.perf_counter() - t0) * 1000),
+            "request_id": request_id
+        })
+        return None
     except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
         log_event('error', 'transcript_method_failure', extra={
             "method": "youtube-transcript-api",
@@ -974,7 +975,7 @@ def fetch_ytdlp(video_id: str,
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Parallel alternative API fallback: fetch from multiple APIs in parallel
-from cachetools import cached, TTLCache
+from cachetools import cached
 
 # Cache for instance lists (1 hour TTL, up to 10 different endpoints)
 instance_cache = TTLCache(maxsize=10, ttl=3600)
@@ -1784,69 +1785,6 @@ def _fetch_comments_from_ytdlp(video_id: str, use_proxy: bool = False, request_i
     return []
 
 # --- Endpoints ---
-@app.before_request
-def log_request_info():
-    if request.path not in ['/health', '/health/deep']: # Avoid spamming health checks
-        ip_addr = request.headers.get("X-Forwarded-For", request.remote_addr)
-        logger.info(f"Request: {request.method} {request.path} from {ip_addr} | Args: {request.args}")
-        if request.is_json:
-            try:
-                # Log small JSON payloads, summarize large ones
-                payload = request.get_json()
-                payload_str = json.dumps(payload)
-                if len(payload_str) > 500:
-                    payload_str = payload_str[:500] + "... (truncated)"
-                logger.debug(f"JSON Payload: {payload_str}")
-            except Exception as e:
-                logger.warning(f"Could not parse/log JSON payload: {e}")
-
-
-
-# --- Background transcript worker helper ---
-def _background_transcript_worker(video_id: str):
-    """Obtiene transcript en segundo plano, guarda en caché y limpia pending."""
-    try:
-        if video_id in transcript_cache:
-            return
-
-        # Llamada real
-        result = get_transcript(video_id)
-        transcript_cache[video_id] = result
-        with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
-            db[video_id] = result
-        logger.info("Transcript processing complete for %s (background)", video_id)
-
-    except NoTranscriptFound:
-        if video_id not in transcript_cache:
-            transcript_cache[video_id] = "__NOT_AVAILABLE__"
-            with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
-                db[video_id] = "__NOT_AVAILABLE__"
-        logger.warning("Transcript marked NOT AVAILABLE for %s", video_id)
-
-    except Exception as e:
-        logger.error("Background transcript worker failed for %s: %s", video_id, str(e))
-
-    finally:
-        _pending_futures.pop(video_id, None)
-
-# --- Background comment worker helper ---
-def _background_comment_worker(video_id: str):
-    """Fetch comments in background, cache result and clean pending."""
-    try:
-        if video_id in comment_cache:
-            return
-        result = _fetch_comments_resilient(video_id)
-        comment_cache[video_id] = result
-        with shelve.open(PERSISTENT_COMMENT_DB) as db:
-            db[video_id] = result
-        logger.info("Comment processing complete for %s (background)", video_id)
-    except Exception as e:
-        logger.error("Background comment worker failed for %s: %s", video_id, str(e))
-    finally:
-        _pending_futures.pop(f"comments_{video_id}", None)
-
-
-
 @app.route("/transcript", methods=["GET"])
 @limiter.limit("1000/hour;200/minute")  # Increased limits for transcript endpoint
 def get_transcript_endpoint():
@@ -2062,7 +2000,6 @@ def openai_proxy():
 
     # --- Streaming mode (Server-Sent Events pass-through) ---
     if bool(payload.get('stream')):
-        import itertools as _it
         from flask import Response, stream_with_context
 
         def _iter_sse():
@@ -2244,14 +2181,7 @@ def favicon():
 
 # --- Cleanup on Exit ---
 def cleanup_on_exit():
-    logger.info("Shutting down thread pool...")
-    executor.shutdown(wait=True) # Wait for tasks to complete
-    # Clear pending futures to avoid issues on restart if process is killed abruptly
-    _pending_futures.clear()
-    
-    # Close shelve databases properly (important for data integrity)
-    # This is harder to guarantee with shelve if app crashes.
-    # Consider more robust DBs if data loss is critical.
+    # Close shelve databases properly (best-effort; they are opened on demand)
     logger.info("Application shutting down.")
 
 import atexit
