@@ -728,7 +728,17 @@ GEN_HTTP = os.getenv("PROXY_HTTP_URL") or os.getenv("HTTP_PROXY")
 GEN_HTTPS = os.getenv("PROXY_HTTPS_URL") or os.getenv("HTTPS_PROXY")
 
 PROXY_CFG = None
-if GEN_HTTP or GEN_HTTPS:
+# Prefer Webshare if configured; fall back to generic proxy URLs if not.
+if WS_USER and WS_PASS:
+    if not WS_USER.endswith("-rotate"):
+        WS_USER = f"{WS_USER}-rotate"
+    from youtube_transcript_api.proxies import WebshareProxyConfig
+    PROXY_CFG = WebshareProxyConfig(
+        proxy_username=WS_USER,
+        proxy_password=WS_PASS
+    )
+    logger.info("Using Webshare rotating residential proxies (username=%s)", WS_USER)
+elif GEN_HTTP or GEN_HTTPS:
     try:
         from youtube_transcript_api.proxies import GenericProxyConfig
         PROXY_CFG = GenericProxyConfig(
@@ -738,29 +748,20 @@ if GEN_HTTP or GEN_HTTPS:
         logger.info("Using GenericProxyConfig (http=%s, https=%s)", bool(GEN_HTTP), bool(GEN_HTTPS))
     except Exception as e:
         logger.warning("Failed to create GenericProxyConfig: %s", e)
-elif WS_USER and WS_PASS:
-    if not WS_USER.endswith("-rotate"):
-        WS_USER = f"{WS_USER}-rotate"
-    from youtube_transcript_api.proxies import WebshareProxyConfig
-    PROXY_CFG = WebshareProxyConfig(
-        proxy_username=WS_USER,
-        proxy_password=WS_PASS
-    )
-    logger.info("Using Webshare rotating residential proxies (username=%s)", WS_USER)
 else:
     logger.info("No proxy credentials – transcript requests will go direct unless FORCE_PROXY=true")
 
 # ---------------------------------------------------------------------------
 # Helper – build a single rotating Webshare gateway URL
 def _gateway_url() -> str | None:
-    # Prefer generic proxy URL if provided
+    # Prefer Webshare rotating gateway when available
+    if WS_USER and WS_PASS:
+        return f"http://{WS_USER}:{WS_PASS}@p.webshare.io:80"
+    # Otherwise fall back to generic proxy URLs
     if GEN_HTTPS:
         return GEN_HTTPS
     if GEN_HTTP:
         return GEN_HTTP
-    if WS_USER and WS_PASS:
-        # Webshare rotating residential gateway host
-        return f"http://{WS_USER}:{WS_PASS}@p.webshare.io:80"
     return None
 
 def get_proxy_dict() -> dict:
@@ -819,6 +820,35 @@ def fetch_api_once(video_id: str,
         "Cookie": CONSENT_COOKIE_HEADER
     })
     ytt_api = YouTubeTranscriptApi(http_client=http_client, proxy_config=proxy_cfg)
+
+    # If English appears to be available as an original transcript, move it to front
+    # so we "try English first if it's the original video language", then others.
+    try:
+        if any(c.startswith('en') for c in languages_final):
+            # Prefer instance method (respects proxy_config); fall back to classmethod
+            if hasattr(ytt_api, 'list'):
+                tl = ytt_api.list(video_id)
+            else:
+                tl = _list_transcripts_safe(video_id, proxy_config=proxy_cfg)
+            en_present = False
+            for tr in tl:
+                code = getattr(tr, 'language_code', '') or ''
+                if code.lower().startswith('en'):
+                    en_present = True
+                    break
+            if en_present:
+                orig = languages_final[:]
+                languages_final = [c for c in languages_final if c.startswith('en')] + [c for c in languages_final if not c.startswith('en')]
+                if languages_final != orig:
+                    log_event('info', 'language_order_adjusted_en_first', extra={
+                        "video_id": video_id,
+                        "request_id": request_id,
+                        "reason": "english_transcript_present",
+                        "new_order": languages_final
+                    })
+    except Exception:
+        # Non-fatal – continue with existing order
+        pass
     try:
         ft = ytt_api.fetch(video_id, languages=languages_final)
     except NoTranscriptFound:
