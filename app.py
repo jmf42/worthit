@@ -580,12 +580,26 @@ def _fetch_from_alternative_api(hosts: deque, path: str, cooldown_map: dict[str,
 
 # --- Language preferences helper (shared) ---
 def expand_preferred_langs(codes: Optional[List[str]], force_en_first: bool = False) -> List[str]:
-    """Expand language preferences into variants while preserving caller intent.
-    - When `codes` is None/empty: fall back to env default and optionally force English first.
-    - When caller provides explicit `codes`: DO NOT force English unless requested.
+    """Expand/normalize language preferences while preserving caller intent.
+    - None/empty → use env default and optionally put English first.
+    - Explicit list → keep given priority; no forced English unless requested.
+    - Normalizes common aliases (e.g., 'in'→'id', 'jp'→'ja', 'zh-cn'→'zh-Hans').
     """
     if not codes:
         codes = TRANSCRIPT_LANGS
+
+    def _norm(code: str) -> str:
+        c = (code or '').strip().replace('_', '-').lower()
+        # Common legacy/alias normalizations
+        alias = {
+            'jp': 'ja',
+            'iw': 'he',  # old Hebrew
+            'in': 'id',  # old Indonesian
+            'zh-cn': 'zh-hans', 'zh-sg': 'zh-hans', 'zh-hans': 'zh-hans',
+            'zh-tw': 'zh-hant', 'zh-hk': 'zh-hant', 'zh-mo': 'zh-hant', 'zh-hant': 'zh-hant',
+        }
+        return alias.get(c, c)
+
     mapping = {
         'es': ['es', 'es-419', 'es-ES', 'es-MX', 'es-AR', 'es-CL', 'es-CO', 'es-PE', 'es-VE'],
         'pt': ['pt', 'pt-BR', 'pt-PT'],
@@ -601,6 +615,8 @@ def expand_preferred_langs(codes: Optional[List[str]], force_en_first: bool = Fa
         'ja': ['ja', 'ja-JP'],
         'ko': ['ko', 'ko-KR'],
         'zh': ['zh', 'zh-Hans', 'zh-Hant', 'zh-CN', 'zh-TW'],
+        'zh-hans': ['zh-Hans', 'zh', 'zh-CN', 'zh-SG'],
+        'zh-hant': ['zh-Hant', 'zh', 'zh-TW', 'zh-HK', 'zh-MO'],
         'vi': ['vi', 'vi-VN'],
         'pl': ['pl', 'pl-PL'],
         'nl': ['nl', 'nl-NL'],
@@ -611,24 +627,28 @@ def expand_preferred_langs(codes: Optional[List[str]], force_en_first: bool = Fa
         'te': ['te', 'te-IN'],
         'th': ['th', 'th-TH'],
     }
-    # 1) De-dup while preserving order
+
+    # 1) Normalize + de-dup preserving order
     seen = set()
-    ordered = []
+    ordered: List[str] = []
     for c in codes:
-        c = (c or '').strip()
-        if not c or c in seen:
+        cn = _norm(c)
+        if not cn or cn in seen:
             continue
-        ordered.append(c)
-        seen.add(c)
-    # 2) Optionally ensure English first (only when explicitly requested or using defaults)
+        ordered.append(cn)
+        seen.add(cn)
+
+    # 2) Optionally ensure English first
     if force_en_first and 'en' in ordered:
         ordered.remove('en')
         ordered.insert(0, 'en')
+
     # 3) Expand variants
-    out = []
+    out: List[str] = []
     seen = set()
     for c in ordered:
-        variants = mapping.get(c, [c])
+        base = c.split('-', 1)[0]
+        variants = mapping.get(c, mapping.get(base, [c]))
         for v in variants:
             if v not in seen:
                 out.append(v)
@@ -1196,7 +1216,9 @@ def get_transcript(video_id: str,
 
     # Step 2: Timedtext direct (manual → asr), English-first ordering
     try:
-        tt = timedtext_try_languages(video_id, languages, request_id=request_id)
+        # Ensure we never pass None into timedtext flow; preserve caller's order
+        langs_for_timedtext = languages or expand_preferred_langs(TRANSCRIPT_LANGS, force_en_first=True)
+        tt = timedtext_try_languages(video_id, langs_for_timedtext, request_id=request_id)
         if tt:
             logger.info("Timedtext fetch succeeded", extra={
                 "event": "transcript_step_success",
