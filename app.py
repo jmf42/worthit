@@ -392,6 +392,9 @@ _cors_origins = [o.strip() for o in _cors_origins_env.split(",")] if _cors_origi
 CORS(app, resources={r"/*": {"origins": _cors_origins}})
 app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_CONTENT_LENGTH_BYTES", str(2 * 1024 * 1024)))
 
+# Feature flags / behavior toggles
+ORIGINAL_TRANSLATE_FALLBACK = os.getenv("ORIGINAL_TRANSLATE_FALLBACK", "true").lower() == "true"
+
 
 # Rate Limiting
 RATELIMIT_STORAGE_URI = os.getenv("RATELIMIT_STORAGE_URI") # e.g., redis://localhost:6379/0
@@ -1241,6 +1244,34 @@ def get_transcript(video_id: str,
             "reason": str(e),
             "request_id": request_id
         })
+
+    # Step 2.5: Last-resort translation only if originals failed in API/timedtext
+    if ORIGINAL_TRANSLATE_FALLBACK:
+        txt = _try_translate_last_resort(video_id, languages, use_proxy=False, request_id=request_id)
+        if txt:
+            logger.info("Last-resort translation succeeded (no proxy)", extra={
+                "event": "transcript_step_success",
+                "step": 3,
+                "method": "last_resort_translation",
+                "video_id": video_id,
+                "text_len": len(txt),
+                "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+                "request_id": request_id
+            })
+            return txt
+        if PROXY_CFG is not None:
+            txt = _try_translate_last_resort(video_id, languages, use_proxy=True, request_id=request_id)
+            if txt:
+                logger.info("Last-resort translation succeeded (with proxy)", extra={
+                    "event": "transcript_step_success",
+                    "step": 3,
+                    "method": "last_resort_translation_proxy",
+                    "video_id": video_id,
+                    "text_len": len(txt),
+                    "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+                    "request_id": request_id
+                })
+                return txt
 
     # Step 3: Try alternative APIs in parallel
     txt = _fetch_transcript_alternatives(video_id, request_id=request_id, languages=languages)
@@ -2282,3 +2313,64 @@ if __name__ == "__main__":
 # For Cloud Run / Gunicorn
 if __name__ != "__main__":
     gunicorn_app = app
+# ---------------------------------------------------------------------------
+# Controlled last-resort translation (original-first already failed)
+def _try_translate_last_resort(video_id: str,
+                               languages: Optional[List[str]],
+                               use_proxy: bool,
+                               request_id: str = "") -> Optional[str]:
+    if not ORIGINAL_TRANSLATE_FALLBACK:
+        return None
+    # Build preference list; use provided or defaults
+    languages_final = languages if languages else expand_preferred_langs(TRANSCRIPT_LANGS, force_en_first=True)
+    # Prepare API client
+    http_client = requests.Session()
+    accept_lang = ", ".join(f"{code};q={1.0 - (idx*0.1):.1f}" for idx, code in enumerate(languages_final[:5]))
+    http_client.headers.update({
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept-Language": accept_lang,
+        "Cookie": CONSENT_COOKIE_HEADER
+    })
+    proxy_cfg = PROXY_CFG if use_proxy else None
+    ytt_api = YouTubeTranscriptApi(http_client=http_client, proxy_config=proxy_cfg)
+    try:
+        # List transcripts and find a manual one we can translate
+        tl = ytt_api.list(video_id) if hasattr(ytt_api, 'list') else _list_transcripts_safe(video_id, proxy_config=proxy_cfg)
+        # Prefer any manual transcript (original)
+        manual: Any = None
+        for tr in tl:
+            if not getattr(tr, 'is_generated', False):
+                manual = tr
+                break
+        if manual is None:
+            return None  # Do not translate ASR
+        if not getattr(manual, 'is_translatable', False):
+            return None
+        # Translate to the first preferred language that works
+        for lang in languages_final:
+            try:
+                tr = manual.translate(lang)
+                ft = tr.fetch()
+                segments = ft.to_raw_data() if hasattr(ft, "to_raw_data") else ft
+                text_content = " ".join(
+                    seg.get("text") if isinstance(seg, dict) else getattr(seg, "text", "")
+                    for seg in segments
+                ).strip() or None
+                if text_content:
+                    log_event('info', 'last_resort_translation_success', extra={
+                        "video_id": video_id,
+                        "target_lang": lang,
+                        "proxy": use_proxy,
+                        "request_id": request_id
+                    })
+                    return text_content
+            except Exception:
+                continue
+    except Exception as e:
+        log_event('warning', 'last_resort_translation_error', extra={
+            "video_id": video_id,
+            "error": str(e),
+            "proxy": use_proxy,
+            "request_id": request_id
+        })
+    return None
