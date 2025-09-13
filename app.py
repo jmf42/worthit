@@ -9,7 +9,7 @@ import random
 import html
 import tempfile
 import pathlib
-from typing import List, Optional
+from typing import List, Optional, Any
 from functools import lru_cache
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed
@@ -67,7 +67,12 @@ COMMENT_LIMIT = int(os.getenv("COMMENT_LIMIT", "50"))
 TRANSCRIPT_CACHE_SIZE = int(os.getenv("TRANSCRIPT_CACHE_SIZE", "200"))
 TRANSCRIPT_CACHE_TTL = int(os.getenv("TRANSCRIPT_CACHE_TTL", "7200")) # 2 hours
 # Preferred languages for transcript API (comma‑separated env var)
-TRANSCRIPT_LANGS = os.getenv("TRANSCRIPT_LANGS", "en").split(",")
+# Default priority (override via env in prod if needed):
+# en, hi, es, pt, id, ja, ru, ar, bn, tr, de, fr, vi, ko, th
+TRANSCRIPT_LANGS = os.getenv(
+    "TRANSCRIPT_LANGS",
+    "en,hi,es,pt,id,ja,ru,ar,bn,tr,de,fr,vi,ko,th"
+).split(",")
 #
 # Transcript tuning
 TRANSCRIPT_HTTP_TIMEOUT   = int(os.getenv("TRANSCRIPT_HTTP_TIMEOUT", "15"))
@@ -314,22 +319,6 @@ def timedtext_try_languages(video_id: str, languages: List[str], request_id: str
                         if out:
                             log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "manual", "proxy": True, "request_id": request_id})
                             return out
-        # Try translating a manual track to the first preferred base language (e.g., es/pt) if differs
-        if base_langs:
-            target_base = base_langs[0]
-            for code, kind in tracks:
-                if kind == 'manual' and not code.startswith(target_base):
-                    out = _timedtext_fetch_vtt(video_id, code, asr=False, use_proxy=False, request_id=request_id, tlang=target_base)
-                    if out:
-                        log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": f"manual_translate_{target_base}", "proxy": False, "request_id": request_id})
-                        return out
-            if get_proxy_dict():
-                for code, kind in tracks:
-                    if kind == 'manual' and not code.startswith(target_base):
-                        out = _timedtext_fetch_vtt(video_id, code, asr=False, use_proxy=True, request_id=request_id, tlang=target_base)
-                        if out:
-                            log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": f"manual_translate_{target_base}", "proxy": True, "request_id": request_id})
-                            return out
         # Try ASR in requested base languages
         for base in base_langs:
             for code, kind in tracks:
@@ -347,6 +336,29 @@ def timedtext_try_languages(video_id: str, languages: List[str], request_id: str
                         if out:
                             log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "asr", "proxy": True, "request_id": request_id})
                             return out
+
+        # Original-first: if we discovered tracks but none match preferences, pick an original by server defaults
+        if tracks:
+            # Manual preferred over ASR when choosing
+            manual_codes = [code for code, kind in tracks if kind == 'manual']
+            asr_codes = [code for code, kind in tracks if kind == 'asr']
+            def _choose_by_defaults(codes: list[str]) -> Optional[str]:
+                for base in [c.split('-')[0].lower() for c in expand_preferred_langs(TRANSCRIPT_LANGS, force_en_first=True)]:
+                    for code in codes:
+                        if code.lower().startswith(base):
+                            return code
+                return codes[0] if codes else None
+            chosen = _choose_by_defaults(manual_codes) or _choose_by_defaults(asr_codes)
+            if chosen:
+                out = _timedtext_fetch_vtt(video_id, chosen, asr=(chosen in asr_codes), use_proxy=False, request_id=request_id)
+                if out:
+                    log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": chosen, "kind": "manual" if chosen in manual_codes else "asr", "proxy": False, "request_id": request_id})
+                    return out
+            if get_proxy_dict() and chosen:
+                out = _timedtext_fetch_vtt(video_id, chosen, asr=(chosen in asr_codes), use_proxy=True, request_id=request_id)
+                if out:
+                    log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": chosen, "kind": "manual" if chosen in manual_codes else "asr", "proxy": True, "request_id": request_id})
+                    return out
 
     # If list failed or nothing matched, do a simple brute force (manual then ASR; direct then proxy)
     for base in base_langs:
@@ -604,6 +616,7 @@ def expand_preferred_langs(codes: Optional[List[str]], force_en_first: bool = Fa
         'bn': ['bn', 'bn-BD', 'bn-IN'],
         'ta': ['ta', 'ta-IN'],
         'te': ['te', 'te-IN'],
+        'th': ['th', 'th-TH'],
     }
     # 1) De-dup while preserving order
     seen = set()
@@ -789,46 +802,63 @@ def fetch_api_once(video_id: str,
     try:
         ft = ytt_api.fetch(video_id, languages=languages_final)
     except NoTranscriptFound:
-        # Try advanced fallback: list transcripts, then fetch/translate
+        # Original-first fallback using transcript listing (no translation)
         try:
-            # Prefer instance method (respects proxy_config); fall back to classmethod
             if hasattr(ytt_api, 'list'):
                 tl = ytt_api.list(video_id)
             else:
                 tl = _list_transcripts_safe(video_id, proxy_config=proxy_cfg)
-            # Prefer requested languages directly
-            if languages_final:
-                try:
-                    t = tl.find_transcript(languages_final)
-                    ft = t.fetch()
-                except Exception:
-                    t = None
-            else:
-                t = None
 
-            # If no direct match, pick any transcript then translate to first preferred language if possible
-            if not 'ft' in locals() or ft is None:
-                # Pick a manually created transcript first, otherwise any
-                t = t or (getattr(tl, 'find_manually_created_transcript', lambda langs: None)(languages or []))
-                t = t or (getattr(tl, 'find_generated_transcript', lambda langs: None)(languages or []))
-                t = t or (next(iter(tl), None))
-                if t is None:
-                    raise NoTranscriptFound
-                # Translate if caller provided preferred languages and translation is supported
-                if languages_final and getattr(t, 'is_translatable', False):
-                    translated = None
-                    for lang in languages_final:
-                        try:
-                            translated = t.translate(lang)
-                            break
-                        except Exception:
-                            continue
-                    if translated is not None:
-                        ft = translated.fetch()
-                    else:
-                        ft = t.fetch()
-                else:
-                    ft = t.fetch()
+            # Collect available originals by code and type (manual/generated)
+            originals: dict[str, dict[str, Any]] = {}
+            for tr in tl:
+                code = getattr(tr, 'language_code', None)
+                if not code:
+                    continue
+                is_gen = getattr(tr, 'is_generated', False)
+                if code not in originals:
+                    originals[code] = {"manual": None, "generated": None}
+                key = "generated" if is_gen else "manual"
+                originals[code][key] = tr
+
+            if not originals:
+                raise NoTranscriptFound
+
+            # Helper: prefer a code that matches caller prefs; else server defaults; else any
+            def _choose_original_code(codes: list[str], prefs: list[str]) -> str:
+                # Try preference list (base match)
+                pref_bases = [p.split('-')[0].lower() for p in prefs]
+                for base in pref_bases:
+                    for code in codes:
+                        if code.lower().startswith(base):
+                            return code
+                # Try server default order
+                for base in [c.split('-')[0].lower() for c in expand_preferred_langs(TRANSCRIPT_LANGS, force_en_first=True)]:
+                    for code in codes:
+                        if code.lower().startswith(base):
+                            return code
+                # Fallback: first available
+                return codes[0]
+
+            available_codes = list(originals.keys())
+            chosen_code = _choose_original_code(available_codes, languages_final or [])
+            chosen = originals.get(chosen_code) or {}
+            tr_obj = chosen.get("manual") or chosen.get("generated")
+            if not tr_obj:
+                # Should not happen, but guard by choosing any manual then any generated
+                for c in available_codes:
+                    cand = originals[c]
+                    tr_obj = cand.get("manual") or cand.get("generated")
+                    if tr_obj:
+                        chosen_code = c
+                        break
+            ft = tr_obj.fetch()
+            log_event('info', 'original_first_selected', extra={
+                "method": "youtube-transcript-api",
+                "video_id": video_id,
+                "chosen_language": chosen_code,
+                "request_id": request_id
+            })
         except Exception:
             log_event('warning', 'transcript_method_failure', extra={
                 "method": "youtube-transcript-api",
@@ -1143,39 +1173,50 @@ def get_transcript(video_id: str,
             "request_id": request_id
         })
 
-    # Step 1b: Retry youtube-transcript-api WITH PROXY (only if configured)
+    # Step 1b: Retry youtube-transcript-api WITH PROXY (only if configured and healthy)
     if PROXY_CFG is not None:
-        try:
-            txt = fetch_api_once(video_id, PROXY_CFG, request_id=request_id, languages=languages)
-            if txt:
-                logger.info("Primary transcript fetch succeeded (with proxy)", extra={
-                    "event": "transcript_step_success",
-                    "step": 1,
-                    "method": "youtube-transcript-api_proxy",
-                    "video_id": video_id,
-                    "text_len": len(txt),
-                    "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
-                    "request_id": request_id
-                })
-                return txt
-            else:
-                logger.info("Primary transcript fetch failed (with proxy)", extra={
+        proxy_url = _gateway_url()
+        if proxy_url and not _proxy_is_healthy(proxy_url):
+            logger.warning("Proxy health check failed — skipping youtube-transcript-api proxy retry", extra={
+                "event": "transcript_step_skipped",
+                "step": 1,
+                "method": "youtube-transcript-api_proxy",
+                "video_id": video_id,
+                "proxy_url": proxy_url,
+                "request_id": request_id
+            })
+        else:
+            try:
+                txt = fetch_api_once(video_id, PROXY_CFG, request_id=request_id, languages=languages)
+                if txt:
+                    logger.info("Primary transcript fetch succeeded (with proxy)", extra={
+                        "event": "transcript_step_success",
+                        "step": 1,
+                        "method": "youtube-transcript-api_proxy",
+                        "video_id": video_id,
+                        "text_len": len(txt),
+                        "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+                        "request_id": request_id
+                    })
+                    return txt
+                else:
+                    logger.info("Primary transcript fetch failed (with proxy)", extra={
+                        "event": "transcript_step_failure",
+                        "step": 1,
+                        "method": "youtube-transcript-api_proxy",
+                        "video_id": video_id,
+                        "reason": "No transcript found",
+                        "request_id": request_id
+                    })
+            except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
+                logger.warning("Primary transcript fetch blocked or failed (proxy)", extra={
                     "event": "transcript_step_failure",
                     "step": 1,
                     "method": "youtube-transcript-api_proxy",
                     "video_id": video_id,
-                    "reason": "No transcript found",
+                    "reason": str(e),
                     "request_id": request_id
                 })
-        except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
-            logger.warning("Primary transcript fetch blocked or failed (proxy)", extra={
-                "event": "transcript_step_failure",
-                "step": 1,
-                "method": "youtube-transcript-api_proxy",
-                "video_id": video_id,
-                "reason": str(e),
-                "request_id": request_id
-            })
 
     # Step 2: Timedtext direct (manual → asr), English-first ordering
     try:
