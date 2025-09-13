@@ -12,13 +12,9 @@ import pathlib
 from typing import List, Optional
 from functools import lru_cache
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, TimeoutError, Future, as_completed
-
+from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 
 from flask import Flask, request, jsonify, g, make_response
-from flask import make_response
-from flask import make_response
-from flask import g
 import uuid
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
@@ -30,13 +26,10 @@ from youtube_transcript_api import (
 )
 from youtube_transcript_api._errors import CouldNotRetrieveTranscript
 from cachetools import TTLCache
-from logging.handlers import RotatingFileHandler
 from flask_cors import CORS
 from flask_limiter import Limiter
-from flask_limiter.errors import RateLimitExceeded
 from flask_limiter.util import get_remote_address
 import requests
-import shutil
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from urllib.parse import urljoin
@@ -221,34 +214,6 @@ def get_random_user_agent_header():
         "User-Agent": random.choice(USER_AGENTS),
         "Accept-Language": "en-US,en;q=0.8"
     }
-
-# --- Cookies loader (Netscape format) ---------------------------------------
-def _load_cookies_from_netscape(path: Optional[str], session: requests.Session) -> None:
-    if not path or not os.path.isfile(path):
-        return
-    try:
-        with open(path, 'r', encoding='utf-8', errors='ignore') as fh:
-            for line in fh:
-                if not line or line.startswith('#'):
-                    continue
-                parts = line.strip().split('\t')
-                if len(parts) != 7:
-                    continue
-                domain, flag, cookie_path, secure, expiry, name, value = parts
-                # Only apply YouTube/Google cookies
-                if ".youtube.com" not in domain and ".google.com" not in domain:
-                    continue
-                c = requests.cookies.create_cookie(
-                    domain=domain,
-                    name=name,
-                    value=value,
-                    path=cookie_path,
-                    secure=(secure.upper() == 'TRUE')
-                )
-                session.cookies.set_cookie(c)
-        logger.info("Loaded cookies from %s into session", path)
-    except Exception as e:
-        logger.warning("Failed to load cookies from %s: %s", path, e)
 
 # --- Minimal timedtext direct fetch (non-official) ---------------------------
 def _timedtext_fetch_vtt(video_id: str, lang: str, asr: bool, use_proxy: bool = False, request_id: str = "", tlang: Optional[str] = None) -> Optional[str]:
@@ -662,6 +627,33 @@ def expand_preferred_langs(codes: Optional[List[str]], force_en_first: bool = Fa
             if v not in seen:
                 out.append(v)
                 seen.add(v)
+    return out
+
+# --- Accept-Language parsing helper ---
+def _parse_accept_language_header(header_val: str | None) -> list[str]:
+    """Parse an HTTP Accept-Language header into a list of base language codes in priority order.
+    Examples:
+      "es-419,es;q=0.9,en-US;q=0.8,en;q=0.7" -> ["es", "en"]
+      "pt-BR,pt;q=0.9" -> ["pt"]
+    Returns an empty list when header is missing or unusable.
+    """
+    if not header_val:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    try:
+        parts = [p.strip() for p in header_val.split(',') if p.strip()]
+        for p in parts:
+            # Token up to ';' is the language tag
+            tag = p.split(';', 1)[0].strip().lower()
+            if not tag or tag == '*':
+                continue
+            base = tag.split('-', 1)[0]
+            if base and base not in seen:
+                out.append(base)
+                seen.add(base)
+    except Exception:
+        return []
     return out
 
 # --- yt-dlp Helper ---
@@ -1849,6 +1841,8 @@ def get_transcript_endpoint():
     languages: Optional[List[str]] = None
     # Build a language-aware cache key that respects caller intent
     cache_key = video_id
+    legacy_fallback_allowed = True  # Use legacy cache key only for default English-first path
+
     if raw_langs:
         # Normalize and de-dup caller-provided list, preserving order
         base_list = []
@@ -1861,9 +1855,23 @@ def get_transcript_endpoint():
             seen.add(cc)
         languages = expand_preferred_langs(base_list, force_en_first=False)
         cache_key = f"{video_id}::langs={','.join(base_list)}"
+        legacy_fallback_allowed = False
     else:
-        # Default behavior: English-first expansion, keep legacy cache key for compatibility
-        languages = expand_preferred_langs(TRANSCRIPT_LANGS, force_en_first=True)
+        # No explicit languages provided by client → infer from Accept-Language header.
+        # Keep English-first legacy behavior if the client prefers English, to avoid changing the current flow.
+        accept_lang_hdr = request.headers.get("Accept-Language", "")
+        inferred_bases = _parse_accept_language_header(accept_lang_hdr)
+        if inferred_bases and inferred_bases[0] != 'en':
+            # Non-English preference → expand accordingly and append English as a safety fallback
+            if 'en' not in inferred_bases:
+                inferred_bases.append('en')
+            languages = expand_preferred_langs(inferred_bases, force_en_first=False)
+            cache_key = f"{video_id}::langs={','.join(inferred_bases)}"
+            legacy_fallback_allowed = False
+            log_event('info', 'languages_inferred_from_accept_language', video_id=video_id, accept_language=accept_lang_hdr, inferred=inferred_bases, request_id=g.request_id)
+        else:
+            # Default behavior: English-first expansion, keep legacy cache key for compatibility
+            languages = expand_preferred_langs(TRANSCRIPT_LANGS, force_en_first=True)
 
     # Log the start of transcript fetching
     log_event('info', 'transcript_fetch_workflow_start', video_id=video_id, languages=languages or TRANSCRIPT_LANGS, ip=get_remote_address(), request_id=g.request_id)
@@ -1888,7 +1896,7 @@ def get_transcript_endpoint():
                 return jsonify({"error": "Transcript not available"}), 404
             log_event('info', 'transcript_persisted_hit', video_id=video_id, text_len=len(cached), request_id=g.request_id)
             return jsonify({"video_id": video_id, "text": cached}), 200
-        if not raw_langs:
+        if not raw_langs and legacy_fallback_allowed:
             # Legacy fallback: old key without language dimension
             legacy = db.get(video_id)
             if legacy is not None:
