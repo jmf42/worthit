@@ -9,7 +9,7 @@ import random
 import html
 import tempfile
 import pathlib
-from typing import List, Optional
+from typing import List, Optional, Dict
 from functools import lru_cache
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,6 +30,7 @@ from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import requests
+import threading
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from urllib.parse import urljoin
@@ -507,6 +508,10 @@ def _after_request(response):
 # --- Caches ---
 transcript_cache = TTLCache(maxsize=TRANSCRIPT_CACHE_SIZE, ttl=TRANSCRIPT_CACHE_TTL)
 comment_cache = TTLCache(maxsize=COMMENT_CACHE_SIZE, ttl=COMMENT_CACHE_TTL)
+
+# In-flight deduplication for transcript fetches (keyed by cache_key)
+transcript_inflight_lock = threading.Lock()
+transcript_inflight_events: Dict[str, threading.Event] = {}
 
 logger.info(f"App initialized. Max workers: {MAX_WORKERS}. Comment limit: {COMMENT_LIMIT}")
 logger.info(f"Transcript Cache: size={TRANSCRIPT_CACHE_SIZE}, ttl={TRANSCRIPT_CACHE_TTL}s")
@@ -1151,6 +1156,33 @@ def get_transcript(video_id: str,
         "request_id": request_id
     })
 
+    proxy_future = None
+    proxy_executor = None
+    proxy_url = None
+    if PROXY_CFG is not None:
+        proxy_url = _gateway_url()
+        if proxy_url and not _proxy_is_healthy(proxy_url):
+            logger.warning("Proxy health check failed — skipping youtube-transcript-api proxy retry", extra={
+                "event": "transcript_step_skipped",
+                "step": 1,
+                "method": "youtube-transcript-api_proxy",
+                "video_id": video_id,
+                "proxy_url": proxy_url,
+                "request_id": request_id
+            })
+        else:
+            proxy_executor = ThreadPoolExecutor(max_workers=1)
+            proxy_future = proxy_executor.submit(
+                fetch_api_once,
+                video_id,
+                PROXY_CFG,
+                languages=languages,
+                request_id=request_id,
+                prefer_original=prefer_original,
+                strict_languages=strict_languages,
+                allow_translate=allow_translate
+            )
+
     # Step 1a: Try youtube-transcript-api DIRECT (preferred, keeps EN path unchanged, avoids flaky proxies)
     try:
         txt = fetch_api_once(video_id, None, request_id=request_id, languages=languages,
@@ -1167,6 +1199,9 @@ def get_transcript(video_id: str,
                 "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
                 "request_id": request_id
             })
+            if proxy_executor:
+                proxy_executor.shutdown(wait=False)
+                proxy_executor = None
             return txt
         else:
             logger.info("Primary transcript fetch failed (no transcript found)", extra={
@@ -1187,53 +1222,45 @@ def get_transcript(video_id: str,
             "request_id": request_id
         })
 
-    # Step 1b: Retry youtube-transcript-api WITH PROXY (only if configured and healthy)
-    if PROXY_CFG is not None:
-        proxy_url = _gateway_url()
-        if proxy_url and not _proxy_is_healthy(proxy_url):
-            logger.warning("Proxy health check failed — skipping youtube-transcript-api proxy retry", extra={
-                "event": "transcript_step_skipped",
-                "step": 1,
-                "method": "youtube-transcript-api_proxy",
-                "video_id": video_id,
-                "proxy_url": proxy_url,
-                "request_id": request_id
-            })
-        else:
-            try:
-                txt = fetch_api_once(video_id, PROXY_CFG, request_id=request_id, languages=languages,
-                                     prefer_original=prefer_original,
-                                     strict_languages=strict_languages,
-                                     allow_translate=allow_translate)
-                if txt:
-                    logger.info("Primary transcript fetch succeeded (with proxy)", extra={
-                        "event": "transcript_step_success",
-                        "step": 1,
-                        "method": "youtube-transcript-api_proxy",
-                        "video_id": video_id,
-                        "text_len": len(txt),
-                        "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
-                        "request_id": request_id
-                    })
-                    return txt
-                else:
-                    logger.info("Primary transcript fetch failed (with proxy)", extra={
-                        "event": "transcript_step_failure",
-                        "step": 1,
-                        "method": "youtube-transcript-api_proxy",
-                        "video_id": video_id,
-                        "reason": "No transcript found",
-                        "request_id": request_id
-                    })
-            except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
-                logger.warning("Primary transcript fetch blocked or failed (proxy)", extra={
+    # Step 1b: Await proxy result if it was started
+    if proxy_future is not None:
+        try:
+            txt = proxy_future.result()
+            if txt:
+                logger.info("Primary transcript fetch succeeded (with proxy)", extra={
+                    "event": "transcript_step_success",
+                    "step": 1,
+                    "method": "youtube-transcript-api_proxy",
+                    "video_id": video_id,
+                    "text_len": len(txt),
+                    "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+                    "request_id": request_id
+                })
+                if proxy_executor:
+                    proxy_executor.shutdown(wait=False)
+                    proxy_executor = None
+                return txt
+            else:
+                logger.info("Primary transcript fetch failed (with proxy)", extra={
                     "event": "transcript_step_failure",
                     "step": 1,
                     "method": "youtube-transcript-api_proxy",
                     "video_id": video_id,
-                    "reason": str(e),
+                    "reason": "No transcript found",
                     "request_id": request_id
                 })
+        except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
+            logger.warning("Primary transcript fetch blocked or failed (proxy)", extra={
+                "event": "transcript_step_failure",
+                "step": 1,
+                "method": "youtube-transcript-api_proxy",
+                "video_id": video_id,
+                "reason": str(e),
+                "request_id": request_id
+            })
+        finally:
+            if proxy_executor:
+                proxy_executor.shutdown(wait=False)
 
     # Step 2: Timedtext direct (manual → asr), English-first ordering
     try:
@@ -1910,49 +1937,95 @@ def get_transcript_endpoint():
                 log_event('info', 'transcript_persisted_hit_legacy', video_id=video_id, text_len=len(legacy), request_id=g.request_id)
                 return jsonify({"video_id": video_id, "text": legacy}), 200
 
-    # Try fetch with short retry/backoff on transient errors
+    # In-flight deduplication: elect a single leader to perform the fetch
+    leader = False
+    with transcript_inflight_lock:
+        evt = transcript_inflight_events.get(cache_key)
+        if evt is None:
+            evt = threading.Event()
+            transcript_inflight_events[cache_key] = evt
+            leader = True
+
+    if not leader:
+        # Another request is already fetching this transcript. Wait briefly for it to complete, then reuse cache/persisted result.
+        log_event('info', 'transcript_inflight_wait', video_id=video_id, request_id=g.request_id)
+        evt.wait(timeout=30)
+        # Re-check RAM cache
+        cached = transcript_cache.get(cache_key)
+        if cached is not None:
+            if cached == "__NOT_AVAILABLE__":
+                log_event('info', 'transcript_cache_miss_marker', video_id=video_id, request_id=g.request_id)
+                return jsonify({"error": "Transcript not available"}), 404
+            log_event('info', 'transcript_cache_hit_after_wait', video_id=video_id, text_len=len(cached), request_id=g.request_id)
+            return jsonify({"video_id": video_id, "text": cached}), 200
+        # Re-check persistent cache
+        with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
+            cached = db.get(cache_key)
+            if cached is None and (not raw_langs and legacy_fallback_allowed):
+                cached = db.get(video_id)
+            if cached is not None:
+                transcript_cache[cache_key] = cached
+                if cached == "__NOT_AVAILABLE__":
+                    log_event('info', 'transcript_persisted_not_available_after_wait', video_id=video_id, request_id=g.request_id)
+                    return jsonify({"error": "Transcript not available"}), 404
+                log_event('info', 'transcript_persisted_hit_after_wait', video_id=video_id, text_len=len(cached), request_id=g.request_id)
+                return jsonify({"video_id": video_id, "text": cached}), 200
+        # Fallback: proceed to fetch ourselves (rare edge when leader failed/timeout)
+        log_event('warning', 'transcript_inflight_promote_to_fetch', video_id=video_id, request_id=g.request_id)
+
+    # Try fetch with short retry/backoff on transient errors (leader or promoted follower)
     attempts = 0
     last_err = None
-    while attempts < 2:
-        try:
-            # Log attempt start
-            log_event('info', 'transcript_method_attempt', method='unified_fetch', attempt=attempts + 1, video_id=video_id, request_id=g.request_id)
-            text = get_transcript(video_id, request_id=g.request_id, languages=languages,
-                                  prefer_original=prefer_original,
-                                  strict_languages=strict_languages,
-                                  allow_translate=allow_translate)
-            transcript_cache[cache_key] = text
-            with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
-                db[cache_key] = text
-            log_event('info', 'transcript_fetched', video_id=video_id, text_len=len(text), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
-            resp = make_response(jsonify({"video_id": video_id, "text": text}), 200)
-            resp.headers['Cache-Control'] = 'public, max-age=3600'
-            return resp
-        except NoTranscriptFound:
-            if cache_key not in transcript_cache:
-                transcript_cache[cache_key] = "__NOT_AVAILABLE__"
+    try:
+        if leader:
+            log_event('info', 'transcript_inflight_leader', video_id=video_id, request_id=g.request_id)
+        while attempts < 2:
+            try:
+                # Log attempt start
+                log_event('info', 'transcript_method_attempt', method='unified_fetch', attempt=attempts + 1, video_id=video_id, request_id=g.request_id)
+                text = get_transcript(video_id, request_id=g.request_id, languages=languages,
+                                      prefer_original=prefer_original,
+                                      strict_languages=strict_languages,
+                                      allow_translate=allow_translate)
+                transcript_cache[cache_key] = text
                 with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
-                    db[cache_key] = "__NOT_AVAILABLE__"
-            log_event('warning', 'transcript_not_found', video_id=video_id, duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
-            resp = make_response(jsonify({"error": "Transcript not available"}), 404)
-            resp.headers['Cache-Control'] = 'public, max-age=600'
-            return resp
-        except requests.exceptions.RequestException as e:
-            # Transient network/SSL errors – backoff and retry once
-            attempts += 1
-            last_err = e
-            log_event('warning', 'transcript_fetch_network_error', video_id=video_id, attempt=attempts, error=str(e), request_id=g.request_id)
-            time.sleep(0.5 * attempts)
-            continue
-        except Exception as e:
-            # Non-retryable internal error
-            log_event('error', 'transcript_fetch_failed', video_id=video_id, error=str(e), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
-            return jsonify({"error": "Transcript fetch failed"}), 500
-    # Retries exhausted → treat as not available
-    log_event('warning', 'transcript_unavailable_after_retry', video_id=video_id, error=str(last_err) if last_err else None, duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
-    resp = make_response(jsonify({"error": "Transcript not available"}), 404)
-    resp.headers['Cache-Control'] = 'public, max-age=600'
-    return resp
+                    db[cache_key] = text
+                log_event('info', 'transcript_fetched', video_id=video_id, text_len=len(text), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
+                resp = make_response(jsonify({"video_id": video_id, "text": text}), 200)
+                resp.headers['Cache-Control'] = 'public, max-age=3600'
+                return resp
+            except NoTranscriptFound:
+                if cache_key not in transcript_cache:
+                    transcript_cache[cache_key] = "__NOT_AVAILABLE__"
+                    with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
+                        db[cache_key] = "__NOT_AVAILABLE__"
+                log_event('warning', 'transcript_not_found', video_id=video_id, duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
+                resp = make_response(jsonify({"error": "Transcript not available"}), 404)
+                resp.headers['Cache-Control'] = 'public, max-age=600'
+                return resp
+            except requests.exceptions.RequestException as e:
+                # Transient network/SSL errors – backoff and retry once
+                attempts += 1
+                last_err = e
+                log_event('warning', 'transcript_fetch_network_error', video_id=video_id, attempt=attempts, error=str(e), request_id=g.request_id)
+                time.sleep(0.5 * attempts)
+                continue
+            except Exception as e:
+                # Non-retryable internal error
+                log_event('error', 'transcript_fetch_failed', video_id=video_id, error=str(e), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
+                return jsonify({"error": "Transcript fetch failed"}), 500
+        # Retries exhausted → treat as not available
+        log_event('warning', 'transcript_unavailable_after_retry', video_id=video_id, error=str(last_err) if last_err else None, duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
+        resp = make_response(jsonify({"error": "Transcript not available"}), 404)
+        resp.headers['Cache-Control'] = 'public, max-age=600'
+        return resp
+    finally:
+        if leader:
+            with transcript_inflight_lock:
+                evt = transcript_inflight_events.pop(cache_key, None)
+                if evt is not None:
+                    evt.set()
+            log_event('info', 'transcript_inflight_done', video_id=video_id, request_id=g.request_id)
 
 @app.route("/comments", methods=["GET"])
 @limiter.limit("120/hour;20/minute")  # Limits for comments endpoint
