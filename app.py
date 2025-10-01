@@ -1679,15 +1679,6 @@ def _fetch_comments_resilient(video_id: str, request_id: str = "") -> list[str]:
         ("yt-dlp (with proxy)", lambda: _fetch_comments_from_ytdlp(video_id, True, request_id))
     ]
 
-    # Try alternative APIs concurrently
-    piped_instances = fetch_live_instances("https://piped-instances.kavin.rocks/")
-    invidious_instances = fetch_live_instances("https://api.invidious.io/instances.json?sort_by=health")
-
-    comment_sources = [
-        ("Alternative API (Piped direct)", lambda instance: _fetch_from_alternative_api([f"{instance}/api"], f"/comments/{video_id}", _PIPE_COOLDOWN, request_id=request_id)),
-        ("Alternative API (Piped)", lambda instance: _fetch_from_alternative_api([instance], f"/comments/{video_id}", _PIPE_COOLDOWN, request_id=request_id)),
-        ("Alternative API (Invidious)", lambda instance: _fetch_from_alternative_api([instance], f"/api/v1/comments/{video_id}", _PIPE_COOLDOWN, request_id=request_id)),
-    ]
 
     # First, try primary strategies sequentially
     for strategy_name, fetch_func in comment_retrieval_strategies:
@@ -1711,6 +1702,34 @@ def _fetch_comments_resilient(video_id: str, request_id: str = "") -> list[str]:
         })
 
     # If primary strategies fail, try alternative APIs concurrently
+    piped_instances = fetch_live_instances("https://piped-instances.kavin.rocks/")
+    invidious_instances = fetch_live_instances("https://api.invidious.io/instances.json?sort_by=health")
+
+    comment_sources = []
+    if piped_instances:
+        comment_sources.extend([
+            ("Alternative API (Piped direct)", lambda instance: _fetch_from_alternative_api([f"{instance}/api"], f"/comments/{video_id}", _PIPE_COOLDOWN, request_id=request_id)),
+            ("Alternative API (Piped)", lambda instance: _fetch_from_alternative_api([instance], f"/comments/{video_id}", _PIPE_COOLDOWN, request_id=request_id))
+        ])
+    if invidious_instances:
+        comment_sources.append(("Alternative API (Invidious)", lambda instance: _fetch_from_alternative_api([instance], f"/api/v1/comments/{video_id}", _PIPE_COOLDOWN, request_id=request_id)))
+
+    if not comment_sources:
+        log_event('warning', 'comment_alternative_sources_unavailable', extra={
+            "video_id": video_id,
+            "reason": "No alternative hosts discovered",
+            "request_id": request_id
+        })
+        log_event('error', 'all_comment_methods_failed', extra={
+            "video_id": video_id,
+            "strategies_attempted": [
+                strategy[0] for strategy in comment_retrieval_strategies
+            ],
+            "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+            "request_id": request_id
+        })
+        return []
+
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = []
         for source_name, fetch_func_factory in comment_sources:
