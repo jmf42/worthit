@@ -12,7 +12,7 @@ import pathlib
 from typing import List, Optional, Dict
 from functools import lru_cache
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 from flask import Flask, request, jsonify, g, make_response
 import uuid
@@ -287,7 +287,11 @@ def _timedtext_list_tracks(video_id: str, use_proxy: bool = False, request_id: s
         log_event('debug', 'timedtext_list_error', extra={"video_id": video_id, "error": str(e), "request_id": request_id})
         return []
 
-def timedtext_try_languages(video_id: str, languages: Optional[List[str]], request_id: str = "", allow_translate: bool = True) -> Optional[str]:
+def timedtext_try_languages(video_id: str,
+                            languages: Optional[List[str]],
+                            request_id: str = "",
+                            allow_translate: bool = True,
+                            allow_proxy: bool = True) -> Optional[str]:
     """Try timedtext using discovery with this order:
     1) Manual (direct then proxy)
     2) ASR (direct then proxy)
@@ -307,7 +311,7 @@ def timedtext_try_languages(video_id: str, languages: Optional[List[str]], reque
 
     # Try direct list
     tracks = _timedtext_list_tracks(video_id, use_proxy=False, request_id=request_id)
-    if not tracks and get_proxy_dict():
+    if not tracks and allow_proxy and get_proxy_dict():
         # Try via proxy if no tracks direct
         tracks = _timedtext_list_tracks(video_id, use_proxy=True, request_id=request_id)
 
@@ -321,7 +325,7 @@ def timedtext_try_languages(video_id: str, languages: Optional[List[str]], reque
                     if out:
                         log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "manual", "proxy": False, "request_id": request_id})
                         return out
-        if get_proxy_dict():
+        if allow_proxy and get_proxy_dict():
             for base in base_langs:
                 for code, kind in tracks:
                     if kind == 'manual' and code.startswith(base):
@@ -337,7 +341,7 @@ def timedtext_try_languages(video_id: str, languages: Optional[List[str]], reque
                     if out:
                         log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "asr", "proxy": False, "request_id": request_id})
                         return out
-        if get_proxy_dict():
+        if allow_proxy and get_proxy_dict():
             for base in base_langs:
                 for code, kind in tracks:
                     if kind == 'asr' and code.startswith(base):
@@ -354,7 +358,7 @@ def timedtext_try_languages(video_id: str, languages: Optional[List[str]], reque
                     if out:
                         log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": f"manual_translate_{target_base}", "proxy": False, "request_id": request_id})
                         return out
-            if get_proxy_dict():
+            if allow_proxy and get_proxy_dict():
                 for code, kind in tracks:
                     if kind == 'manual' and not code.startswith(target_base):
                         out = _timedtext_fetch_vtt(video_id, code, asr=False, use_proxy=True, request_id=request_id, tlang=target_base)
@@ -367,7 +371,7 @@ def timedtext_try_languages(video_id: str, languages: Optional[List[str]], reque
         if out := _timedtext_fetch_vtt(video_id, base, asr=False, use_proxy=False, request_id=request_id):
             log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": base, "kind": "manual", "proxy": False, "request_id": request_id})
             return out
-    if get_proxy_dict():
+    if allow_proxy and get_proxy_dict():
         for base in base_langs:
             if out := _timedtext_fetch_vtt(video_id, base, asr=False, use_proxy=True, request_id=request_id):
                 log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": base, "kind": "manual", "proxy": True, "request_id": request_id})
@@ -376,7 +380,7 @@ def timedtext_try_languages(video_id: str, languages: Optional[List[str]], reque
         if out := _timedtext_fetch_vtt(video_id, base, asr=True, use_proxy=False, request_id=request_id):
             log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": base, "kind": "asr", "proxy": False, "request_id": request_id})
             return out
-    if get_proxy_dict():
+    if allow_proxy and get_proxy_dict():
         for base in base_langs:
             if out := _timedtext_fetch_vtt(video_id, base, asr=True, use_proxy=True, request_id=request_id):
                 log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": base, "kind": "asr", "proxy": True, "request_id": request_id})
@@ -545,8 +549,14 @@ def extract_video_id(url_or_id: str) -> str | None:
 
 # --- Piped/Invidious API Helpers ---
 _PIPE_COOLDOWN: dict[str, float] = {}
+MAX_ALT_CAPTION_HOSTS = 3
 
-def _fetch_from_alternative_api(hosts, path: str, cooldown_map: dict[str, float], timeout: float = 2.0, request_id: str = "") -> dict | None:
+def _fetch_from_alternative_api(hosts,
+                                path: str,
+                                cooldown_map: dict[str, float],
+                                timeout: float = 2.0,
+                                request_id: str = "",
+                                use_proxy: bool = True) -> dict | None:
     """Fetch JSON from a list/deque of alternative API hosts with simple round-robin + cooldown.
     Accepts a list of host URLs or a deque. Converts to deque internally as needed.
     """
@@ -568,7 +578,7 @@ def _fetch_from_alternative_api(hosts, path: str, cooldown_map: dict[str, float]
             continue
         
         url = f"{host}{path}"
-        current_proxy = get_proxy_dict()
+        current_proxy = get_proxy_dict() if use_proxy else {}
         
         t_host_attempt = time.perf_counter()
         log_event('debug', 'alternative_api_host_attempt', url=url, host=host, proxy_used=bool(current_proxy), request_id=request_id)
@@ -1065,7 +1075,10 @@ def fetch_live_instances(api_url):
             ]
         return []
 
-def _fetch_transcript_alternatives(video_id: str, request_id: str = "", languages: Optional[List[str]] = None) -> str | None:
+def _fetch_transcript_alternatives(video_id: str,
+                                   request_id: str = "",
+                                   languages: Optional[List[str]] = None,
+                                   allow_proxy: bool = True) -> str | None:
     """Try alternative APIs in parallel for transcript fetching."""
     t0 = time.perf_counter()
     logger.info("Attempting transcript fetch via alternative APIs", extra={
@@ -1074,55 +1087,124 @@ def _fetch_transcript_alternatives(video_id: str, request_id: str = "", language
         "video_id": video_id,
         "request_id": request_id
     })
-    piped_instances = fetch_live_instances("https://piped-instances.kavin.rocks/")
-    invidious_instances = fetch_live_instances("https://api.invidious.io/instances.json?sort_by=health")
-    # Extra safety: if discovery yielded nothing, seed with static instances
-    if not piped_instances:
-        piped_instances = [
-            "https://pipedapi.kavin.rocks",
-            "https://pipedapi.adminforge.de",
-            "https://pipedapi.tokhmi.xyz",
-            "https://piped-api.privacy.com.de",
-            "https://api-piped.mha.fi",
-        ]
-    if not invidious_instances:
-        invidious_instances = [
-            "https://yewtu.be",
-            "https://vid.puffyan.us",
-            "https://inv.nadeko.net",
-        ]
 
-    fetchers = [
-        lambda vid=video_id: _piped_captions_direct(vid, piped_instances, languages=languages),
-        lambda vid=video_id: _piped_captions(vid, piped_instances, languages=languages),
-        lambda vid=video_id: _invidious_captions(vid, invidious_instances, languages=languages)
+    static_piped = [
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.adminforge.de",
+        "https://pipedapi.tokhmi.xyz",
+        "https://piped-api.privacy.com.de",
+        "https://api-piped.mha.fi",
+    ]
+    static_invidious = [
+        "https://yewtu.be",
+        "https://vid.puffyan.us",
+        "https://inv.nadeko.net",
     ]
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(fetcher): fetcher.__name__ for fetcher in fetchers}
-        for future in as_completed(futures, timeout=6):
-            try:
-                result = future.result()
-                if result:
-                    logger.info("✅ Alternative API transcript succeeded", extra={
-                        "event": "transcript_step_success",
+    MAX_HOSTS = 3
+
+    def _attempt_with_hosts(p_hosts: list[str], i_hosts: list[str], proxy_allowed: bool) -> str | None:
+        piped_subset = list((p_hosts or [])[:MAX_HOSTS])
+        invidious_subset = list((i_hosts or [])[:MAX_HOSTS])
+
+        fetchers: list[tuple[str, callable]] = []
+        if piped_subset:
+            fetchers.extend([
+                (
+                    "piped_direct",
+                    lambda vid=video_id, hosts=piped_subset: _piped_captions_direct(
+                        vid,
+                        hosts,
+                        languages=languages,
+                        use_proxy=proxy_allowed
+                    )
+                ),
+                (
+                    "piped_api",
+                    lambda vid=video_id, hosts=piped_subset: _piped_captions(
+                        vid,
+                        hosts,
+                        languages=languages,
+                        use_proxy=proxy_allowed
+                    )
+                ),
+            ])
+        if invidious_subset:
+            fetchers.append(
+                (
+                    "invidious",
+                    lambda vid=video_id, hosts=invidious_subset: _invidious_captions(
+                        vid,
+                        hosts,
+                        languages=languages,
+                        use_proxy=proxy_allowed
+                    )
+                )
+            )
+
+        if not fetchers:
+            return None
+
+        with ThreadPoolExecutor(max_workers=len(fetchers)) as executor:
+            future_map = {executor.submit(fn): name for name, fn in fetchers}
+            for future in as_completed(future_map, timeout=6):
+                try:
+                    result = future.result()
+                    if result:
+                        logger.info("✅ Alternative API transcript succeeded", extra={
+                            "event": "transcript_step_success",
+                            "step": 2,
+                            "method": "alternative_apis",
+                            "source": future_map[future],
+                            "video_id": video_id,
+                            "text_len": len(result),
+                            "duration_ms": int((time.perf_counter() - t0) * 1000),
+                            "request_id": request_id
+                        })
+                        return result
+                except Exception as e:
+                    logger.warning("Transcript fetch via %s failed", future_map[future], extra={
+                        "event": "transcript_step_failure",
                         "step": 2,
                         "method": "alternative_apis",
                         "video_id": video_id,
-                        "text_len": len(result),
-                        "duration_ms": int((time.perf_counter() - t0) * 1000),
+                        "reason": str(e),
                         "request_id": request_id
                     })
-                    return result
-            except Exception as e:
-                logger.warning("Transcript fetch via %s failed", futures[future], extra={
-                    "event": "transcript_step_failure",
-                    "step": 2,
-                    "method": "alternative_apis",
-                    "video_id": video_id,
-                    "reason": str(e),
-                    "request_id": request_id
-                })
+        return None
+
+    discovery_executor = ThreadPoolExecutor(max_workers=2)
+    piped_future = discovery_executor.submit(fetch_live_instances, "https://piped-instances.kavin.rocks/")
+    invidious_future = discovery_executor.submit(fetch_live_instances, "https://api.invidious.io/instances.json?sort_by=health")
+    try:
+        result = _attempt_with_hosts(static_piped, static_invidious, proxy_allowed=False)
+        if result:
+            return result
+
+        use_piped: list[str] = []
+        use_invidious: list[str] = []
+
+        try:
+            use_piped = piped_future.result(timeout=2) or []
+        except TimeoutError:
+            log_event('warning', 'transcript_instance_discovery_timeout', provider='piped', video_id=video_id, request_id=request_id)
+        except Exception as exc:
+            log_event('warning', 'transcript_instance_discovery_failed', provider='piped', video_id=video_id, error=str(exc), request_id=request_id)
+
+        try:
+            use_invidious = invidious_future.result(timeout=2) or []
+        except TimeoutError:
+            log_event('warning', 'transcript_instance_discovery_timeout', provider='invidious', video_id=video_id, request_id=request_id)
+        except Exception as exc:
+            log_event('warning', 'transcript_instance_discovery_failed', provider='invidious', video_id=video_id, error=str(exc), request_id=request_id)
+
+        if (use_piped and use_piped != static_piped) or (use_invidious and use_invidious != static_invidious):
+            result = _attempt_with_hosts(use_piped or static_piped, use_invidious or static_invidious, proxy_allowed=allow_proxy)
+            if result:
+                return result
+    finally:
+        discovery_executor.shutdown(wait=False)
+
     logger.warning("All alternative API transcript fetchers failed for %s", video_id, extra={
         "event": "transcript_step_failure",
         "step": 2,
@@ -1142,12 +1224,10 @@ def get_transcript(video_id: str,
                    strict_languages: bool = False,
                    allow_translate: bool = True) -> str:
     """
-    Transcript fetch logic with explicit, concise fallback steps:
-    1. Try youtube-transcript-api (proxy if configured)
-    2. Try alternative APIs in parallel (Piped direct, Piped, Invidious)
-    3. Try yt-dlp (no proxy)
-    4. Try yt-dlp (with proxy)
-    Raise NoTranscriptFound if all fail.
+    Transcript fetch logic:
+    1. Try youtube-transcript-api directly (and via proxy when configured).
+    2. If that fails, kick off timedtext, alternative mirror APIs, and yt-dlp (no proxy) in parallel.
+    Raise NoTranscriptFound if every option fails.
     """
     t0_workflow = time.perf_counter()
     logger.info("💡 Initiating unified transcript fetch workflow", extra={
@@ -1262,120 +1342,69 @@ def get_transcript(video_id: str,
             if proxy_executor:
                 proxy_executor.shutdown(wait=False)
 
-    # Step 2: Timedtext direct (manual → asr), English-first ordering
-    try:
-        tt = timedtext_try_languages(video_id, languages, request_id=request_id, allow_translate=allow_translate)
-        if tt:
-            logger.info("Timedtext fetch succeeded", extra={
-                "event": "transcript_step_success",
-                "step": 2,
-                "method": "timedtext",
-                "video_id": video_id,
-                "text_len": len(tt),
-                "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
-                "request_id": request_id
-            })
-            return tt
-    except Exception as e:
-        logger.info("Timedtext fetch not available: %s", str(e), extra={
-            "event": "transcript_step_failure",
-            "step": 2,
-            "method": "timedtext",
-            "video_id": video_id,
-            "reason": str(e),
-            "request_id": request_id
-        })
+    # Step 2+: Run remaining fallbacks in parallel (timedtext, alt APIs, yt-dlp no-proxy)
+    fallback_attempts = [
+        (
+            "timedtext",
+            lambda: timedtext_try_languages(
+                video_id,
+                languages,
+                request_id=request_id,
+                allow_translate=allow_translate,
+                allow_proxy=False
+            )
+        ),
+        (
+            "alternative_apis",
+            lambda: _fetch_transcript_alternatives(
+                video_id,
+                request_id=request_id,
+                languages=languages,
+                allow_proxy=False
+            )
+        ),
+        (
+            "yt-dlp_no_proxy",
+            lambda: fetch_ytdlp(video_id, None, request_id=request_id, languages=languages)
+        ),
+    ]
 
-    # Step 3: Try alternative APIs in parallel
-    txt = _fetch_transcript_alternatives(video_id, request_id=request_id, languages=languages)
-    if txt:
-        logger.info("Fallback transcript fetch succeeded via alternative APIs", extra={
-            "event": "transcript_step_success",
-            "step": 3,
-            "method": "alternative_apis",
-            "video_id": video_id,
-            "text_len": len(txt),
-            "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
-            "request_id": request_id
-        })
-        return txt
-    else:
-        logger.info("Alternative APIs fallback failed (no transcript found)", extra={
-            "event": "transcript_step_failure",
-            "step": 3,
-            "method": "alternative_apis",
-            "video_id": video_id,
-            "reason": "No transcript found",
-            "request_id": request_id
-        })
-
-    # Step 4: Try yt-dlp (no proxy)
-    txt = fetch_ytdlp(video_id, None, request_id=request_id, languages=languages)
-    if txt:
-        logger.info("Fallback transcript fetch succeeded via yt-dlp (no proxy)", extra={
-            "event": "transcript_step_success",
-            "step": 4,
-            "method": "yt-dlp_no_proxy",
-            "video_id": video_id,
-            "text_len": len(txt),
-            "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
-            "request_id": request_id
-        })
-        return txt
-    else:
-        logger.info("yt-dlp (no proxy) fallback failed (no transcript found)", extra={
-            "event": "transcript_step_failure",
-            "step": 4,
-            "method": "yt-dlp_no_proxy",
-            "video_id": video_id,
-            "reason": "No transcript found",
-            "request_id": request_id
-        })
-
-    # Step 5: Try yt-dlp (with proxy)
-    proxy_url = _gateway_url()
-    if proxy_url:
-        # Validate proxy before using to avoid noisy CONNECT failures
-        if not _proxy_is_healthy(proxy_url):
-            logger.warning("Proxy health check failed — skipping yt-dlp proxy fallback", extra={
-                "event": "transcript_step_skipped",
-                "step": 5,
-                "method": "yt-dlp_with_proxy",
-                "video_id": video_id,
-                "proxy_url": proxy_url,
-                "request_id": request_id
-            })
-        else:
-            txt = fetch_ytdlp(video_id, proxy_url, request_id=request_id, languages=languages)
-            if txt:
-                logger.info("Fallback transcript fetch succeeded via yt-dlp (with proxy)", extra={
-                    "event": "transcript_step_success",
-                    "step": 5,
-                    "method": "yt-dlp_with_proxy",
-                    "video_id": video_id,
-                    "text_len": len(txt),
-                    "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
-                    "request_id": request_id
-                })
-                return txt
-            else:
-                logger.info("yt-dlp (with proxy) fallback failed (no transcript found)", extra={
-                    "event": "transcript_step_failure",
-                    "step": 5,
-                    "method": "yt-dlp_with_proxy",
-                    "video_id": video_id,
-                    "reason": "No transcript found",
-                    "request_id": request_id
-                })
-    else:
-        logger.info("yt-dlp (with proxy) skipped: No proxy URL available", extra={
-            "event": "transcript_step_skipped",
-            "step": 5,
-            "method": "yt-dlp_with_proxy",
-            "video_id": video_id,
-            "reason": "No proxy URL",
-            "request_id": request_id
-        })
+    with ThreadPoolExecutor(max_workers=len(fallback_attempts)) as executor:
+        future_map = {executor.submit(fn): name for name, fn in fallback_attempts}
+        try:
+            for future in as_completed(future_map, timeout=12):
+                step_name = future_map[future]
+                try:
+                    txt = future.result()
+                except Exception as exc:
+                    log_event(
+                        'warning',
+                        'transcript_fallback_exception',
+                        step=step_name,
+                        video_id=video_id,
+                        error=str(exc),
+                        request_id=request_id
+                    )
+                    continue
+                if txt:
+                    log_event(
+                        'info',
+                        'transcript_fallback_succeeded',
+                        step=step_name,
+                        video_id=video_id,
+                        text_len=len(txt),
+                        duration_ms=int((time.perf_counter() - t0_workflow) * 1000),
+                        request_id=request_id
+                    )
+                    return txt
+        except TimeoutError:
+            log_event(
+                'warning',
+                'transcript_fallback_timeout',
+                video_id=video_id,
+                request_id=request_id,
+                steps=[name for _, name in fallback_attempts]
+            )
 
     # If all fail
     logger.warning("❌ All transcript fetch methods FAILED.", extra={
@@ -1391,25 +1420,36 @@ def _strip_tags(text: str) -> str:
     """Remove HTML/XML tags from a string."""
     return re.sub(r"<[^>]+>", "", text)
 
-def _piped_captions_direct(video_id: str, hosts: list[str], languages: Optional[List[str]] = None) -> str | None:
-    """
-    Try to get captions directly from a list of Piped API instances.
-    """
+def _piped_captions_direct(video_id: str,
+                           hosts: list[str],
+                           languages: Optional[List[str]] = None,
+                           use_proxy: bool = True) -> str | None:
+    """Fetch captions directly from several Piped instances in parallel."""
     if not hosts:
         logger.warning("No Piped hosts available for direct captions for %s", video_id)
         return None
-    for host in hosts:
+
+    subset = list((hosts or [])[:MAX_ALT_CAPTION_HOSTS])
+    if not subset:
+        logger.warning("No Piped hosts available for direct captions for %s", video_id)
+        return None
+
+    prefs = [c.strip().lower() for c in (languages or TRANSCRIPT_LANGS)]
+
+    def _fetch_from_host(host: str) -> str | None:
         try:
-            meta = session.get(f"{host}/api/v1/captions/{video_id}", timeout=4, proxies=get_proxy_dict())
+            meta = session.get(
+                f"{host}/api/v1/captions/{video_id}",
+                timeout=3,
+                proxies=get_proxy_dict() if use_proxy else {}
+            )
             if meta.status_code == 404:
                 return None
             meta.raise_for_status()
             data = meta.json()
             subs = data.get("captions") or []
             if not subs:
-                continue
-            # Normalize language preferences for matching
-            prefs = [c.strip().lower() for c in (languages or TRANSCRIPT_LANGS)]
+                return None
             chosen = None
             for code in prefs:
                 chosen = next((s for s in subs if s.get("language", "").lower().startswith(code)), None)
@@ -1419,37 +1459,64 @@ def _piped_captions_direct(video_id: str, hosts: list[str], languages: Optional[
                 chosen = subs[0]
             url = chosen.get("url")
             if not url:
-                continue
+                return None
             if url.startswith("//"):
                 url = "https:" + url
-            raw = session.get(url, timeout=4, proxies=get_proxy_dict()).text
+            raw = session.get(url, timeout=3, proxies=get_proxy_dict() if use_proxy else {}).text
             text = " ".join(html.unescape(t) for t in re.findall(r">([^<]+)</text>", raw)).strip()
-            if text:
-                return text
-        except Exception as e:
-            logger.debug("Piped captions host %s failed: %s", host, e)
-            continue
+            return text or None
+        except Exception as exc:
+            logger.debug("Piped captions host %s failed: %s", host, exc)
+            return None
+
+    with ThreadPoolExecutor(max_workers=len(subset)) as executor:
+        futures = {executor.submit(_fetch_from_host, host): host for host in subset}
+        try:
+            for future in as_completed(futures, timeout=5):
+                host = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:  # pragma: no cover – defensive
+                    logger.debug("Piped captions host %s raised: %s", host, exc)
+                    continue
+                if result:
+                    return result
+        except TimeoutError:
+            logger.warning("Timed out waiting for direct Piped captions for %s", video_id)
+
     logger.warning("All direct Piped caption mirrors failed for %s", video_id)
     return None
 
-def _piped_captions(video_id: str, hosts: list[str], languages: Optional[List[str]] = None) -> str | None:
-    """Try to get captions from Piped API using a list of hosts."""
+def _piped_captions(video_id: str,
+                    hosts: list[str],
+                    languages: Optional[List[str]] = None,
+                    use_proxy: bool = True) -> str | None:
+    """Fetch captions via the Piped API using several mirrors concurrently."""
     if not hosts:
         logger.warning("No Piped hosts available for fallback captions for %s", video_id)
         return None
-    # Use a simple round-robin, try each host in order
-    for host in hosts:
+
+    subset = list((hosts or [])[:MAX_ALT_CAPTION_HOSTS])
+    if not subset:
+        logger.warning("No Piped hosts available for fallback captions for %s", video_id)
+        return None
+
+    prefs = [c.strip().lower() for c in (languages or TRANSCRIPT_LANGS)]
+
+    def _fetch_from_host(host: str) -> str | None:
         try:
-            resp = session.get(f"{host}/streams/{video_id}", timeout=4, proxies=get_proxy_dict())
+            resp = session.get(
+                f"{host}/streams/{video_id}",
+                timeout=3,
+                proxies=get_proxy_dict() if use_proxy else {}
+            )
             if resp.status_code == 404:
-                continue
+                return None
             resp.raise_for_status()
             data = resp.json()
-            if "subtitles" not in data or not data["subtitles"]:
-                continue
-            subs = data["subtitles"]
-            # Normalize language preferences for matching
-            prefs = [c.strip().lower() for c in (languages or TRANSCRIPT_LANGS)]
+            subs = data.get("subtitles") or []
+            if not subs:
+                return None
             chosen = None
             for code in prefs:
                 chosen = next((s for s in subs if s.get("language", "").lower().startswith(code)), None)
@@ -1459,49 +1526,73 @@ def _piped_captions(video_id: str, hosts: list[str], languages: Optional[List[st
                 chosen = subs[0]
             url = chosen.get("url")
             if not url:
-                continue
-            r = session.get(url, timeout=5, proxies=get_proxy_dict())
+                return None
+            r = session.get(url, timeout=3, proxies=get_proxy_dict() if use_proxy else {})
             r.raise_for_status()
             data_text = r.text
             if url.endswith(".vtt"):
                 lines = [l.strip() for l in data_text.splitlines() if l and not l.startswith("WEBVTT") and not re.match(r"^\d\d:\d\d", l)]
-                text = " ".join(_strip_tags(l) for l in lines if not re.match(r"^\d+$", l))
-                return text.strip() or None
-            elif url.endswith(".srv3") or "<text" in data_text:
+                text = " ".join(_strip_tags(l) for l in lines if not re.match(r"^\d+$", l)).strip()
+                return text or None
+            if url.endswith(".srv3") or "<text" in data_text:
                 return " ".join(html.unescape(t) for t in re.findall(r">([^<]+)</text>", data_text)).strip() or None
-            else:
-                continue
-        except Exception as e:
-            logger.debug("Piped fallback captions host %s failed: %s", host, e)
-            continue
+            if url.endswith(".srt"):
+                lines = [l.strip() for l in data_text.splitlines() if l and "-->" not in l and not re.match(r"^\d+$", l)]
+                return " ".join(lines).strip() or None
+            return None
+        except Exception as exc:
+            logger.debug("Piped fallback captions host %s failed: %s", host, exc)
+            return None
+
+    with ThreadPoolExecutor(max_workers=len(subset)) as executor:
+        futures = {executor.submit(_fetch_from_host, host): host for host in subset}
+        try:
+            for future in as_completed(futures, timeout=6):
+                host = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:  # pragma: no cover – defensive
+                    logger.debug("Piped fallback captions host %s raised: %s", host, exc)
+                    continue
+                if result:
+                    return result
+        except TimeoutError:
+            logger.warning("Timed out waiting for Piped API captions for %s", video_id)
+
     logger.warning("All fallback Piped API hosts failed for %s", video_id)
     return None
 
-def _invidious_captions(video_id: str, hosts: list[str], languages: Optional[List[str]] = None) -> str | None:
-    """
-    Fetch captions from a list of Invidious mirrors.
-    • One attempt per host (no endless cycle / retry storm)
-    • Normalises relative caption URLs returned by some mirrors
-    • Logs individual host failures at DEBUG level only; a single
-      WARNING is emitted if *all* hosts fail.
-    """
+def _invidious_captions(video_id: str,
+                        hosts: list[str],
+                        languages: Optional[List[str]] = None,
+                        use_proxy: bool = True) -> str | None:
+    """Fetch captions from Invidious mirrors using limited parallelism."""
     if not hosts:
         logger.warning("No Invidious hosts available for captions for %s", video_id)
         return None
-    for host in hosts:
+
+    subset = list((hosts or [])[:MAX_ALT_CAPTION_HOSTS])
+    if not subset:
+        logger.warning("No Invidious hosts available for captions for %s", video_id)
+        return None
+
+    prefs = [c.strip().lower() for c in (languages or TRANSCRIPT_LANGS)]
+
+    def _fetch_from_host(host: str) -> str | None:
         try:
             meta_url = f"{host}/api/v1/captions/{video_id}"
-            meta_resp = session.get(meta_url, timeout=5, proxies=get_proxy_dict())
+            meta_resp = session.get(
+                meta_url,
+                timeout=3,
+                proxies=get_proxy_dict() if use_proxy else {}
+            )
             if meta_resp.status_code == 404:
-                # Video has no captions at all; no need to probe others
                 return None
             meta_resp.raise_for_status()
             meta_json = meta_resp.json()
             subs = meta_json.get("captions") or []
             if not subs:
-                continue
-            # Prefer requested languages, otherwise first available. Normalize codes.
-            prefs = [c.strip().lower() for c in (languages or TRANSCRIPT_LANGS)]
+                return None
             chosen = None
             for code in prefs:
                 chosen = next((s for s in subs if s.get("languageCode", "").lower().startswith(code)), None)
@@ -1511,13 +1602,15 @@ def _invidious_captions(video_id: str, hosts: list[str], languages: Optional[Lis
                 chosen = subs[0]
             rel_url = chosen.get("url")
             if not rel_url:
-                continue
-            # Some mirrors return a relative path → make it absolute
+                return None
             caption_url = rel_url if rel_url.startswith("http") else urljoin(host, rel_url)
-            cap_resp = session.get(caption_url, timeout=5, proxies=get_proxy_dict())
+            cap_resp = session.get(
+                caption_url,
+                timeout=3,
+                proxies=get_proxy_dict() if use_proxy else {}
+            )
             cap_resp.raise_for_status()
             raw = cap_resp.text
-            # --- basic format sniffing / parsing ---
             if caption_url.endswith(".vtt"):
                 lines = [
                     l.strip()
@@ -1534,11 +1627,26 @@ def _invidious_captions(video_id: str, hosts: list[str], languages: Optional[Lis
                     if l and "-->" not in l and not re.match(r"^\d+$", l)
                 ]
                 return " ".join(lines).strip() or None
-            # Unknown format → skip to next mirror
-            continue
+            return None
         except Exception as exc:
             logger.debug("Invidious host %s failed: %s", host, exc)
-            continue  # try next mirror
+            return None
+
+    with ThreadPoolExecutor(max_workers=len(subset)) as executor:
+        futures = {executor.submit(_fetch_from_host, host): host for host in subset}
+        try:
+            for future in as_completed(futures, timeout=6):
+                host = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:  # pragma: no cover – defensive
+                    logger.debug("Invidious host %s raised: %s", host, exc)
+                    continue
+                if result:
+                    return result
+        except TimeoutError:
+            logger.warning("Timed out waiting for Invidious captions for %s", video_id)
+
     logger.warning("All Invidious caption mirrors failed for %s", video_id)
     return None
 
@@ -1701,74 +1809,174 @@ def _fetch_comments_resilient(video_id: str, request_id: str = "") -> list[str]:
             "request_id": request_id
         })
 
-    # If primary strategies fail, try alternative APIs concurrently
-    piped_instances = fetch_live_instances("https://piped-instances.kavin.rocks/")
-    invidious_instances = fetch_live_instances("https://api.invidious.io/instances.json?sort_by=health")
+    static_piped = [
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.adminforge.de",
+        "https://pipedapi.tokhmi.xyz",
+        "https://piped-api.privacy.com.de",
+        "https://api-piped.mha.fi",
+    ]
+    static_invidious = [
+        "https://yewtu.be",
+        "https://vid.puffyan.us",
+        "https://inv.nadeko.net",
+    ]
+    MAX_ALT_HOSTS = 3
 
-    comment_sources = []
-    if piped_instances:
-        comment_sources.extend([
-            ("Alternative API (Piped direct)", lambda instance: _fetch_from_alternative_api([f"{instance}/api"], f"/comments/{video_id}", _PIPE_COOLDOWN, request_id=request_id)),
-            ("Alternative API (Piped)", lambda instance: _fetch_from_alternative_api([instance], f"/comments/{video_id}", _PIPE_COOLDOWN, request_id=request_id))
-        ])
-    if invidious_instances:
-        comment_sources.append(("Alternative API (Invidious)", lambda instance: _fetch_from_alternative_api([instance], f"/api/v1/comments/{video_id}", _PIPE_COOLDOWN, request_id=request_id)))
+    def _try_alternative_hosts(p_hosts: list[str], i_hosts: list[str]) -> list[str] | None:
+        piped_subset = list((p_hosts or [])[:MAX_ALT_HOSTS])
+        invidious_subset = list((i_hosts or [])[:MAX_ALT_HOSTS])
 
-    if not comment_sources:
-        log_event('warning', 'comment_alternative_sources_unavailable', extra={
-            "video_id": video_id,
-            "reason": "No alternative hosts discovered",
-            "request_id": request_id
-        })
-        log_event('error', 'all_comment_methods_failed', extra={
-            "video_id": video_id,
-            "strategies_attempted": [
-                strategy[0] for strategy in comment_retrieval_strategies
-            ],
-            "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
-            "request_id": request_id
-        })
-        return []
+        tasks: list = []
+        future_meta: dict = {}
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            for host in piped_subset:
+                future_direct = executor.submit(
+                    _fetch_from_alternative_api,
+                    [f"{host}/api"],
+                    f"/comments/{video_id}",
+                    _PIPE_COOLDOWN,
+                    request_id=request_id,
+                    use_proxy=False
+                )
+                future_meta[future_direct] = ("Alternative API (Piped direct)", host)
+                tasks.append(future_direct)
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = []
-        for source_name, fetch_func_factory in comment_sources:
-            if "Piped" in source_name:
-                for instance in piped_instances:
-                    futures.append(executor.submit(fetch_func_factory(instance)))
-            elif "Invidious" in source_name:
-                for instance in invidious_instances:
-                    futures.append(executor.submit(fetch_func_factory(instance)))
-        
-        for future in as_completed(futures, timeout=10):
+                future_api = executor.submit(
+                    _fetch_from_alternative_api,
+                    [host],
+                    f"/comments/{video_id}",
+                    _PIPE_COOLDOWN,
+                    request_id=request_id,
+                    use_proxy=False
+                )
+                future_meta[future_api] = ("Alternative API (Piped)", host)
+                tasks.append(future_api)
+
+            for host in invidious_subset:
+                future_inv = executor.submit(
+                    _fetch_from_alternative_api,
+                    [host],
+                    f"/api/v1/comments/{video_id}",
+                    _PIPE_COOLDOWN,
+                    request_id=request_id,
+                    use_proxy=False
+                )
+                future_meta[future_inv] = ("Alternative API (Invidious)", host)
+                tasks.append(future_inv)
+
+            if not tasks:
+                return None
+
             try:
-                result_json = future.result()
-                if result_json and "comments" in result_json:
-                    comments = [c.get("text") for c in result_json["comments"] if c.get("text")]
-                    if comments:
-                        log_event('info', 'comment_step_success', extra={
+                for future in as_completed(tasks, timeout=10):
+                    try:
+                        result_json = future.result()
+                    except Exception as exc:
+                        source_name, host = future_meta.get(future, (None, None))
+                        log_event('warning', 'comment_step_failure', extra={
                             "step": "alternative_apis_concurrent",
                             "video_id": video_id,
-                            "count": len(comments),
-                            "sources": [f"{source_name} ({instance})" for source_name, fetch_func_factory in comment_sources],
-                            "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+                            "source": source_name,
+                            "host": host,
+                            "reason": str(exc),
                             "request_id": request_id
                         })
-                        return comments
-            except Exception as e:
-                log_event('warning', 'comment_step_failure', extra={
-                    "step": "alternative_apis_concurrent",
+                        continue
+
+                    if result_json and "comments" in result_json:
+                        comments = [c.get("text") for c in result_json["comments"] if c.get("text")]
+                        if comments:
+                            source_name, host = future_meta.get(future, (None, None))
+                            log_event('info', 'comment_step_success', extra={
+                                "step": "alternative_apis_concurrent",
+                                "video_id": video_id,
+                                "count": len(comments),
+                                "source": source_name,
+                                "host": host,
+                                "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+                                "request_id": request_id
+                            })
+                            return comments
+            except TimeoutError:
+                log_event('warning', 'comment_alternative_timeout', extra={
                     "video_id": video_id,
-                    "reason": str(e),
+                    "hosts_tried": piped_subset + invidious_subset,
                     "request_id": request_id
                 })
+
+        return None
+
+    # First attempt with static hosts (no discovery penalty)
+    discovery_executor = ThreadPoolExecutor(max_workers=2)
+    piped_future = discovery_executor.submit(fetch_live_instances, "https://piped-instances.kavin.rocks/")
+    invidious_future = discovery_executor.submit(fetch_live_instances, "https://api.invidious.io/instances.json?sort_by=health")
+    try:
+        comments = _try_alternative_hosts(static_piped, static_invidious)
+        if comments:
+            return comments
+
+        use_piped: list[str] = []
+        use_invidious: list[str] = []
+
+        try:
+            use_piped = piped_future.result(timeout=2) or []
+        except TimeoutError:
+            log_event('warning', 'comment_instance_discovery_timeout', extra={
+                "video_id": video_id,
+                "provider": "piped",
+                "request_id": request_id
+            })
+        except Exception as exc:
+            log_event('warning', 'comment_instance_discovery_failed', extra={
+                "video_id": video_id,
+                "provider": "piped",
+                "error": str(exc),
+                "request_id": request_id
+            })
+
+        try:
+            use_invidious = invidious_future.result(timeout=2) or []
+        except TimeoutError:
+            log_event('warning', 'comment_instance_discovery_timeout', extra={
+                "video_id": video_id,
+                "provider": "invidious",
+                "request_id": request_id
+            })
+        except Exception as exc:
+            log_event('warning', 'comment_instance_discovery_failed', extra={
+                "video_id": video_id,
+                "provider": "invidious",
+                "error": str(exc),
+                "request_id": request_id
+            })
+
+        if not use_piped and not use_invidious:
+            log_event('warning', 'comment_alternative_sources_unavailable', extra={
+                "video_id": video_id,
+                "reason": "No alternative hosts discovered",
+                "request_id": request_id
+            })
+            log_event('error', 'all_comment_methods_failed', extra={
+                "video_id": video_id,
+                "strategies_attempted": [strategy[0] for strategy in comment_retrieval_strategies],
+                "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+                "request_id": request_id
+            })
+            return []
+
+        comments = _try_alternative_hosts(use_piped or static_piped, use_invidious or static_invidious)
+        if comments:
+            return comments
+    finally:
+        discovery_executor.shutdown(wait=False)
 
     # If all methods fail
     log_event('error', 'all_comment_methods_failed', extra={
         "video_id": video_id,
         "strategies_attempted": [
             strategy[0] for strategy in comment_retrieval_strategies
-        ] + [source[0] for source in comment_sources],
+        ] + ['alternative_apis'],
         "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
         "request_id": request_id
     })
