@@ -705,17 +705,19 @@ _YDL_OPTS_BASE = {
 
 # ---------------------------------------------------------------------------
 # Proxy health check (quick)
-def _proxy_health_check(url: Optional[str], attempts: int = PROXY_HEALTH_ATTEMPTS) -> tuple[bool, list[str]]:
+def _proxy_health_check(url: Optional[str], attempts: int = PROXY_HEALTH_ATTEMPTS) -> tuple[bool, list[str], int]:
     """Probe the proxy endpoint a handful of times.
 
     Returns (is_healthy, errors).  Errors is a list of stringified exceptions/status issues.
     Even when the check returns False we may still attempt the proxy, but the caller can log details.
     """
     if not url:
-        return False, ["missing_proxy_url"]
+        return False, ["missing_proxy_url"], 0
 
     errors: list[str] = []
+    attempts_made = 0
     for attempt in range(1, max(1, attempts) + 1):
+        attempts_made = attempt
         try:
             r = requests.get(
                 "https://www.youtube.com/generate_204",
@@ -723,11 +725,11 @@ def _proxy_health_check(url: Optional[str], attempts: int = PROXY_HEALTH_ATTEMPT
                 timeout=PROXY_HEALTH_TIMEOUT,
             )
             if 200 <= r.status_code < 400:
-                return True, []
+                return True, [], attempts_made
             errors.append(f"status_{r.status_code}")
         except Exception as exc:  # pragma: no cover - defensive against networking errors
             errors.append(str(exc))
-    return False, errors
+    return False, errors, attempts_made
 # Proxy configuration (supports Generic providers or Webshare)
 DISABLE_DIRECT = os.getenv("FORCE_PROXY", "false").lower() == "true"
 
@@ -1253,17 +1255,17 @@ def get_transcript(video_id: str,
     })
 
     proxy_future = None
-    proxy_executor: ThreadPoolExecutor | None = None
+    proxy_executor: Optional[ThreadPoolExecutor] = None
     proxy_url = None
     proxy_health_details: dict | None = None
     if PROXY_CFG is not None:
         proxy_url = _gateway_url()
         if proxy_url:
-            healthy, errors = _proxy_health_check(proxy_url)
+            healthy, errors, attempts_made = _proxy_health_check(proxy_url)
             proxy_health_details = {
                 "healthy": healthy,
                 "errors": errors,
-                "attempts": len(errors) if errors else PROXY_HEALTH_ATTEMPTS,
+                "attempts": attempts_made,
             }
             log_event(
                 'info' if healthy else 'warning',
@@ -1271,6 +1273,7 @@ def get_transcript(video_id: str,
                 video_id=video_id,
                 proxy_url=proxy_url,
                 healthy=healthy,
+                attempts=attempts_made,
                 errors=errors,
                 request_id=request_id
             )
@@ -1304,6 +1307,16 @@ def get_transcript(video_id: str,
                 "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
                 "request_id": request_id
             })
+            log_event(
+                'info',
+                'transcript_result',
+                strategy='youtube-transcript-api_direct',
+                video_id=video_id,
+                text_len=len(txt),
+                duration_ms=int((time.perf_counter() - t0_workflow) * 1000),
+                proxy_health=proxy_health_details,
+                request_id=request_id
+            )
             if proxy_executor:
                 proxy_executor.shutdown(wait=False)
                 proxy_executor = None
@@ -1377,8 +1390,8 @@ def get_transcript(video_id: str,
                 except Exception as exc:
                     log_event(
                         'warning',
-                        'transcript_fallback_exception',
-                        step=step_name,
+                        'transcript_strategy_exception',
+                        strategy=step_name,
                         video_id=meta.get("video_id", video_id),
                         error=str(exc),
                         request_id=request_id,
@@ -1388,8 +1401,8 @@ def get_transcript(video_id: str,
                 if txt:
                     log_event(
                         'info',
-                        'transcript_fallback_succeeded',
-                        step=step_name,
+                        'transcript_result',
+                        strategy=step_name,
                         video_id=meta.get("video_id", video_id),
                         text_len=len(txt),
                         duration_ms=int((time.perf_counter() - t0_workflow) * 1000),
@@ -1804,6 +1817,9 @@ def _fetch_comments_resilient(video_id: str, request_id: str = "") -> list[str]:
                 "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
                 "request_id": request_id
             })
+            log_event('info', 'comments_result', strategy=strategy_name, video_id=video_id,
+                      count=len(comments), duration_ms=int((time.perf_counter() - t0_workflow) * 1000),
+                      cache='miss', request_id=request_id)
             return comments
         
         log_event('warning', 'comment_step_failure', extra={
@@ -1891,18 +1907,22 @@ def _fetch_comments_resilient(video_id: str, request_id: str = "") -> list[str]:
 
                     if result_json and "comments" in result_json:
                         comments = [c.get("text") for c in result_json["comments"] if c.get("text")]
-                        if comments:
-                            source_name, host = future_meta.get(future, (None, None))
-                            log_event('info', 'comment_step_success', extra={
-                                "step": "alternative_apis_concurrent",
-                                "video_id": video_id,
-                                "count": len(comments),
-                                "source": source_name,
-                                "host": host,
-                                "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
-                                "request_id": request_id
-                            })
-                            return comments
+                    if comments:
+                        source_name, host = future_meta.get(future, (None, None))
+                        log_event('info', 'comment_step_success', extra={
+                            "step": "alternative_apis_concurrent",
+                            "video_id": video_id,
+                            "count": len(comments),
+                            "source": source_name,
+                            "host": host,
+                            "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+                            "request_id": request_id
+                        })
+                        log_event('info', 'comments_result', strategy=source_name or "alternative_apis",
+                                  video_id=video_id, count=len(comments), host=host,
+                                  duration_ms=int((time.perf_counter() - t0_workflow) * 1000),
+                                  cache='miss', request_id=request_id)
+                        return comments
             except TimeoutError:
                 log_event('warning', 'comment_alternative_timeout', extra={
                     "video_id": video_id,
@@ -2145,6 +2165,7 @@ def get_transcript_endpoint():
             log_event('info', 'transcript_cache_miss_marker', video_id=video_id, request_id=g.request_id)
             return jsonify({"error": "Transcript not available"}), 404
         log_event('info', 'transcript_cache_hit', video_id=video_id, text_len=len(cached), request_id=g.request_id)
+        log_event('info', 'transcript_response_summary', video_id=video_id, cache='memory', strategy='cache', text_len=len(cached), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
         return jsonify({"video_id": video_id, "text": cached}), 200
 
     # Try persistent cache
@@ -2157,6 +2178,7 @@ def get_transcript_endpoint():
                 log_event('info', 'transcript_persisted_not_available', video_id=video_id, request_id=g.request_id)
                 return jsonify({"error": "Transcript not available"}), 404
             log_event('info', 'transcript_persisted_hit', video_id=video_id, text_len=len(cached), request_id=g.request_id)
+            log_event('info', 'transcript_response_summary', video_id=video_id, cache='disk', strategy='cache', text_len=len(cached), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
             return jsonify({"video_id": video_id, "text": cached}), 200
         if not raw_langs and legacy_fallback_allowed:
             # Legacy fallback: old key without language dimension
@@ -2201,6 +2223,7 @@ def get_transcript_endpoint():
                     log_event('info', 'transcript_persisted_not_available_after_wait', video_id=video_id, request_id=g.request_id)
                     return jsonify({"error": "Transcript not available"}), 404
                 log_event('info', 'transcript_persisted_hit_after_wait', video_id=video_id, text_len=len(cached), request_id=g.request_id)
+                log_event('info', 'transcript_response_summary', video_id=video_id, cache='disk', strategy='cache_after_wait', text_len=len(cached), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
                 return jsonify({"video_id": video_id, "text": cached}), 200
         # Fallback: proceed to fetch ourselves (rare edge when leader failed/timeout)
         log_event('warning', 'transcript_inflight_promote_to_fetch', video_id=video_id, request_id=g.request_id)
@@ -2223,6 +2246,7 @@ def get_transcript_endpoint():
                 with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
                     db[cache_key] = text
                 log_event('info', 'transcript_fetched', video_id=video_id, text_len=len(text), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
+                log_event('info', 'transcript_response_summary', video_id=video_id, cache='miss', strategy='fresh_fetch', text_len=len(text), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
                 resp = make_response(jsonify({"video_id": video_id, "text": text}), 200)
                 resp.headers['Cache-Control'] = 'public, max-age=3600'
                 return resp
@@ -2279,6 +2303,9 @@ def get_comments_endpoint():
     cached = comment_cache.get(video_id)
     if cached is not None:
         log_event('info', 'comments_cache_hit', video_id=video_id, count=len(cached), request_id=g.request_id)
+        log_event('info', 'comments_result', strategy='cache_memory', video_id=video_id,
+                  count=len(cached), duration_ms=int((time.perf_counter()-g.request_start_time)*1000),
+                  cache='memory', request_id=g.request_id)
         return jsonify({"video_id": video_id, "comments": cached}), 200
 
     with shelve.open(PERSISTENT_COMMENT_DB) as db:
@@ -2286,6 +2313,9 @@ def get_comments_endpoint():
         if cached is not None:
             comment_cache[video_id] = cached
             log_event('info', 'comments_persisted_hit', video_id=video_id, count=len(cached), request_id=g.request_id)
+            log_event('info', 'comments_result', strategy='cache_disk', video_id=video_id,
+                      count=len(cached), duration_ms=int((time.perf_counter()-g.request_start_time)*1000),
+                      cache='disk', request_id=g.request_id)
             return jsonify({"video_id": video_id, "comments": cached}), 200
 
     try:
@@ -2294,6 +2324,9 @@ def get_comments_endpoint():
         with shelve.open(PERSISTENT_COMMENT_DB) as db:
             db[video_id] = comments
         log_event('info', 'comments_fetched', video_id=video_id, count=len(comments), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
+        log_event('info', 'comments_result', strategy='fresh_fetch', video_id=video_id,
+                  count=len(comments), duration_ms=int((time.perf_counter()-g.request_start_time)*1000),
+                  cache='miss', request_id=g.request_id)
         return jsonify({"video_id": video_id, "comments": comments}), 200
     except Exception as e:
         log_event('warning', 'comments_fetch_failed_with_exception', video_id=video_id, error=str(e), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
