@@ -64,6 +64,9 @@ from flask import send_from_directory
 APP_NAME = "WorthItService"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", str(min(4, (os.cpu_count() or 1)))))
+MAX_TIMEDTEXT_LANGS = int(os.getenv("MAX_TIMEDTEXT_LANGS", "3"))
+PROXY_HEALTH_ATTEMPTS = int(os.getenv("PROXY_HEALTH_ATTEMPTS", "2"))
+PROXY_HEALTH_TIMEOUT = float(os.getenv("PROXY_HEALTH_TIMEOUT", "3"))
 COMMENT_LIMIT = int(os.getenv("COMMENT_LIMIT", "50"))
 TRANSCRIPT_CACHE_SIZE = int(os.getenv("TRANSCRIPT_CACHE_SIZE", "200"))
 TRANSCRIPT_CACHE_TTL = int(os.getenv("TRANSCRIPT_CACHE_TTL", "7200")) # 2 hours
@@ -243,7 +246,7 @@ def _timedtext_fetch_vtt(video_id: str, lang: str, asr: bool, use_proxy: bool = 
         }
         # Use proxy only if requested and configured (no cookies required)
         proxies = get_proxy_dict() if use_proxy else {}
-        r = youtube_http.get("https://www.youtube.com/api/timedtext", params=params, headers=headers, timeout=8, proxies=proxies)
+        r = youtube_http.get("https://www.youtube.com/api/timedtext", params=params, headers=headers, timeout=3, proxies=proxies)
         if r.status_code != 200:
             return None
         txt = r.text.strip()
@@ -308,6 +311,11 @@ def timedtext_try_languages(video_id: str,
         if base and base not in seen:
             base_langs.append(base)
             seen.add(base)
+
+    if base_langs and len(base_langs) > MAX_TIMEDTEXT_LANGS:
+        original = base_langs[:]
+        base_langs = base_langs[:MAX_TIMEDTEXT_LANGS]
+        log_event('debug', 'timedtext_language_trim', video_id=video_id, trimmed_from=original, trimmed_to=base_langs, request_id=request_id)
 
     # Try direct list
     tracks = _timedtext_list_tracks(video_id, use_proxy=False, request_id=request_id)
@@ -697,21 +705,29 @@ _YDL_OPTS_BASE = {
 
 # ---------------------------------------------------------------------------
 # Proxy health check (quick)
-def _proxy_is_healthy(url: Optional[str]) -> bool:
-    """Best-effort probe to skip obviously broken proxies before heavy calls.
-    Uses YouTube's generate_204 endpoint (very cheap). 3s timeout.
+def _proxy_health_check(url: Optional[str], attempts: int = PROXY_HEALTH_ATTEMPTS) -> tuple[bool, list[str]]:
+    """Probe the proxy endpoint a handful of times.
+
+    Returns (is_healthy, errors).  Errors is a list of stringified exceptions/status issues.
+    Even when the check returns False we may still attempt the proxy, but the caller can log details.
     """
     if not url:
-        return False
-    try:
-        r = requests.get(
-            "https://www.youtube.com/generate_204",
-            proxies={"http": url, "https": url},
-            timeout=3,
-        )
-        return 200 <= r.status_code < 400
-    except Exception:
-        return False
+        return False, ["missing_proxy_url"]
+
+    errors: list[str] = []
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            r = requests.get(
+                "https://www.youtube.com/generate_204",
+                proxies={"http": url, "https": url},
+                timeout=PROXY_HEALTH_TIMEOUT,
+            )
+            if 200 <= r.status_code < 400:
+                return True, []
+            errors.append(f"status_{r.status_code}")
+        except Exception as exc:  # pragma: no cover - defensive against networking errors
+            errors.append(str(exc))
+    return False, errors
 # Proxy configuration (supports Generic providers or Webshare)
 DISABLE_DIRECT = os.getenv("FORCE_PROXY", "false").lower() == "true"
 
@@ -1237,20 +1253,27 @@ def get_transcript(video_id: str,
     })
 
     proxy_future = None
-    proxy_executor = None
+    proxy_executor: ThreadPoolExecutor | None = None
     proxy_url = None
+    proxy_health_details: dict | None = None
     if PROXY_CFG is not None:
         proxy_url = _gateway_url()
-        if proxy_url and not _proxy_is_healthy(proxy_url):
-            logger.warning("Proxy health check failed — skipping youtube-transcript-api proxy retry", extra={
-                "event": "transcript_step_skipped",
-                "step": 1,
-                "method": "youtube-transcript-api_proxy",
-                "video_id": video_id,
-                "proxy_url": proxy_url,
-                "request_id": request_id
-            })
-        else:
+        if proxy_url:
+            healthy, errors = _proxy_health_check(proxy_url)
+            proxy_health_details = {
+                "healthy": healthy,
+                "errors": errors,
+                "attempts": len(errors) if errors else PROXY_HEALTH_ATTEMPTS,
+            }
+            log_event(
+                'info' if healthy else 'warning',
+                'proxy_health_check_result',
+                video_id=video_id,
+                proxy_url=proxy_url,
+                healthy=healthy,
+                errors=errors,
+                request_id=request_id
+            )
             proxy_executor = ThreadPoolExecutor(max_workers=1)
             proxy_future = proxy_executor.submit(
                 fetch_api_once,
@@ -1262,6 +1285,8 @@ def get_transcript(video_id: str,
                 strict_languages=strict_languages,
                 allow_translate=allow_translate
             )
+        else:
+            log_event('warning', 'proxy_url_missing', video_id=video_id, request_id=request_id)
 
     # Step 1a: Try youtube-transcript-api DIRECT (preferred, keeps EN path unchanged, avoids flaky proxies)
     try:
@@ -1302,46 +1327,16 @@ def get_transcript(video_id: str,
             "request_id": request_id
         })
 
-    # Step 1b: Await proxy result if it was started
+    fallback_futures: dict = {}
     if proxy_future is not None:
-        try:
-            txt = proxy_future.result()
-            if txt:
-                logger.info("Primary transcript fetch succeeded (with proxy)", extra={
-                    "event": "transcript_step_success",
-                    "step": 1,
-                    "method": "youtube-transcript-api_proxy",
-                    "video_id": video_id,
-                    "text_len": len(txt),
-                    "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
-                    "request_id": request_id
-                })
-                if proxy_executor:
-                    proxy_executor.shutdown(wait=False)
-                    proxy_executor = None
-                return txt
-            else:
-                logger.info("Primary transcript fetch failed (with proxy)", extra={
-                    "event": "transcript_step_failure",
-                    "step": 1,
-                    "method": "youtube-transcript-api_proxy",
-                    "video_id": video_id,
-                    "reason": "No transcript found",
-                    "request_id": request_id
-                })
-        except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
-            logger.warning("Primary transcript fetch blocked or failed (proxy)", extra={
-                "event": "transcript_step_failure",
-                "step": 1,
-                "method": "youtube-transcript-api_proxy",
+        fallback_futures[proxy_future] = {
+            "step": "youtube-transcript-api_proxy",
+            "meta": {
                 "video_id": video_id,
-                "reason": str(e),
-                "request_id": request_id
-            })
-        finally:
-            if proxy_executor:
-                proxy_executor.shutdown(wait=False)
-
+                "proxy_health": proxy_health_details,
+                "request_id": request_id,
+            }
+        }
     # Step 2+: Run remaining fallbacks in parallel (timedtext, alt APIs, yt-dlp no-proxy)
     fallback_attempts = [
         (
@@ -1370,10 +1365,13 @@ def get_transcript(video_id: str,
     ]
 
     with ThreadPoolExecutor(max_workers=len(fallback_attempts)) as executor:
-        future_map = {executor.submit(fn): name for name, fn in fallback_attempts}
+        future_map = {executor.submit(fn): {"step": name} for name, fn in fallback_attempts}
+        future_map.update(fallback_futures)
         try:
             for future in as_completed(future_map, timeout=12):
-                step_name = future_map[future]
+                info = future_map[future]
+                step_name = info.get("step")
+                meta = info.get("meta", {})
                 try:
                     txt = future.result()
                 except Exception as exc:
@@ -1381,9 +1379,10 @@ def get_transcript(video_id: str,
                         'warning',
                         'transcript_fallback_exception',
                         step=step_name,
-                        video_id=video_id,
+                        video_id=meta.get("video_id", video_id),
                         error=str(exc),
-                        request_id=request_id
+                        request_id=request_id,
+                        proxy_health=meta.get("proxy_health")
                     )
                     continue
                 if txt:
@@ -1391,11 +1390,14 @@ def get_transcript(video_id: str,
                         'info',
                         'transcript_fallback_succeeded',
                         step=step_name,
-                        video_id=video_id,
+                        video_id=meta.get("video_id", video_id),
                         text_len=len(txt),
                         duration_ms=int((time.perf_counter() - t0_workflow) * 1000),
+                        proxy_health=meta.get("proxy_health"),
                         request_id=request_id
                     )
+                    if proxy_executor:
+                        proxy_executor.shutdown(wait=False)
                     return txt
         except TimeoutError:
             log_event(
@@ -1403,8 +1405,11 @@ def get_transcript(video_id: str,
                 'transcript_fallback_timeout',
                 video_id=video_id,
                 request_id=request_id,
-                steps=[name for _, name in fallback_attempts]
+                steps=[info.get("step") for info in future_map.values()]
             )
+
+    if proxy_executor:
+        proxy_executor.shutdown(wait=False)
 
     # If all fail
     logger.warning("❌ All transcript fetch methods FAILED.", extra={
