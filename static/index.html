@@ -3,124 +3,457 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>WorthIt.AI — Smarter YouTube in Seconds</title>
-  <meta name="description" content="AI summaries, comment insights, and a credibility signal for any YouTube video. Share a video to WorthIt.AI and get the essentials fast." />
+  <title>WorthIt.AI — Smarter YouTube In Seconds</title>
+  <meta name="description" content="WorthIt.AI turns YouTube videos into instant AI summaries, comment insights, and credibility checks so you can steal minutes back from endless watching." />
   <style>
     :root {
-      --bg: #1f1f1f;
-      --section: #2e2e2e;
-      --text: #ffffff;
-      --muted: rgba(255,255,255,0.75);
-      --border: rgba(255,255,255,0.12);
-      --glowA: #6ea8fe; /* blue */
-      --glowB: #b16cff; /* purple */
-      --accent: #8ea6ff;
-      --chip: rgba(255,255,255,0.08);
+      --bg: #04060f;
+      --bg-soft: #0b0f24;
+      --surface: #111735;
+      --surface-raised: rgba(24, 29, 59, 0.85);
+      --border: rgba(132, 146, 255, 0.16);
+      --text: #f7f8ff;
+      --muted: rgba(230, 232, 255, 0.70);
+      --accent-a: #6ea8fe;
+      --accent-b: #b16cff;
+      --accent-c: #86f7ff;
+      --chip: rgba(255, 255, 255, 0.12);
+      --shadow-xl: 0 45px 90px rgba(8, 11, 28, 0.55);
+      --shadow-m: 0 24px 48px rgba(8, 11, 28, 0.35);
+      --radius-lg: 28px;
+      --radius-md: 18px;
+      --radius-sm: 12px;
     }
     * { box-sizing: border-box; }
-    body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Inter', 'Segoe UI', Roboto, system-ui, Helvetica, Arial, sans-serif; }
-    a { color: var(--accent); text-decoration: none; }
-    header { position: sticky; top: 0; background: linear-gradient(180deg, rgba(0,0,0,0.65), rgba(0,0,0,0)); z-index: 10; }
-    .nav { max-width: 1120px; margin: 0 auto; padding: 14px 16px; display: flex; align-items: center; gap: 12px; }
-    .logo { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; }
-    .logo-badge { width: 28px; height: 28px; border-radius: 6px; background: linear-gradient(135deg, var(--glowA), var(--glowB)); box-shadow: 0 8px 18px rgba(177,108,255,0.25); }
-    .spacer { flex: 1; }
-    .nav a { color: var(--muted); padding: 6px 10px; border-radius: 10px; }
-    .nav a:hover { background: var(--chip); }
+    body {
+      margin: 0;
+      font-family: "SF Pro Display", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, system-ui, sans-serif;
+      background: radial-gradient(circle at top left, rgba(110, 168, 254, 0.16), transparent 45%),
+                  radial-gradient(circle at 20% 120%, rgba(177, 108, 255, 0.22), transparent 55%),
+                  linear-gradient(180deg, var(--bg) 0%, #06081a 100%);
+      color: var(--text);
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: inherit; text-decoration: none; }
 
-    .hero { position: relative; overflow: hidden; }
-    .glow { position: absolute; inset: -30% -20% auto -20%; height: 60vh; background: radial-gradient(closest-side, rgba(142,166,255,0.35), rgba(177,108,255,0.20), transparent 70%); filter: blur(36px); pointer-events: none; }
-    .hero-inner { max-width: 1120px; margin: 0 auto; padding: 56px 16px 28px; display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 18px; }
-    @media (max-width: 860px) { .hero-inner { grid-template-columns: 1fr; padding-top: 40px; } }
-    .card { background: var(--section); border-radius: 18px; border: 1px solid var(--border); box-shadow: 0 10px 24px rgba(0,0,0,0.25); }
-    .card.pad { padding: 22px; }
-    h1 { font-size: clamp(28px, 4vw, 42px); margin: 0 0 10px; }
-    .subtitle { color: var(--muted); font-size: 16px; line-height: 1.4; }
-    .chips { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
-    .chip { padding: 6px 10px; border-radius: 999px; background: var(--chip); border: 1px solid var(--border); color: var(--muted); font-size: 13px; }
-    .cta-row { margin-top: 18px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-    .btn { display: inline-flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 12px; color: #0d0d0d; background: linear-gradient(90deg, var(--glowA), var(--glowB)); border: 1px solid rgba(255,255,255,0.25); box-shadow: 0 10px 24px rgba(142,166,255,0.25); font-weight: 600; }
-    .btn.secondary { background: transparent; color: var(--text); border-color: var(--border); }
-    .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 10px; }
-    @media (max-width: 860px) { .steps { grid-template-columns: 1fr; } }
-    .step { padding: 14px; border-radius: 14px; background: rgba(255,255,255,0.05); border: 1px solid var(--border); color: var(--muted); font-size: 14px; }
-    .step strong { color: var(--text); }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      backdrop-filter: blur(16px);
+      background: linear-gradient(180deg, rgba(4, 6, 15, 0.82) 0%, rgba(4, 6, 15, 0.18) 100%);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    }
+    .nav {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 18px 22px;
+      display: flex;
+      align-items: center;
+      gap: 18px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+    }
+    .brand img {
+      width: 34px;
+      height: 34px;
+      border-radius: 10px;
+      box-shadow: 0 18px 36px rgba(110, 168, 254, 0.35);
+    }
+    .nav-links {
+      margin-left: auto;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    .nav-links a {
+      padding: 8px 14px;
+      border-radius: var(--radius-sm);
+      color: var(--muted);
+      transition: background 0.2s ease, color 0.2s ease;
+    }
+    .nav-links a:hover {
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text);
+    }
+    .nav-cta {
+      padding: 10px 16px;
+      border-radius: var(--radius-sm);
+      background: linear-gradient(120deg, var(--accent-a) 0%, var(--accent-b) 100%);
+      color: #05060f;
+      font-weight: 600;
+      box-shadow: 0 18px 40px rgba(110, 168, 254, 0.38);
+    }
 
-    .features { max-width: 1120px; margin: 10px auto 0; padding: 0 16px 28px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
-    @media (max-width: 1000px) { .features { grid-template-columns: repeat(2, 1fr);} }
-    @media (max-width: 600px) { .features { grid-template-columns: 1fr;} }
-    .feature { padding: 16px; border-radius: 14px; background: var(--section); border: 1px solid var(--border); }
-    .feature h3 { margin: 0 0 8px; font-size: 16px; }
-    .feature p { margin: 0; font-size: 14px; color: var(--muted); }
+    main { overflow: hidden; }
+    .hero {
+      position: relative;
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 96px 22px 64px;
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+      gap: 32px;
+      align-items: center;
+    }
+    @media (max-width: 980px) {
+      .hero {
+        grid-template-columns: 1fr;
+        padding-top: 72px;
+      }
+    }
+    .hero-copy {
+      position: relative;
+      z-index: 2;
+      background: linear-gradient(140deg, rgba(17, 23, 53, 0.9), rgba(11, 18, 42, 0.65));
+      border-radius: var(--radius-lg);
+      padding: 38px;
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow-xl);
+    }
+    .hero-copy h1 {
+      margin: 0 0 16px;
+      font-size: clamp(34px, 5vw, 58px);
+      line-height: 1.05;
+      letter-spacing: -0.01em;
+    }
+    .hero-copy p {
+      margin: 0 0 22px;
+      font-size: 18px;
+      line-height: 1.55;
+      color: var(--muted);
+    }
+    .tagline {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 6px 14px;
+      border-radius: 999px;
+      background: rgba(134, 247, 255, 0.12);
+      color: var(--accent-c);
+      font-weight: 600;
+      margin-bottom: 18px;
+      border: 1px solid rgba(134, 247, 255, 0.35);
+    }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 26px;
+    }
+    .chip {
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: var(--chip);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: var(--muted);
+      font-size: 13px;
+      letter-spacing: 0.02em;
+    }
+    .cta-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 12px 18px;
+      border-radius: var(--radius-sm);
+      font-weight: 600;
+      border: 1px solid transparent;
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
+    }
+    .btn-primary {
+      background: linear-gradient(120deg, var(--accent-a) 0%, var(--accent-b) 100%);
+      color: #05060f;
+      box-shadow: 0 24px 48px rgba(110, 168, 254, 0.45);
+    }
+    .btn-primary:hover { transform: translateY(-2px); }
+    .btn-secondary {
+      background: transparent;
+      color: var(--text);
+      border-color: rgba(255, 255, 255, 0.12);
+    }
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.06);
+    }
 
-    .footer { max-width: 1120px; margin: 0 auto; padding: 22px 16px 40px; color: var(--muted); display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
-    .links { display: flex; gap: 14px; }
+    .hero-visual {
+      position: relative;
+      border-radius: var(--radius-lg);
+      padding: 28px;
+      background: linear-gradient(160deg, rgba(17, 24, 52, 0.95), rgba(26, 21, 52, 0.7));
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow-xl);
+      overflow: hidden;
+    }
+    .hero-visual::before {
+      content: "";
+      position: absolute;
+      inset: 40% -20% -30% -40%;
+      background: radial-gradient(circle, rgba(177, 108, 255, 0.35), transparent 70%);
+      filter: blur(60px);
+    }
+    .hero-visual h2 {
+      position: relative;
+      margin: 0 0 18px;
+      font-size: 20px;
+    }
+    .how-cards {
+      position: relative;
+      display: grid;
+      gap: 12px;
+    }
+    .how-card {
+      padding: 16px;
+      border-radius: var(--radius-md);
+      background: rgba(12, 16, 38, 0.72);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.4;
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+    }
+    .how-card strong { color: var(--text); font-size: 16px; }
+    .how-card span.badge {
+      width: 34px;
+      height: 34px;
+      border-radius: 12px;
+      background: rgba(110, 168, 254, 0.18);
+      border: 1px solid rgba(110, 168, 254, 0.45);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent-a);
+      font-weight: 600;
+    }
+
+    .section {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 32px 22px 12px;
+    }
+    .section h2 {
+      margin: 0 0 18px;
+      font-size: clamp(26px, 3.5vw, 38px);
+      letter-spacing: -0.01em;
+    }
+    .section p.lead {
+      margin: 0 0 28px;
+      color: var(--muted);
+      font-size: 17px;
+      max-width: 740px;
+    }
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 18px;
+    }
+    @media (max-width: 1100px) {
+      .feature-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 640px) {
+      .feature-grid { grid-template-columns: minmax(0, 1fr); }
+    }
+    .feature-card {
+      background: var(--surface);
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border);
+      padding: 22px;
+      box-shadow: var(--shadow-m);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .feature-card h3 {
+      margin: 0;
+      font-size: 18px;
+    }
+    .feature-card p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.5;
+    }
+
+    .info-panels {
+      display: grid;
+      gap: 18px;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    }
+    @media (max-width: 900px) {
+      .info-panels { grid-template-columns: minmax(0, 1fr); }
+    }
+    .panel {
+      padding: 26px;
+      border-radius: var(--radius-md);
+      background: var(--surface-raised);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      box-shadow: var(--shadow-m);
+    }
+    .panel h3 { margin: 0 0 12px; }
+    .panel p { margin: 0 0 14px; color: var(--muted); }
+    .panel ul { margin: 0; padding-left: 18px; color: var(--muted); }
+    .panel li { margin-bottom: 8px; }
+
+    .glow-strip {
+      margin: 42px auto 32px;
+      padding: 24px;
+      border-radius: var(--radius-lg);
+      max-width: 1120px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      align-items: center;
+      justify-content: space-between;
+      border: 1px solid rgba(134, 247, 255, 0.28);
+      background: linear-gradient(120deg, rgba(110, 168, 254, 0.18), rgba(177, 108, 255, 0.22));
+      color: var(--text);
+    }
+    .glow-strip p { margin: 0; color: var(--text); font-weight: 600; }
+    .glow-strip span { color: var(--muted); font-size: 15px; display: block; margin-top: 4px; }
+
+    footer {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 36px 22px 56px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--muted);
+      border-top: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .footer-links { display: flex; gap: 18px; flex-wrap: wrap; }
+    .footer-links a { color: var(--muted); }
+    .footer-links a:hover { color: var(--text); }
   </style>
 </head>
 <body>
   <header>
     <nav class="nav">
-      <div class="logo">
-        <div class="logo-badge"></div>
+      <a class="brand" href="/">
+        <img src="/static/assets/worthit-logo.png" alt="WorthIt.AI logo" />
         <span>WorthIt.AI</span>
+      </a>
+      <div class="nav-links">
+        <a href="/support">Support</a>
+        <a href="/privacy">Privacy</a>
+        <a href="/terms">Terms</a>
+        <a class="nav-cta" href="https://apps.apple.com/us/app/worthit-ai-video-summaries/id6749246821" target="_blank" rel="noopener noreferrer">Get the app</a>
       </div>
-      <div class="spacer"></div>
-      <a href="/support">Support</a>
-      <a href="/privacy">Privacy</a>
-      <a href="/terms">Terms</a>
     </nav>
   </header>
 
-  <section class="hero">
-    <div class="glow"></div>
-    <div class="hero-inner">
-      <div class="card pad">
-        <h1>Smarter YouTube in seconds</h1>
-        <p class="subtitle">Share any video to get an AI summary, comment insights, and a credibility signal — fast. Ask follow‑ups to go deeper.</p>
+  <main>
+    <section class="hero">
+      <div class="hero-copy">
+        <div class="tagline">Stole minutes from YouTube</div>
+        <h1>Smarter YouTube in seconds.</h1>
+        <p>WorthIt.AI turns any YouTube video into a crisp summary, the real story from comments, and a credibility pulse—so you can spend time on what matters instead of the rabbit hole.</p>
         <div class="chips">
           <div class="chip">AI Summary</div>
-          <div class="chip">Comment Sentiment & Themes</div>
+          <div class="chip">Comment Sentiment &amp; Themes</div>
           <div class="chip">Credibility Signal</div>
           <div class="chip">Ask Anything</div>
         </div>
         <div class="cta-row">
-          <a class="btn" href="#how">See how it works</a>
-          <a class="btn secondary" href="https://apps.apple.com" target="_blank" rel="noopener">Get the app</a>
+          <a class="btn btn-primary" href="#how-it-works">See how it works</a>
+          <a class="btn btn-secondary" href="https://apps.apple.com/us/app/worthit-ai-video-summaries/id6749246821" target="_blank" rel="noopener noreferrer">Download on the App Store</a>
         </div>
       </div>
-      <div class="card pad" id="how">
-        <h2 style="margin:0 0 8px; font-size:18px;">How it works</h2>
-        <div class="steps">
-          <div class="step"><strong>1.</strong> Open a YouTube video</div>
-          <div class="step"><strong>2.</strong> Tap <strong>Share</strong> → <strong>WorthIt.AI</strong></div>
-          <div class="step"><strong>3.</strong> See summary, comments, and score</div>
+      <aside class="hero-visual" aria-labelledby="how-title">
+        <h2 id="how-title">3 taps to clarity</h2>
+        <div class="how-cards">
+          <div class="how-card">
+            <span class="badge">1</span>
+            <div><strong>Share a YouTube link</strong><br />From the YouTube app, tap Share → WorthIt.AI.</div>
+          </div>
+          <div class="how-card">
+            <span class="badge">2</span>
+            <div><strong>Wait a few seconds</strong><br />We grab transcripts, real comments, and run our AI stack.</div>
+          </div>
+          <div class="how-card">
+            <span class="badge">3</span>
+            <div><strong>Read, trust, explore</strong><br />Get the summary, credibility score, and ask deeper follow-ups.</div>
+          </div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="section" id="how-it-works">
+      <h2>Designed to match the WorthIt iOS experience</h2>
+      <p class="lead">Every screen mirrors the native WorthIt.AI interface—dark, focused, and fast. Start with a summary, dive into structured comment insights, then decide if the video is worth your time.</p>
+      <div class="feature-grid">
+        <article class="feature-card">
+          <h3>Instant AI summaries</h3>
+          <p>No fluff. We ground every summary on the transcript so you capture the gist in under 10 seconds.</p>
+        </article>
+        <article class="feature-card">
+          <h3>Comment intelligence</h3>
+          <p>See what real viewers think—sentiment, recurring themes, and outlier takes surface automatically.</p>
+        </article>
+        <article class="feature-card">
+          <h3>Credibility signal</h3>
+          <p>A transparent score that blends creator patterns, transcript depth, and crowd reaction to keep hype in check.</p>
+        </article>
+        <article class="feature-card">
+          <h3>Ask anything</h3>
+          <p>Follow up with natural questions. WorthIt.AI keeps context to deliver structured, helpful answers.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="info-panels">
+        <div class="panel">
+          <h3>Why people love WorthIt.AI</h3>
+          <p>Creators, students, researchers, and busy pros count on WorthIt.AI to compress hours of watching into minutes.</p>
+          <ul>
+            <li>Focus mode UI that matches the native app</li>
+            <li>Fast recaps for 10 minute explainers or 2 hour deep dives</li>
+            <li>Works wherever captions and comments are available</li>
+            <li>Privacy-first: no personal accounts, no trackers</li>
+          </ul>
+        </div>
+        <div class="panel">
+          <h3>Built for clarity</h3>
+          <p>We engineered the same motion and hierarchy you feel on iOS—cards, gradients, and the WorthIt glow.</p>
+          <ul>
+            <li>Dynamic gradient surfaces with crisp typography</li>
+            <li>Accessible contrast and large tap targets</li>
+            <li>Reliable backend that keeps pace with your queue</li>
+            <li>Support team ready at <a href="mailto:worthit.tuliai@gmail.com">worthit.tuliai@gmail.com</a></li>
+          </ul>
         </div>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <section class="features">
-    <div class="feature">
-      <h3>AI Summaries</h3>
-      <p>Clear takeaways from the transcript — grounded, not guessed.</p>
+    <div class="glow-strip">
+      <div>
+        <p>Ready to save your watchlist?</p>
+        <span>Join the WorthIt community that already stole minutes from YouTube rabbit holes.</span>
+      </div>
+      <a class="btn btn-primary" href="https://apps.apple.com/us/app/worthit-ai-video-summaries/id6749246821" target="_blank" rel="noopener noreferrer">Get WorthIt.AI</a>
     </div>
-    <div class="feature">
-      <h3>Comment Insights</h3>
-      <p>Sentiment and themes from real comments, not the transcript.</p>
-    </div>
-    <div class="feature">
-      <h3>Credibility Signal</h3>
-      <p>Understand depth vs. fluff with a quick, transparent score.</p>
-    </div>
-    <div class="feature">
-      <h3>Ask Anything</h3>
-      <p>Follow‑up questions with structured, helpful answers.</p>
-    </div>
-  </section>
+  </main>
 
-  <footer class="footer">
-    <div>© 2025 WorthIt.AI</div>
-    <div class="links">
+  <footer>
+    <div>© 2025 WorthIt.AI — Built by TuliAI</div>
+    <div class="footer-links">
       <a href="/support">Support</a>
       <a href="/privacy">Privacy</a>
       <a href="/terms">Terms</a>
@@ -129,4 +462,3 @@
   </footer>
 </body>
 </html>
-

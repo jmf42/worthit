@@ -1,80 +1,198 @@
-<!-- static/terms.html -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>WorthIt.AI — Terms of Use</title>
+  <meta name="description" content="WorthIt.AI terms of use outlining acceptable usage, data handling, and contact details." />
   <style>
-    :root { --bg:#0f1221; --card:#181b2e; --text:#e9ecf1; --muted:#aab1c3; --accent1:#667eea; --accent2:#764ba2; --border:rgba(255,255,255,0.08); }
+    :root {
+      --bg: #04060f;
+      --surface: rgba(15, 18, 43, 0.92);
+      --border: rgba(132, 146, 255, 0.16);
+      --text: #f7f8ff;
+      --muted: rgba(230, 232, 255, 0.7);
+      --accent-a: #6ea8fe;
+      --radius-lg: 28px;
+      --radius-md: 18px;
+      --radius-sm: 12px;
+    }
     * { box-sizing: border-box; }
-    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:linear-gradient(180deg,#0f1221 0%,#0c0f1a 100%); color:var(--text); }
-    .container { max-width:960px; margin:0 auto; padding:24px; }
-    .hero { background:linear-gradient(135deg,var(--accent1) 0%,var(--accent2) 100%); color:white; border-bottom:1px solid var(--border); box-shadow:0 30px 60px rgba(0,0,0,0.25); }
-    .hero-inner { padding:56px 24px; text-align:center; }
-    .hero h1 { margin:0 0 8px; font-size:2.2rem; font-weight:800; letter-spacing:-0.01em; }
-    .hero p { margin:4px 0 0; opacity:.95; }
-    .card { background:var(--card); border:1px solid var(--border); border-radius:16px; padding:24px; margin:24px 0; box-shadow:0 10px 24px rgba(0,0,0,0.25); }
-    h2 { font-size:1.25rem; margin:0 0 12px; }
-    p { line-height:1.7; margin:0 0 12px; }
-    ul { margin:0 0 12px 1.2rem; }
-    li { margin:6px 0; }
-    .muted { color:var(--muted); }
-    a { color:#92a8ff; text-decoration:none; }
-    a:hover { text-decoration:underline; }
-    footer { color:var(--muted); text-align:center; padding:24px 0 48px; }
+    body {
+      margin: 0;
+      font-family: "SF Pro Text", -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, system-ui, sans-serif;
+      background: radial-gradient(circle at top left, rgba(110, 168, 254, 0.16), transparent 45%),
+                  radial-gradient(circle at 18% 120%, rgba(177, 108, 255, 0.2), transparent 55%),
+                  linear-gradient(180deg, var(--bg) 0%, #06081a 100%);
+      color: var(--text);
+      -webkit-font-smoothing: antialiased;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      backdrop-filter: blur(16px);
+      background: linear-gradient(180deg, rgba(4, 6, 15, 0.85) 0%, rgba(4, 6, 15, 0.18) 100%);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .nav {
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 18px 22px;
+      display: flex;
+      align-items: center;
+      gap: 18px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+    }
+    .brand img {
+      width: 32px;
+      height: 32px;
+      border-radius: 10px;
+      box-shadow: 0 14px 32px rgba(110, 168, 254, 0.35);
+    }
+    .nav-links { margin-left: auto; display: flex; gap: 12px; }
+    .nav-links a { color: var(--muted); padding: 8px 14px; border-radius: var(--radius-sm); }
+    .nav-links a:hover { background: rgba(255, 255, 255, 0.08); color: var(--text); }
+    main { max-width: 1080px; margin: 0 auto; padding: 64px 22px 56px; }
+    .hero-card {
+      background: linear-gradient(140deg, rgba(15, 22, 48, 0.92), rgba(21, 18, 46, 0.68));
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--border);
+      padding: 42px;
+      box-shadow: 0 36px 72px rgba(8, 11, 28, 0.55);
+      margin-bottom: 32px;
+    }
+    .hero-card .badge {
+      display: inline-flex;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: rgba(110, 168, 254, 0.14);
+      border: 1px solid rgba(110, 168, 254, 0.38);
+      color: var(--accent-a);
+      font-weight: 600;
+      margin-bottom: 16px;
+    }
+    .hero-card h1 { margin: 0 0 12px; font-size: clamp(32px, 4vw, 46px); }
+    .hero-card p { margin: 0; color: var(--muted); max-width: 640px; font-size: 18px; }
+    .terms-list {
+      display: grid;
+      gap: 18px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    @media (max-width: 900px) { .terms-list { grid-template-columns: minmax(0, 1fr); } }
+    .card {
+      background: var(--surface);
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border);
+      padding: 26px;
+      box-shadow: 0 26px 52px rgba(8, 11, 28, 0.42);
+    }
+    .card h2 { margin: 0 0 12px; font-size: 20px; }
+    .card p { margin: 0 0 12px; color: var(--muted); line-height: 1.65; }
+    .card ul { margin: 0 0 12px 20px; color: var(--muted); line-height: 1.6; }
+    .card li { margin-bottom: 6px; }
+    .full { grid-column: span 2; }
+    @media (max-width: 900px) { .full { grid-column: span 1; } }
+    footer {
+      padding: 36px 22px 56px;
+      color: var(--muted);
+      border-top: 1px solid rgba(255, 255, 255, 0.05);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      justify-content: space-between;
+    }
+    .footer-links { display: flex; gap: 18px; flex-wrap: wrap; }
+    .footer-links a { color: var(--muted); }
+    .footer-links a:hover { color: var(--text); }
   </style>
 </head>
 <body>
-  <header class="hero">
-    <div class="container hero-inner">
-      <span class="muted">Last updated: <strong>13 Aug 2025</strong></span>
-      <h1>Terms of Use</h1>
-      <p class="muted">Please read these Terms carefully before using WorthIt.AI</p>
-    </div>
+  <header>
+    <nav class="nav">
+      <a class="brand" href="/">
+        <img src="/static/assets/worthit-logo.png" alt="WorthIt.AI logo" />
+        <span>WorthIt.AI</span>
+      </a>
+      <div class="nav-links">
+        <a href="/support">Support</a>
+        <a href="/privacy">Privacy</a>
+        <a href="/terms">Terms</a>
+        <a href="https://apps.apple.com/us/app/worthit-ai-video-summaries/id6749246821" target="_blank" rel="noopener noreferrer">App Store</a>
+      </div>
+    </nav>
   </header>
-  <main class="container">
-    <section class="card">
-      <h2>1. Introduction</h2>
-      <p>Welcome to WorthIt.AI. By using our app, you agree to these Terms.</p>
+
+  <main>
+    <section class="hero-card">
+      <div class="badge">Last updated: 13 Aug 2025</div>
+      <h1>Terms of Use</h1>
+      <p>Please review these terms carefully—using WorthIt.AI means you agree to the responsibilities and limitations below.</p>
     </section>
-    <section class="card">
-      <h2>2. Description of service</h2>
-      <p>WorthIt.AI analyzes publicly available YouTube transcripts and a subset of public comments to generate AI‑powered summaries, insights, and Q&amp;A. It does not stream or store video content.</p>
+
+    <section class="terms-list">
+      <article class="card">
+        <h2>1. Introduction</h2>
+        <p>WorthIt.AI condenses public YouTube content into AI-generated summaries, insights, and answers. These terms govern your use of the service.</p>
+      </article>
+      <article class="card">
+        <h2>2. Service description</h2>
+        <p>We collect transcripts and a subset of public comments to deliver WorthIt.AI outputs. We do not stream or permanently store copyrighted video content.</p>
+      </article>
+      <article class="card">
+        <h2>3. Data practices</h2>
+        <p>Diagnostic logs and caches operate as described in our <a href="/privacy">Privacy Policy</a>. No personal account is required.</p>
+      </article>
+      <article class="card">
+        <h2>4. Acceptable use</h2>
+        <ul>
+          <li>Use WorthIt.AI for lawful purposes and respect YouTube’s policies.</li>
+          <li>Do not attempt to reverse engineer, overload, or misuse the service.</li>
+          <li>You are responsible for evaluating AI outputs before acting on them.</li>
+        </ul>
+      </article>
+      <article class="card">
+        <h2>5. Intellectual property</h2>
+        <p>WorthIt.AI retains rights to the app, brand, and backend systems. YouTube content remains owned by its respective creators.</p>
+      </article>
+      <article class="card">
+        <h2>6. Third-party services</h2>
+        <p>OpenAI powers certain responses. When transcripts are difficult to reach, we may rely on public caption mirrors or tools such as yt-dlp and youtube-comment-downloader.</p>
+      </article>
+      <article class="card">
+        <h2>7. Limitations &amp; liability</h2>
+        <p>The service is provided “as is.” We do not guarantee accuracy or availability. To the fullest extent permitted by law, we disclaim liability for indirect or consequential damages.</p>
+      </article>
+      <article class="card">
+        <h2>8. Termination</h2>
+        <p>We may suspend or end access without notice if your usage harms reliability or violates these terms.</p>
+      </article>
+      <article class="card">
+        <h2>9. Updates</h2>
+        <p>We may modify the service and these terms. Continued use after updates signals acceptance of the revised terms.</p>
+      </article>
+      <article class="card full">
+        <h2>10. Contact</h2>
+        <p>Questions? Email <a href="mailto:worthit.tuliai@gmail.com">worthit.tuliai@gmail.com</a>. We typically reply within 24 hours.</p>
+      </article>
     </section>
-    <section class="card">
-      <h2>3. Data collection</h2>
-      <p>We collect minimal diagnostic data and operate caches as described in our <a href="/privacy">Privacy Policy</a>.</p>
-    </section>
-    <section class="card">
-      <h2>4. Use of information</h2>
-      <p>Any diagnostic data is used solely to maintain and improve service reliability. We do not sell personal data.</p>
-    </section>
-    <section class="card">
-      <h2>5. Storage &amp; retention</h2>
-      <p><strong>In‑memory caches:</strong> ~2 hours. <strong>Persistent cache:</strong> used to speed repeated requests; no fixed time‑based expiration and pruned/overwritten during maintenance. <strong>Logs:</strong> rotate by size; older entries overwritten. See <a href="/privacy">Privacy Policy</a> for details.</p>
-    </section>
-    <section class="card">
-      <h2>6. Third‑party services</h2>
-      <p>We use OpenAI’s API to generate summaries and Q&amp;A. When direct caption retrieval fails, we may use public caption mirrors (e.g., Piped/Invidious) or tools like <code>yt‑dlp</code> and <code>youtube‑comment‑downloader</code> to retrieve public captions/comments.</p>
-    </section>
-    <section class="card">
-      <h2>7. User responsibilities</h2>
-      <p>Respect YouTube’s and third parties’ rights. Do not use WorthIt.AI for illegal or infringing purposes. You remain responsible for how you use outputs.</p>
-    </section>
-    <section class="card">
-      <h2>8. Limitations</h2>
-      <p>Outputs are generated by AI and may contain errors. The service is provided “as is,” without warranties of any kind. To the fullest extent permitted by law, we are not liable for indirect or consequential damages arising from use of the app.</p>
-    </section>
-    <section class="card">
-      <h2>9. Changes to terms</h2>
-      <p>We may update these Terms; continued use after changes means you accept the updated Terms.</p>
-    </section>
-    <section class="card">
-      <h2>10. Contact</h2>
-      <p>Email <a href="mailto:worthit.tuliai@gmail.com">worthit.tuliai@gmail.com</a></p>
-    </section>
-    <footer>See also our <a href="/privacy">Privacy Policy</a>.</footer>
   </main>
+
+  <footer>
+    <div>© 2025 WorthIt.AI — Built by TuliAI</div>
+    <div class="footer-links">
+      <a href="/">Home</a>
+      <a href="/support">Support</a>
+      <a href="/privacy">Privacy</a>
+      <a href="/terms">Terms</a>
+      <a href="mailto:worthit.tuliai@gmail.com">Contact</a>
+    </div>
+  </footer>
 </body>
 </html>
