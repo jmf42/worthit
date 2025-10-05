@@ -39,7 +39,7 @@ from yt_dlp import YoutubeDL
 
 import functools
 
-# --- Patch for youtube-transcript-api compatibility ---
+# --- Patch for youtube-transcript-api compatibility -----
 import inspect
 
 # Determine accepted parameters for YouTubeTranscriptApi.list_transcripts at runtime
