@@ -750,10 +750,10 @@ def expand_preferred_langs(codes: Optional[List[str]], force_en_first: bool = Fa
         ordered.append(c)
         seen.add(c)
     # 2) Optionally ensure English first (only when explicitly requested or using defaults)
-   if force_en_first and 'en' in ordered:
-       ordered.remove('en')
-       ordered.insert(0, 'en')
-   # 3) Expand variants
+    if force_en_first and 'en' in ordered:
+        ordered.remove('en')
+        ordered.insert(0, 'en')
+    # 3) Expand variants
     expanded: list[str] = []
     seen_variants: set[str] = set()
     for c in ordered:
