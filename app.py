@@ -9,7 +9,7 @@ import random
 import html
 import tempfile
 import pathlib
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from functools import lru_cache
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
@@ -135,8 +135,82 @@ os.makedirs(PERSISTENT_CACHE_DIR, exist_ok=True)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# --- Thread-local session reuse for youtube-transcript-api ------------------
+_thread_local_ytt_session = threading.local()
+
+def _build_ytt_session() -> requests.Session:
+    session = requests.Session()
+    retry_total = int(os.getenv("YTT_SESSION_RETRY_TOTAL", "3"))
+    backoff = float(os.getenv("YTT_SESSION_BACKOFF", "0.5"))
+    pool_connections = int(os.getenv("YTT_SESSION_POOL_CONNECTIONS", "20"))
+    pool_maxsize = int(os.getenv("YTT_SESSION_POOL_MAXSIZE", "20"))
+    retry = Retry(
+        total=retry_total,
+        backoff_factor=backoff,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"]),
+    )
+    adapter = HTTPAdapter(pool_connections=pool_connections, pool_maxsize=pool_maxsize, max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cookie": CONSENT_COOKIE_HEADER,
+    })
+    return session
+
+def get_thread_local_ytt_session(user_agent: str, accept_language: str) -> requests.Session:
+    session: Optional[requests.Session] = getattr(_thread_local_ytt_session, "session", None)
+    if session is None:
+        session = _build_ytt_session()
+        _thread_local_ytt_session.session = session
+    # Update per-request headers (thread-local session ensures no cross-thread races)
+    session.headers["User-Agent"] = user_agent
+    session.headers["Accept-Language"] = accept_language
+    session.headers["Cookie"] = CONSENT_COOKIE_HEADER
+    return session
+
 
 # --- Logging Setup ---
+
+def make_transcript_payload(
+    text: str,
+    language_code: str,
+    language_label: str,
+    is_generated: bool,
+    tracks: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    return {
+        "text": text,
+        "language": {
+            "code": language_code or "unknown",
+            "label": language_label or language_code or "unknown",
+            "is_generated": bool(is_generated),
+        },
+        "tracks": tracks or [],
+    }
+
+def make_fallback_payload(
+    text: str,
+    languages: Optional[List[str]],
+    is_generated: bool,
+) -> Dict[str, Any]:
+    code = "unknown"
+    label = "unknown"
+    if languages:
+        base = (languages[0] or "").strip()
+        if base:
+            code = base.split("-")[0] or base
+            label = base
+    return make_transcript_payload(text, code, label, is_generated, [])
+
+def ensure_payload(value: Any, languages: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+    if isinstance(value, dict) and "text" in value:
+        return value
+    if isinstance(value, str):
+        return make_fallback_payload(value, languages, is_generated=False)
+    return None
+
 def setup_logging():
     """
     Configure a single JSON logger to stdout with no propagation to avoid
@@ -292,7 +366,7 @@ def timedtext_try_languages(video_id: str,
                             languages: Optional[List[str]],
                             request_id: str = "",
                             allow_translate: bool = True,
-                            allow_proxy: bool = True) -> Optional[str]:
+                            allow_proxy: bool = True) -> Optional[Dict[str, Any]]:
     """Try timedtext using discovery with this order:
     1) Manual (direct then proxy)
     2) ASR (direct then proxy)
@@ -321,7 +395,18 @@ def timedtext_try_languages(video_id: str,
         # Try via proxy if no tracks direct
         tracks = _timedtext_list_tracks(video_id, use_proxy=True, request_id=request_id)
 
+    track_manifest = []
     if tracks:
+        track_manifest = [
+            {
+                "code": code,
+                "label": code,
+                "is_generated": kind == "asr",
+                "is_translatable": False,
+                "base_url": "",
+            }
+            for code, kind in tracks
+        ]
         log_event('info', 'timedtext_tracks_found', extra={"video_id": video_id, "count": len(tracks), "sample": tracks[:3], "request_id": request_id})
         # 1) Manual (direct then proxy) in requested base order
         for base in base_langs:
@@ -330,7 +415,7 @@ def timedtext_try_languages(video_id: str,
                     out = _timedtext_fetch_vtt(video_id, code, asr=False, use_proxy=False, request_id=request_id)
                     if out:
                         log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "manual", "proxy": False, "request_id": request_id})
-                        return out
+                        return make_transcript_payload(out, code, code, False, track_manifest)
         if allow_proxy and get_proxy_dict():
             for base in base_langs:
                 for code, kind in tracks:
@@ -338,7 +423,7 @@ def timedtext_try_languages(video_id: str,
                         out = _timedtext_fetch_vtt(video_id, code, asr=False, use_proxy=True, request_id=request_id)
                         if out:
                             log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "manual", "proxy": True, "request_id": request_id})
-                            return out
+                            return make_transcript_payload(out, code, code, False, track_manifest)
         # 2) ASR (direct then proxy) in requested base order
         for base in base_langs:
             for code, kind in tracks:
@@ -346,7 +431,7 @@ def timedtext_try_languages(video_id: str,
                     out = _timedtext_fetch_vtt(video_id, code, asr=True, use_proxy=False, request_id=request_id)
                     if out:
                         log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "asr", "proxy": False, "request_id": request_id})
-                        return out
+                        return make_transcript_payload(out, code, code, True, track_manifest)
         if allow_proxy and get_proxy_dict():
             for base in base_langs:
                 for code, kind in tracks:
@@ -354,7 +439,7 @@ def timedtext_try_languages(video_id: str,
                         out = _timedtext_fetch_vtt(video_id, code, asr=True, use_proxy=True, request_id=request_id)
                         if out:
                             log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": "asr", "proxy": True, "request_id": request_id})
-                            return out
+                            return make_transcript_payload(out, code, code, True, track_manifest)
         # 3) Translation as last resort
         if allow_translate and base_langs:
             target_base = base_langs[0]
@@ -363,34 +448,34 @@ def timedtext_try_languages(video_id: str,
                     out = _timedtext_fetch_vtt(video_id, code, asr=False, use_proxy=False, request_id=request_id, tlang=target_base)
                     if out:
                         log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": f"manual_translate_{target_base}", "proxy": False, "request_id": request_id})
-                        return out
+                        return make_transcript_payload(out, target_base, target_base, False, track_manifest)
             if allow_proxy and get_proxy_dict():
                 for code, kind in tracks:
                     if kind == 'manual' and not code.startswith(target_base):
                         out = _timedtext_fetch_vtt(video_id, code, asr=False, use_proxy=True, request_id=request_id, tlang=target_base)
                         if out:
                             log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": code, "kind": f"manual_translate_{target_base}", "proxy": True, "request_id": request_id})
-                            return out
+                            return make_transcript_payload(out, target_base, target_base, False, track_manifest)
 
     # If list failed or nothing matched, do a simple brute force (manual then ASR; direct then proxy)
     for base in base_langs:
         if out := _timedtext_fetch_vtt(video_id, base, asr=False, use_proxy=False, request_id=request_id):
             log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": base, "kind": "manual", "proxy": False, "request_id": request_id})
-            return out
+            return make_transcript_payload(out, base, base, False, track_manifest)
     if allow_proxy and get_proxy_dict():
         for base in base_langs:
             if out := _timedtext_fetch_vtt(video_id, base, asr=False, use_proxy=True, request_id=request_id):
                 log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": base, "kind": "manual", "proxy": True, "request_id": request_id})
-                return out
+                return make_transcript_payload(out, base, base, False, track_manifest)
     for base in base_langs:
         if out := _timedtext_fetch_vtt(video_id, base, asr=True, use_proxy=False, request_id=request_id):
             log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": base, "kind": "asr", "proxy": False, "request_id": request_id})
-            return out
+            return make_transcript_payload(out, base, base, True, track_manifest)
     if allow_proxy and get_proxy_dict():
         for base in base_langs:
             if out := _timedtext_fetch_vtt(video_id, base, asr=True, use_proxy=True, request_id=request_id):
                 log_event('info', 'timedtext_success', extra={"video_id": video_id, "lang": base, "kind": "asr", "proxy": True, "request_id": request_id})
-                return out
+                return make_transcript_payload(out, base, base, True, track_manifest)
     return None
 
 # Requires youtube-transcript-api >= 1.0.4 for ProxyConfig support
@@ -763,7 +848,7 @@ def fetch_api_once(video_id: str,
                    request_id: str = "",
                    prefer_original: bool = True,
                    strict_languages: bool = False,
-                   allow_translate: bool = True) -> Optional[str]:
+                   allow_translate: bool = True) -> Optional[Dict[str, Any]]:
     """Single attempt using youtube-transcript-api. Returns plain text or None."""
     t0 = time.perf_counter()
     # Respect caller languages; if none, expand defaults with English-first
@@ -782,18 +867,35 @@ def fetch_api_once(video_id: str,
     
     # Build Accept-Language header with q-values
     accept_lang = ", ".join(f"{code};q={1.0 - (idx*0.1):.1f}" for idx, code in enumerate(languages_final[:5]))
-    http_client = requests.Session()
-    http_client.headers.update({
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept-Language": accept_lang,
-        "Cookie": CONSENT_COOKIE_HEADER
-    })
+    user_agent = random.choice(USER_AGENTS)
+    http_client = get_thread_local_ytt_session(user_agent=user_agent, accept_language=accept_lang)
     ytt_api = YouTubeTranscriptApi(http_client=http_client, proxy_config=proxy_cfg)
+    selected_transcript = None
+    track_manifest: List[Dict[str, Any]] = []
     try:
         # Prefer list-based selection for finer control. Fallback to simple fetch if list is unavailable.
         if hasattr(ytt_api, 'list'):
             tl = ytt_api.list(video_id)
             ft = None
+            track_manifest = [
+                {
+                    "code": getattr(tr, "language_code", "unknown"),
+                    "label": getattr(tr, "language", getattr(tr, "language_code", "unknown")),
+                    "is_generated": getattr(tr, "is_generated", False),
+                    "is_translatable": getattr(tr, "is_translatable", False),
+                    "base_url": getattr(tr, "_url", ""),
+                }
+                for tr in tl
+            ]
+
+            def fetch_from_transcript(transcript_obj) -> Optional[Any]:
+                nonlocal selected_transcript
+                try:
+                    fetched = transcript_obj.fetch()
+                    selected_transcript = transcript_obj
+                    return fetched
+                except Exception:
+                    return None
             # Gather manual vs generated
             try:
                 manual_list = [tr for tr in tl if not getattr(tr, 'is_generated', False)]
@@ -802,23 +904,19 @@ def fetch_api_once(video_id: str,
                 manual_list, generated_list = [], []
 
             # 1) Prefer original (unique manual or unique generated) when enabled
-            if prefer_original and ft is None:
-                if len(manual_list) == 1:
-                    try:
-                        ft = manual_list[0].fetch()
-                    except Exception:
-                        ft = None
-                elif len(generated_list) == 1:
-                    try:
-                        ft = generated_list[0].fetch()
-                    except Exception:
-                        ft = None
+            if prefer_original and not strict_languages and ft is None:
+                if manual_list:
+                    ft = fetch_from_transcript(manual_list[0])
+                elif generated_list:
+                    ft = fetch_from_transcript(generated_list[0])
 
             # 2) Try manual in the exact user-provided order
             if ft is None and languages_final:
                 try:
                     t = tl.find_manually_created_transcript(languages_final)
-                    ft = t.fetch()
+                    candidate = fetch_from_transcript(t)
+                    if candidate is not None:
+                        ft = candidate
                 except Exception:
                     ft = None
 
@@ -826,7 +924,9 @@ def fetch_api_once(video_id: str,
             if ft is None and languages_final:
                 try:
                     t = tl.find_generated_transcript(languages_final)
-                    ft = t.fetch()
+                    candidate = fetch_from_transcript(t)
+                    if candidate is not None:
+                        ft = candidate
                 except Exception:
                     ft = None
 
@@ -834,10 +934,7 @@ def fetch_api_once(video_id: str,
             if ft is None and not strict_languages:
                 t_any = (manual_list[0] if manual_list else (generated_list[0] if generated_list else None))
                 if t_any is not None:
-                    try:
-                        ft = t_any.fetch()
-                    except Exception:
-                        ft = None
+                    ft = fetch_from_transcript(t_any)
 
             # 5) Last resort: translate to the first requested language, when allowed
             if ft is None and allow_translate and languages_final:
@@ -853,13 +950,17 @@ def fetch_api_once(video_id: str,
                         except Exception:
                             continue
                     if translated is not None:
-                        ft = translated.fetch()
+                        candidate = fetch_from_transcript(translated)
+                        if candidate is not None:
+                            ft = candidate
                     else:
-                        ft = t_any.fetch()
+                        ft = fetch_from_transcript(t_any)
                 else:
-                    ft = t_any.fetch()
+                    ft = fetch_from_transcript(t_any)
         else:
-            ft = ytt_api.fetch(video_id, languages=languages_final)
+            fetched = ytt_api.fetch(video_id, languages=languages_final)
+            ft = fetched
+            selected_transcript = None
     except Exception:
         log_event('warning', 'transcript_method_failure', extra={
             "method": "youtube-transcript-api",
@@ -889,16 +990,33 @@ def fetch_api_once(video_id: str,
         for seg in segments
     ).strip() or None
 
-    if text_content:
-        log_event('info', 'transcript_method_success', extra={
-            "method": "youtube-transcript-api",
-            "video_id": video_id,
-            "text_len": len(text_content),
-            "language_detected": ft.language_code if hasattr(ft, 'language_code') else 'unknown',
-            "duration_ms": int((time.perf_counter() - t0) * 1000),
-            "request_id": request_id
-        })
-    return text_content
+    if not text_content:
+        return None
+
+    language_code = getattr(ft, "language_code", None)
+    language_label = getattr(ft, "language", language_code)
+    is_generated = getattr(ft, "is_generated", getattr(selected_transcript, "is_generated", False))
+    if selected_transcript is not None:
+        language_code = getattr(selected_transcript, "language_code", language_code)
+        language_label = getattr(selected_transcript, "language", language_label)
+
+    payload = make_transcript_payload(
+        text_content,
+        language_code or "unknown",
+        language_label or language_code or "unknown",
+        bool(is_generated),
+        track_manifest,
+    )
+
+    log_event('info', 'transcript_method_success', extra={
+        "method": "youtube-transcript-api",
+        "video_id": video_id,
+        "text_len": len(text_content),
+        "language_detected": payload["language"]["code"],
+        "duration_ms": int((time.perf_counter() - t0) * 1000),
+        "request_id": request_id
+    })
+    return payload
 
 # ---------------------------------------------------------------------------
 # yt‑dlp subtitle fallback ---------------------------------------------------
@@ -907,7 +1025,7 @@ def fetch_api_once(video_id: str,
 def fetch_ytdlp(video_id: str,
                 proxy_url: Optional[str],
                 request_id: str = "",
-                languages: Optional[List[str]] = None) -> Optional[str]:
+                languages: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     """Fetch subtitles via yt-dlp, falling back to auto-generated if manual fails."""
     t0 = time.perf_counter()
     logger.info("Attempting transcript fetch via yt-dlp", extra={
@@ -978,13 +1096,16 @@ def fetch_ytdlp(video_id: str,
                 return None
             raw = fpath.read_text(encoding="utf-8", errors="ignore")
             if fpath.suffix == ".srv3" or "<text" in raw:
-                return " ".join(html.unescape(t) for t in re.findall(r">([^<]+)</text>", raw))
+                text = " ".join(html.unescape(t) for t in re.findall(r">([^<]+)</text>", raw))
+                return make_fallback_payload(text, languages, is_generated=True)
             if fpath.suffix == ".vtt":
                 lines = [l.strip() for l in raw.splitlines() if l and not l.startswith("WEBVTT") and "-->" not in l]
-                return " ".join(lines)
+                text = " ".join(lines)
+                return make_fallback_payload(text, languages, is_generated=True)
             if fpath.suffix == ".srt":
                 lines = [l.strip() for l in raw.splitlines() if l and "-->" not in l and not re.match(r"^\d+$", l)]
-                return " ".join(lines)
+                text = " ".join(lines)
+                return make_fallback_payload(text, languages, is_generated=True)
             return None
         except Exception as e:
             logger.warning("yt-dlp failed for %s: %s", video_id, e)
@@ -1056,7 +1177,7 @@ def fetch_live_instances(api_url):
 def _fetch_transcript_alternatives(video_id: str,
                                    request_id: str = "",
                                    languages: Optional[List[str]] = None,
-                                   allow_proxy: bool = True) -> str | None:
+                                   allow_proxy: bool = True) -> Optional[Dict[str, Any]]:
     """Try alternative APIs in parallel for transcript fetching."""
     t0 = time.perf_counter()
     logger.info("Attempting transcript fetch via alternative APIs", extra={
@@ -1081,7 +1202,7 @@ def _fetch_transcript_alternatives(video_id: str,
 
     MAX_HOSTS = 3
 
-    def _attempt_with_hosts(p_hosts: list[str], i_hosts: list[str], proxy_allowed: bool) -> str | None:
+    def _attempt_with_hosts(p_hosts: list[str], i_hosts: list[str], proxy_allowed: bool) -> Optional[Dict[str, Any]]:
         piped_subset = list((p_hosts or [])[:MAX_HOSTS])
         invidious_subset = list((i_hosts or [])[:MAX_HOSTS])
 
@@ -1139,7 +1260,7 @@ def _fetch_transcript_alternatives(video_id: str,
                             "duration_ms": int((time.perf_counter() - t0) * 1000),
                             "request_id": request_id
                         })
-                        return result
+                        return make_fallback_payload(result, languages, is_generated=True)
                 except Exception as e:
                     logger.warning("Transcript fetch via %s failed", future_map[future], extra={
                         "event": "transcript_step_failure",
@@ -1155,9 +1276,9 @@ def _fetch_transcript_alternatives(video_id: str,
     piped_future = discovery_executor.submit(fetch_live_instances, "https://piped-instances.kavin.rocks/")
     invidious_future = discovery_executor.submit(fetch_live_instances, "https://api.invidious.io/instances.json?sort_by=health")
     try:
-        result = _attempt_with_hosts(static_piped, static_invidious, proxy_allowed=False)
-        if result:
-            return result
+        result_payload = _attempt_with_hosts(static_piped, static_invidious, proxy_allowed=False)
+        if result_payload:
+            return result_payload
 
         use_piped: list[str] = []
         use_invidious: list[str] = []
@@ -1177,9 +1298,9 @@ def _fetch_transcript_alternatives(video_id: str,
             log_event('warning', 'transcript_instance_discovery_failed', provider='invidious', video_id=video_id, error=str(exc), request_id=request_id)
 
         if (use_piped and use_piped != static_piped) or (use_invidious and use_invidious != static_invidious):
-            result = _attempt_with_hosts(use_piped or static_piped, use_invidious or static_invidious, proxy_allowed=allow_proxy)
-            if result:
-                return result
+            result_payload = _attempt_with_hosts(use_piped or static_piped, use_invidious or static_invidious, proxy_allowed=allow_proxy)
+            if result_payload:
+                return result_payload
     finally:
         discovery_executor.shutdown(wait=False)
 
@@ -1200,7 +1321,7 @@ def get_transcript(video_id: str,
                    languages: Optional[List[str]] = None,
                    prefer_original: bool = True,
                    strict_languages: bool = False,
-                   allow_translate: bool = True) -> str:
+                   allow_translate: bool = True) -> Dict[str, Any]:
     """
     Transcript fetch logic:
     1. Try youtube-transcript-api directly (and via proxy when configured).
@@ -1241,7 +1362,7 @@ def get_transcript(video_id: str,
                     allow_translate=allow_translate
                 )
                 if txt:
-                    attempt_meta.update({"status": "success", "text_len": len(txt)})
+                    attempt_meta.update({"status": "success", "text_len": len(txt["text"])})
                     proxy_attempt_details["attempts"].append(attempt_meta)
                     logger.info("Primary transcript fetch succeeded via proxy", extra={
                         "event": "transcript_step_success",
@@ -1249,7 +1370,7 @@ def get_transcript(video_id: str,
                         "attempt": attempt,
                         "method": "youtube-transcript-api_proxy",
                         "video_id": video_id,
-                        "text_len": len(txt),
+                        "text_len": len(txt["text"]),
                         "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
                         "request_id": request_id
                     })
@@ -1258,7 +1379,7 @@ def get_transcript(video_id: str,
                         'transcript_result',
                         strategy='youtube-transcript-api_proxy',
                         video_id=video_id,
-                        text_len=len(txt),
+                        text_len=len(txt["text"]),
                         duration_ms=int((time.perf_counter() - t0_workflow) * 1000),
                         proxy_health=proxy_attempt_details,
                         request_id=request_id,
@@ -1307,7 +1428,7 @@ def get_transcript(video_id: str,
                     "step": 1,
                     "method": "youtube-transcript-api_direct",
                     "video_id": video_id,
-                    "text_len": len(txt),
+                    "text_len": len(txt["text"]),
                     "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
                     "request_id": request_id
                 })
@@ -1316,7 +1437,7 @@ def get_transcript(video_id: str,
                     'transcript_result',
                     strategy='youtube-transcript-api_direct',
                     video_id=video_id,
-                    text_len=len(txt),
+                    text_len=len(txt["text"]),
                     duration_ms=int((time.perf_counter() - t0_workflow) * 1000),
                     proxy_health=proxy_attempt_details,
                     request_id=request_id
@@ -1392,7 +1513,7 @@ def get_transcript(video_id: str,
                         'transcript_result',
                         strategy=step_name,
                         video_id=video_id,
-                        text_len=len(txt),
+                        text_len=len(txt["text"]),
                         duration_ms=int((time.perf_counter() - t0_workflow) * 1000),
                         proxy_health=proxy_attempt_details,
                         request_id=request_id
@@ -2101,7 +2222,7 @@ def get_transcript_endpoint():
     # Behavior flags
     prefer_original = (request.args.get("preferOriginal", "true").lower() == "true")
     strict_languages = (request.args.get("strictLanguages", "false").lower() == "true")
-    allow_translate = (request.args.get("allowTranslate", "true").lower() == "true")
+    allow_translate = (request.args.get("allowTranslate", "false").lower() == "true")
     # Build a language-aware cache key that respects caller intent
     cache_key = video_id
     legacy_fallback_allowed = True  # Use legacy cache key only for default English-first path
@@ -2147,32 +2268,39 @@ def get_transcript_endpoint():
         if cached == "__NOT_AVAILABLE__":
             log_event('info', 'transcript_cache_miss_marker', video_id=video_id, request_id=g.request_id)
             return jsonify({"error": "Transcript not available"}), 404
-        log_event('info', 'transcript_cache_hit', video_id=video_id, text_len=len(cached), request_id=g.request_id)
-        log_event('info', 'transcript_response_summary', video_id=video_id, cache='memory', strategy='cache', text_len=len(cached), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
-        return jsonify({"video_id": video_id, "text": cached}), 200
+        payload = ensure_payload(cached, languages)
+        if payload:
+            transcript_cache[cache_key] = payload
+            log_event('info', 'transcript_cache_hit', video_id=video_id, text_len=len(payload["text"]), request_id=g.request_id)
+            log_event('info', 'transcript_response_summary', video_id=video_id, cache='memory', strategy='cache', text_len=len(payload["text"]), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
+            return jsonify({"video_id": video_id, **payload}), 200
 
     # Try persistent cache
     with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
         # Prefer new language-aware key; fall back to legacy key only when languages not provided
         cached = db.get(cache_key)
         if cached is not None:
-            transcript_cache[cache_key] = cached
             if cached == "__NOT_AVAILABLE__":
                 log_event('info', 'transcript_persisted_not_available', video_id=video_id, request_id=g.request_id)
                 return jsonify({"error": "Transcript not available"}), 404
-            log_event('info', 'transcript_persisted_hit', video_id=video_id, text_len=len(cached), request_id=g.request_id)
-            log_event('info', 'transcript_response_summary', video_id=video_id, cache='disk', strategy='cache', text_len=len(cached), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
-            return jsonify({"video_id": video_id, "text": cached}), 200
+            payload = ensure_payload(cached, languages)
+            if payload:
+                transcript_cache[cache_key] = payload
+                log_event('info', 'transcript_persisted_hit', video_id=video_id, text_len=len(payload["text"]), request_id=g.request_id)
+                log_event('info', 'transcript_response_summary', video_id=video_id, cache='disk', strategy='cache', text_len=len(payload["text"]), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
+                return jsonify({"video_id": video_id, **payload}), 200
         if not raw_langs and legacy_fallback_allowed:
             # Legacy fallback: old key without language dimension
             legacy = db.get(video_id)
             if legacy is not None:
-                transcript_cache[video_id] = legacy
                 if legacy == "__NOT_AVAILABLE__":
                     log_event('info', 'transcript_persisted_not_available_legacy', video_id=video_id, request_id=g.request_id)
                     return jsonify({"error": "Transcript not available"}), 404
-                log_event('info', 'transcript_persisted_hit_legacy', video_id=video_id, text_len=len(legacy), request_id=g.request_id)
-                return jsonify({"video_id": video_id, "text": legacy}), 200
+                payload = ensure_payload(legacy, languages)
+                if payload:
+                    transcript_cache[cache_key] = payload
+                    log_event('info', 'transcript_persisted_hit_legacy', video_id=video_id, text_len=len(payload["text"]), request_id=g.request_id)
+                    return jsonify({"video_id": video_id, **payload}), 200
 
     # In-flight deduplication: elect a single leader to perform the fetch
     leader = False
@@ -2193,21 +2321,26 @@ def get_transcript_endpoint():
             if cached == "__NOT_AVAILABLE__":
                 log_event('info', 'transcript_cache_miss_marker', video_id=video_id, request_id=g.request_id)
                 return jsonify({"error": "Transcript not available"}), 404
-            log_event('info', 'transcript_cache_hit_after_wait', video_id=video_id, text_len=len(cached), request_id=g.request_id)
-            return jsonify({"video_id": video_id, "text": cached}), 200
+            payload = ensure_payload(cached, languages)
+            if payload:
+                transcript_cache[cache_key] = payload
+                log_event('info', 'transcript_cache_hit_after_wait', video_id=video_id, text_len=len(payload["text"]), request_id=g.request_id)
+                return jsonify({"video_id": video_id, **payload}), 200
         # Re-check persistent cache
         with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
             cached = db.get(cache_key)
             if cached is None and (not raw_langs and legacy_fallback_allowed):
                 cached = db.get(video_id)
             if cached is not None:
-                transcript_cache[cache_key] = cached
                 if cached == "__NOT_AVAILABLE__":
                     log_event('info', 'transcript_persisted_not_available_after_wait', video_id=video_id, request_id=g.request_id)
                     return jsonify({"error": "Transcript not available"}), 404
-                log_event('info', 'transcript_persisted_hit_after_wait', video_id=video_id, text_len=len(cached), request_id=g.request_id)
-                log_event('info', 'transcript_response_summary', video_id=video_id, cache='disk', strategy='cache_after_wait', text_len=len(cached), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
-                return jsonify({"video_id": video_id, "text": cached}), 200
+                payload = ensure_payload(cached, languages)
+                if payload:
+                    transcript_cache[cache_key] = payload
+                    log_event('info', 'transcript_persisted_hit_after_wait', video_id=video_id, text_len=len(payload["text"]), request_id=g.request_id)
+                    log_event('info', 'transcript_response_summary', video_id=video_id, cache='disk', strategy='cache_after_wait', text_len=len(payload["text"]), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
+                    return jsonify({"video_id": video_id, **payload}), 200
         # Fallback: proceed to fetch ourselves (rare edge when leader failed/timeout)
         log_event('warning', 'transcript_inflight_promote_to_fetch', video_id=video_id, request_id=g.request_id)
 
@@ -2221,16 +2354,16 @@ def get_transcript_endpoint():
             try:
                 # Log attempt start
                 log_event('info', 'transcript_method_attempt', method='unified_fetch', attempt=attempts + 1, video_id=video_id, request_id=g.request_id)
-                text = get_transcript(video_id, request_id=g.request_id, languages=languages,
-                                      prefer_original=prefer_original,
-                                      strict_languages=strict_languages,
-                                      allow_translate=allow_translate)
-                transcript_cache[cache_key] = text
+                payload = get_transcript(video_id, request_id=g.request_id, languages=languages,
+                                         prefer_original=prefer_original,
+                                         strict_languages=strict_languages,
+                                         allow_translate=allow_translate)
+                transcript_cache[cache_key] = payload
                 with shelve.open(PERSISTENT_TRANSCRIPT_DB) as db:
-                    db[cache_key] = text
-                log_event('info', 'transcript_fetched', video_id=video_id, text_len=len(text), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
-                log_event('info', 'transcript_response_summary', video_id=video_id, cache='miss', strategy='fresh_fetch', text_len=len(text), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
-                resp = make_response(jsonify({"video_id": video_id, "text": text}), 200)
+                    db[cache_key] = payload
+                log_event('info', 'transcript_fetched', video_id=video_id, text_len=len(payload["text"]), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
+                log_event('info', 'transcript_response_summary', video_id=video_id, cache='miss', strategy='fresh_fetch', text_len=len(payload["text"]), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
+                resp = make_response(jsonify({"video_id": video_id, **payload}), 200)
                 resp.headers['Cache-Control'] = 'public, max-age=3600'
                 return resp
             except NoTranscriptFound:
