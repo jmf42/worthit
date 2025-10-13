@@ -10,8 +10,15 @@ steps:
       - ${_IMAGE}
       - .
 
+  # Push imagen al registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - push
+      - ${_IMAGE}
+
   # Deploy a Cloud Run con esa imagen
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
     args:
       - run
       - deploy
