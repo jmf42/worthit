@@ -1,6 +1,6 @@
 Flask==3.1.1
 gunicorn>=21.2.0
-youtube-transcript-api==1.1.0   # versión estable con objetos
+youtube-transcript-api==1.1.0
 Werkzeug==3.1.3
 requests==2.32.3
 urllib3==2.3.0
@@ -13,7 +13,5 @@ click==8.1.8
 idna==3.10
 Jinja2==3.1.5
 MarkupSafe==3.0.2
-vaderSentiment==3.3.2
-youtube-comment-downloader==0.1.76 
-sqlitedict>=2.1
-yt-dlp==2025.06.25
+youtube-comment-downloader==0.1.76
+openai>=1.0.0
