@@ -12,7 +12,7 @@ import pathlib
 from typing import List, Optional, Dict, Any
 from functools import lru_cache
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError, Future
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 from flask import Flask, request, jsonify, g, make_response
 import uuid
@@ -78,9 +78,6 @@ TRANSCRIPT_LANGS = [
         "en,hi,es,pt,id,ja,ru,ar,bn,tr,de,fr,vi,ko,th"
     ).split(",") if c.strip()
 ]
-TRANSCRIPT_PRIMARY_LANG_LIMIT = max(int(os.getenv("TRANSCRIPT_PRIMARY_LANG_LIMIT", "2")), 1)
-TRANSCRIPT_LANG_EXPANSION_LIMIT = max(int(os.getenv("TRANSCRIPT_LANG_EXPANSION_LIMIT", "6")), 1)
-TRANSCRIPT_FALLBACK_DELAY_SEC = max(float(os.getenv("TRANSCRIPT_FALLBACK_DELAY_SEC", "3")), 0.5)
 # (Deprecated) TRANSCRIPT_HTTP_TIMEOUT was unused; per-request timeouts are set on sessions.
 COMMENT_CACHE_SIZE = int(os.getenv("COMMENT_CACHE_SIZE", "150"))
 COMMENT_CACHE_TTL = int(os.getenv("COMMENT_CACHE_TTL", "7200")) # 2 hours
@@ -141,19 +138,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # --- Thread-local session reuse for youtube-transcript-api ------------------
 _thread_local_ytt_session = threading.local()
 
-class _TimeoutSession(requests.Session):
-    def __init__(self, timeout: float):
-        super().__init__()
-        self._default_timeout = timeout
-
-    def request(self, *args, **kwargs):
-        if "timeout" not in kwargs or kwargs["timeout"] is None:
-            kwargs["timeout"] = self._default_timeout
-        return super().request(*args, **kwargs)
-
 def _build_ytt_session() -> requests.Session:
-    default_timeout = float(os.getenv("YTT_REQUEST_TIMEOUT", "15"))
-    session = _TimeoutSession(default_timeout)
+    session = requests.Session()
     retry_total = int(os.getenv("YTT_SESSION_RETRY_TOTAL", "3"))
     backoff = float(os.getenv("YTT_SESSION_BACKOFF", "0.5"))
     pool_connections = int(os.getenv("YTT_SESSION_POOL_CONNECTIONS", "20"))
@@ -209,11 +195,10 @@ def make_fallback_payload(
     languages: Optional[List[str]],
     is_generated: bool,
 ) -> Dict[str, Any]:
-    limited = limit_languages(languages)
     code = "unknown"
     label = "unknown"
-    if limited:
-        base = (limited[0] or "").strip()
+    if languages:
+        base = (languages[0] or "").strip()
         if base:
             code = base.split("-")[0] or base
             label = base
@@ -390,7 +375,6 @@ def timedtext_try_languages(video_id: str,
     # Default to configured preferences if caller provided none
     if not languages:
         languages = TRANSCRIPT_LANGS
-    languages = limit_languages(languages)
     # Build base language set (e.g., 'es' from 'es-419') preserving order
     base_langs: list[str] = []
     seen = set()
@@ -561,16 +545,7 @@ def _full_url() -> str:
         return ""
 
 def log_event(level: str, event: str, include_http: bool = False, **fields):
-    # Safe access to request context
-    request_id = None
-    try:
-        from flask import has_request_context
-        if has_request_context():
-            request_id = getattr(g, 'request_id', None)
-    except:
-        pass  # Not in request context
-    
-    structured = {"event": event, "request_id": request_id, **fields}
+    structured = {"event": event, "request_id": getattr(g, 'request_id', None), **fields}
     # Attach httpRequest per Google format when requested
     if include_http and request is not None:
         http = {
@@ -763,19 +738,15 @@ def expand_preferred_langs(codes: Optional[List[str]], force_en_first: bool = Fa
         ordered.remove('en')
         ordered.insert(0, 'en')
     # 3) Expand variants
-    expanded: list[str] = []
-    seen_variants: set[str] = set()
+    out = []
+    seen = set()
     for c in ordered:
         variants = mapping.get(c, [c])
         for v in variants:
-            if v not in seen_variants:
-                expanded.append(v)
-                seen_variants.add(v)
-        if len(expanded) >= TRANSCRIPT_LANG_EXPANSION_LIMIT:
-            break
-    if not expanded:
-        expanded = ordered[:TRANSCRIPT_LANG_EXPANSION_LIMIT]
-    return expanded
+            if v not in seen:
+                out.append(v)
+                seen.add(v)
+    return out
 
 # --- Accept-Language parsing helper ---
 def _parse_accept_language_header(header_val: str | None) -> list[str]:
@@ -804,23 +775,6 @@ def _parse_accept_language_header(header_val: str | None) -> list[str]:
         return []
     return out
 
-
-def limit_languages(langs: Optional[List[str]]) -> List[str]:
-    """Deduplicate and clamp the language list to the configured expansion limit."""
-    if not langs:
-        return []
-    limited: List[str] = []
-    seen: set[str] = set()
-    for code in langs:
-        code = (code or "").strip()
-        if not code or code in seen:
-            continue
-        limited.append(code)
-        seen.add(code)
-        if len(limited) >= TRANSCRIPT_LANG_EXPANSION_LIMIT:
-            break
-    return limited
-
 # --- yt-dlp Helper ---
 _YDL_OPTS_BASE = {
     "quiet": True, "skip_download": True, "extract_flat": "discard_in_playlist",
@@ -839,14 +793,7 @@ WS_PASS = os.getenv("WEBSHARE_PASS")
 GEN_HTTP = os.getenv("PROXY_HTTP_URL") or os.getenv("HTTP_PROXY")
 GEN_HTTPS = os.getenv("PROXY_HTTPS_URL") or os.getenv("HTTPS_PROXY")
 
-# Enhanced proxy configuration with better error handling and logging
-PROXY_TIMEOUT = int(os.getenv("PROXY_TIMEOUT", "30"))
-PROXY_MAX_RETRIES = int(os.getenv("PROXY_MAX_RETRIES", "3"))
-PROXY_ROTATION_ENABLED = os.getenv("PROXY_ROTATION_ENABLED", "true").lower() == "true"
-
 PROXY_CFG = None
-PROXY_CONFIG_TYPE = "none"
-
 if GEN_HTTP or GEN_HTTPS:
     try:
         from youtube_transcript_api.proxies import GenericProxyConfig
@@ -854,30 +801,20 @@ if GEN_HTTP or GEN_HTTPS:
             http_url=GEN_HTTP or GEN_HTTPS,
             https_url=GEN_HTTPS or GEN_HTTP,
         )
-        PROXY_CONFIG_TYPE = "generic"
-        logger.info("✅ Using GenericProxyConfig (http=%s, https=%s, timeout=%ds)", 
-                   bool(GEN_HTTP), bool(GEN_HTTPS), PROXY_TIMEOUT)
+        logger.info("Using GenericProxyConfig (http=%s, https=%s)", bool(GEN_HTTP), bool(GEN_HTTPS))
     except Exception as e:
-        logger.warning("❌ Failed to create GenericProxyConfig: %s", e)
-        PROXY_CFG = None
+        logger.warning("Failed to create GenericProxyConfig: %s", e)
 elif WS_USER and WS_PASS:
-    try:
-        if not WS_USER.endswith("-rotate") and PROXY_ROTATION_ENABLED:
-            WS_USER = f"{WS_USER}-rotate"
-        
-        from youtube_transcript_api.proxies import WebshareProxyConfig
-        PROXY_CFG = WebshareProxyConfig(
-            proxy_username=WS_USER,
-            proxy_password=WS_PASS
-        )
-        PROXY_CONFIG_TYPE = "webshare"
-        logger.info("✅ Using Webshare rotating residential proxies (username=%s, rotation=%s, timeout=%ds)", 
-                   WS_USER, PROXY_ROTATION_ENABLED, PROXY_TIMEOUT)
-    except Exception as e:
-        logger.warning("❌ Failed to create WebshareProxyConfig: %s", e)
-        PROXY_CFG = None
+    if not WS_USER.endswith("-rotate"):
+        WS_USER = f"{WS_USER}-rotate"
+    from youtube_transcript_api.proxies import WebshareProxyConfig
+    PROXY_CFG = WebshareProxyConfig(
+        proxy_username=WS_USER,
+        proxy_password=WS_PASS
+    )
+    logger.info("Using Webshare rotating residential proxies (username=%s)", WS_USER)
 else:
-    logger.info("ℹ️ No proxy credentials – transcript requests will go direct")
+    logger.info("No proxy credentials – transcript requests will go direct")
 
 # ---------------------------------------------------------------------------
 # Helper – build a single rotating Webshare gateway URL
@@ -912,133 +849,44 @@ def fetch_api_once(video_id: str,
                    prefer_original: bool = True,
                    strict_languages: bool = False,
                    allow_translate: bool = True) -> Optional[Dict[str, Any]]:
-    """Enhanced single attempt using youtube-transcript-api with better proxy handling."""
+    """Single attempt using youtube-transcript-api. Returns plain text or None."""
     t0 = time.perf_counter()
-    
     # Respect caller languages; if none, expand defaults with English-first
     languages_final = languages if languages else expand_preferred_langs(TRANSCRIPT_LANGS, force_en_first=True)
-    languages_final = [lang for lang in languages_final if lang]
-    primary_languages = languages_final[:TRANSCRIPT_PRIMARY_LANG_LIMIT] if languages_final else []
-    
-    # Enhanced logging with proxy details
-    proxy_info = {
-        "is_configured": proxy_cfg is not None,
-        "type": type(proxy_cfg).__name__ if proxy_cfg else None,
-        "config_type": PROXY_CONFIG_TYPE,
-        "timeout": timeout,
-        "max_retries": PROXY_MAX_RETRIES
-    }
-    
     log_event('info', 'transcript_method_attempt', extra={
         "method": "youtube-transcript-api",
         "video_id": video_id,
         "languages": languages_final,
-        "proxy_config": proxy_info,
+        "proxy_config": {
+            "is_configured": proxy_cfg is not None,
+            "type": type(proxy_cfg).__name__ if proxy_cfg else None
+        },
+        "timeout": timeout,
         "request_id": request_id
     })
     
-    try:
-        # Build Accept-Language header with q-values
-        accept_lang = ", ".join(f"{code};q={1.0 - (idx*0.1):.1f}" for idx, code in enumerate(languages_final[:5]))
-        user_agent = random.choice(USER_AGENTS)
-        
-        # Create HTTP client with enhanced configuration
-        http_client = get_thread_local_ytt_session(
-            user_agent=user_agent, 
-            accept_language=accept_lang,
-            timeout=timeout
-        )
-        
-        # Initialize YouTube Transcript API with proxy configuration
-        ytt_api = YouTubeTranscriptApi(
-            http_client=http_client, 
-            proxy_config=proxy_cfg
-        )
-        
-        logger.info("🔧 Initialized YouTube Transcript API", extra={
-            "event": "youtube_api_init",
-            "video_id": video_id,
-            "proxy_configured": proxy_cfg is not None,
-            "proxy_type": type(proxy_cfg).__name__ if proxy_cfg else "none",
-            "languages_requested": len(languages_final),
-            "request_id": request_id
-        })
-        
-    except Exception as e:
-        logger.error("❌ Failed to initialize YouTube Transcript API", extra={
-            "event": "youtube_api_init_failed",
-            "video_id": video_id,
-            "error": str(e),
-            "error_type": type(e).__name__,
-            "proxy_configured": proxy_cfg is not None,
-            "request_id": request_id
-        }, exc_info=True)
-        return None
-    if primary_languages:
-        t_quick = time.perf_counter()
-        log_event('info', 'transcript_method_attempt', extra={
-            "method": "youtube-transcript-api_quick",
-            "video_id": video_id,
-            "languages": primary_languages,
-            "proxy_config": {
-                "is_configured": proxy_cfg is not None,
-                "type": type(proxy_cfg).__name__ if proxy_cfg else None
-            },
-            "request_id": request_id
-        })
-        try:
-            quick_segments = ytt_api.get_transcript(video_id, languages=primary_languages)
-            quick_text = " ".join(
-                (seg.get("text", "").strip() if isinstance(seg, dict) else getattr(seg, "text", "").strip())
-                for seg in quick_segments
-            ).strip()
-            if quick_text:
-                payload = make_transcript_payload(
-                    quick_text,
-                    primary_languages[0],
-                    primary_languages[0],
-                    is_generated=False,
-                    tracks=[]
-                )
-                log_event('info', 'transcript_method_success', extra={
-                    "method": "youtube-transcript-api_quick",
-                    "video_id": video_id,
-                    "text_len": len(quick_text),
-                    "language_detected": payload["language"]["code"],
-                    "duration_ms": int((time.perf_counter() - t_quick) * 1000),
-                    "request_id": request_id
-                })
-                return payload
-        except NoTranscriptFound:
-            pass
-        except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
-            log_event('warning', 'transcript_method_failure', extra={
-                "method": "youtube-transcript-api_quick",
-                "video_id": video_id,
-                "reason": str(e),
-                "error_type": type(e).__name__,
-                "languages_attempted": primary_languages,
-                "proxy_used": proxy_cfg is not None,
-                "duration_ms": int((time.perf_counter() - t_quick) * 1000),
-                "request_id": request_id
-            })
-        except Exception as e:
-            log_event('error', 'transcript_method_failure', extra={
-                "method": "youtube-transcript-api_quick",
-                "video_id": video_id,
-                "reason": str(e),
-                "languages_attempted": primary_languages,
-                "proxy_used": proxy_cfg is not None,
-                "duration_ms": int((time.perf_counter() - t_quick) * 1000),
-                "request_id": request_id
-            }, exc_info=LOG_LEVEL == "DEBUG")
-
+    # Build Accept-Language header with q-values
+    accept_lang = ", ".join(f"{code};q={1.0 - (idx*0.1):.1f}" for idx, code in enumerate(languages_final[:5]))
+    user_agent = random.choice(USER_AGENTS)
+    http_client = get_thread_local_ytt_session(user_agent=user_agent, accept_language=accept_lang)
+    ytt_api = YouTubeTranscriptApi(http_client=http_client, proxy_config=proxy_cfg)
     selected_transcript = None
+    track_manifest: List[Dict[str, Any]] = []
     try:
         # Prefer list-based selection for finer control. Fallback to simple fetch if list is unavailable.
         if hasattr(ytt_api, 'list'):
             tl = ytt_api.list(video_id)
             ft = None
+            track_manifest = [
+                {
+                    "code": getattr(tr, "language_code", "unknown"),
+                    "label": getattr(tr, "language", getattr(tr, "language_code", "unknown")),
+                    "is_generated": getattr(tr, "is_generated", False),
+                    "is_translatable": getattr(tr, "is_translatable", False),
+                    "base_url": getattr(tr, "_url", ""),
+                }
+                for tr in tl
+            ]
 
             def fetch_from_transcript(transcript_obj) -> Optional[Any]:
                 nonlocal selected_transcript
@@ -1092,7 +940,7 @@ def fetch_api_once(video_id: str,
             if ft is None and allow_translate and languages_final:
                 t_any = next(iter(tl), None)
                 if t_any is None:
-                    raise NoTranscriptFound(video_id, languages_final, None)
+                    raise NoTranscriptFound
                 if getattr(t_any, 'is_translatable', False):
                     translated = None
                     for lang in languages_final:
@@ -1157,6 +1005,7 @@ def fetch_api_once(video_id: str,
         language_code or "unknown",
         language_label or language_code or "unknown",
         bool(is_generated),
+        track_manifest,
     )
 
     log_event('info', 'transcript_method_success', extra={
@@ -1187,7 +1036,7 @@ def fetch_ytdlp(video_id: str,
         "request_id": request_id
     })
     # Map desired language codes into yt-dlp subtitle patterns (include auto and manual variants)
-    lang_list = limit_languages(languages) or limit_languages(TRANSCRIPT_LANGS)
+    lang_list = languages or TRANSCRIPT_LANGS
     sub_langs: List[str] = []
     for code in lang_list:
         c = (code or "").strip()
@@ -1218,11 +1067,10 @@ def fetch_ytdlp(video_id: str,
     if YTDL_COOKIE_FILE:
         opts["cookiefile"] = YTDL_COOKIE_FILE
     # Ensure English is always a last‑resort subtitle option
-    base_langs = limit_languages(languages) or []
-    if "en" not in base_langs:
-        langs = base_langs + ["en"]
+    if "en" not in (languages or []):
+        langs = (languages or []) + ["en"]
     else:
-        langs = base_langs
+        langs = (languages or [])
     # Expand subtitle patterns accordingly
     sub_langs = []
     for code in langs:
@@ -1249,15 +1097,15 @@ def fetch_ytdlp(video_id: str,
             raw = fpath.read_text(encoding="utf-8", errors="ignore")
             if fpath.suffix == ".srv3" or "<text" in raw:
                 text = " ".join(html.unescape(t) for t in re.findall(r">([^<]+)</text>", raw))
-                return make_fallback_payload(text, base_langs, is_generated=True)
+                return make_fallback_payload(text, languages, is_generated=True)
             if fpath.suffix == ".vtt":
                 lines = [l.strip() for l in raw.splitlines() if l and not l.startswith("WEBVTT") and "-->" not in l]
                 text = " ".join(lines)
-                return make_fallback_payload(text, base_langs, is_generated=True)
+                return make_fallback_payload(text, languages, is_generated=True)
             if fpath.suffix == ".srt":
                 lines = [l.strip() for l in raw.splitlines() if l and "-->" not in l and not re.match(r"^\d+$", l)]
                 text = " ".join(lines)
-                return make_fallback_payload(text, base_langs, is_generated=True)
+                return make_fallback_payload(text, languages, is_generated=True)
             return None
         except Exception as e:
             logger.warning("yt-dlp failed for %s: %s", video_id, e)
@@ -1487,146 +1335,84 @@ def get_transcript(video_id: str,
         "request_id": request_id
     })
 
-    proxy_url = _gateway_url() if PROXY_CFG is not None else None
-    proxy_attempt_details: dict[str, Any] = {
-        "proxy_configured": PROXY_CFG is not None,
-        "proxy_url": proxy_url,
-        "attempts": []
-    }
-    if PROXY_CFG is not None and proxy_url is None:
-        log_event('warning', 'proxy_url_missing', video_id=video_id, request_id=request_id)
+    proxy_attempt_details: dict | None = None
 
-    def run_primary_attempt() -> Optional[Dict[str, Any]]:
-        if PROXY_CFG is not None:
-            max_proxy_attempts = PROXY_MAX_RETRIES
-            logger.info("🚀 Starting proxy attempts", extra={
-                "event": "proxy_attempts_start",
-                "video_id": video_id,
-                "max_attempts": max_proxy_attempts,
-                "proxy_type": PROXY_CONFIG_TYPE,
-                "request_id": request_id
-            })
-            
-            for attempt in range(1, max_proxy_attempts + 1):
-                attempt_meta: dict[str, Any] = {"attempt": attempt}
-                attempt_start = time.perf_counter()
-                
-                try:
-                    logger.info("🔄 Proxy attempt %d/%d", attempt, max_proxy_attempts, extra={
-                        "event": "proxy_attempt_start",
-                        "video_id": video_id,
+    # Step 1: Attempt youtube-transcript-api through configured proxy first
+    if PROXY_CFG is not None:
+        proxy_url = _gateway_url()
+        proxy_attempt_details = {
+            "proxy_configured": True,
+            "proxy_url": proxy_url,
+            "attempts": []
+        }
+        if proxy_url is None:
+            log_event('warning', 'proxy_url_missing', video_id=video_id, request_id=request_id)
+
+        max_proxy_attempts = 2
+        for attempt in range(1, max_proxy_attempts + 1):
+            attempt_meta = {"attempt": attempt}
+            try:
+                txt = fetch_api_once(
+                    video_id,
+                    PROXY_CFG,
+                    languages=languages,
+                    request_id=request_id,
+                    prefer_original=prefer_original,
+                    strict_languages=strict_languages,
+                    allow_translate=allow_translate
+                )
+                if txt:
+                    attempt_meta.update({"status": "success", "text_len": len(txt["text"])})
+                    proxy_attempt_details["attempts"].append(attempt_meta)
+                    logger.info("Primary transcript fetch succeeded via proxy", extra={
+                        "event": "transcript_step_success",
+                        "step": 1,
                         "attempt": attempt,
-                        "max_attempts": max_proxy_attempts,
-                        "proxy_type": PROXY_CONFIG_TYPE,
+                        "method": "youtube-transcript-api_proxy",
+                        "video_id": video_id,
+                        "text_len": len(txt["text"]),
+                        "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
                         "request_id": request_id
                     })
-                    
-                    txt = fetch_api_once(
-                        video_id,
-                        PROXY_CFG,
-                        languages=languages,
+                    log_event(
+                        'info',
+                        'transcript_result',
+                        strategy='youtube-transcript-api_proxy',
+                        video_id=video_id,
+                        text_len=len(txt["text"]),
+                        duration_ms=int((time.perf_counter() - t0_workflow) * 1000),
+                        proxy_health=proxy_attempt_details,
                         request_id=request_id,
-                        prefer_original=prefer_original,
-                        strict_languages=strict_languages,
-                        allow_translate=allow_translate,
-                        timeout=PROXY_TIMEOUT
+                        attempt=attempt
                     )
-                    
-                    if txt:
-                        attempt_duration = int((time.perf_counter() - attempt_start) * 1000)
-                        attempt_meta.update({"status": "success", "text_len": len(txt["text"]), "duration_ms": attempt_duration})
-                        proxy_attempt_details["attempts"].append(attempt_meta)
-                        
-                        logger.info("✅ Proxy attempt %d succeeded", attempt, extra={
-                            "event": "transcript_step_success",
-                            "step": 1,
-                            "attempt": attempt,
-                            "method": "youtube-transcript-api_proxy",
-                            "video_id": video_id,
-                            "text_len": len(txt["text"]),
-                            "duration_ms": attempt_duration,
-                            "proxy_type": PROXY_CONFIG_TYPE,
-                            "request_id": request_id
-                        })
-                        return txt
-                    
-                    # Empty response
-                    attempt_duration = int((time.perf_counter() - attempt_start) * 1000)
-                    attempt_meta.update({"status": "empty", "duration_ms": attempt_duration})
-                    proxy_attempt_details["attempts"].append(attempt_meta)
-                    
-                    logger.info("⚠️ Proxy attempt %d returned no transcript", attempt, extra={
-                        "event": "transcript_step_failure",
-                        "step": 1,
-                        "attempt": attempt,
-                        "method": "youtube-transcript-api_proxy",
-                        "video_id": video_id,
-                        "reason": "No transcript found",
-                        "duration_ms": attempt_duration,
-                        "proxy_type": PROXY_CONFIG_TYPE,
-                        "request_id": request_id
-                    })
-                    
-                except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
-                    attempt_duration = int((time.perf_counter() - attempt_start) * 1000)
-                    attempt_meta.update({"status": "error", "error": str(e), "duration_ms": attempt_duration})
-                    proxy_attempt_details["attempts"].append(attempt_meta)
-                    
-                    logger.warning("🚫 Proxy attempt %d blocked or failed: %s", attempt, str(e), extra={
-                        "event": "transcript_step_failure",
-                        "step": 1,
-                        "attempt": attempt,
-                        "method": "youtube-transcript-api_proxy",
-                        "video_id": video_id,
-                        "reason": str(e),
-                        "duration_ms": attempt_duration,
-                        "proxy_type": PROXY_CONFIG_TYPE,
-                        "request_id": request_id
-                    })
-                    
-                    # For certain errors, don't retry
-                    if isinstance(e, (VideoUnavailable, AgeRestricted, TranscriptsDisabled)):
-                        logger.info("🛑 Non-retryable error detected, stopping proxy attempts")
-                        break
-                        
-                except Exception as exc:
-                    attempt_duration = int((time.perf_counter() - attempt_start) * 1000)
-                    attempt_meta.update({"status": "error", "error": str(exc), "duration_ms": attempt_duration})
-                    proxy_attempt_details["attempts"].append(attempt_meta)
-                    
-                    logger.warning("💥 Proxy attempt %d raised unexpected exception: %s", attempt, str(exc), extra={
-                        "event": "transcript_step_failure",
-                        "step": 1,
-                        "attempt": attempt,
-                        "method": "youtube-transcript-api_proxy",
-                        "video_id": video_id,
-                        "reason": str(exc),
-                        "duration_ms": attempt_duration,
-                        "proxy_type": PROXY_CONFIG_TYPE,
-                        "request_id": request_id
-                    })
-                
-                # Brief delay between attempts (except on last attempt)
-                if attempt < max_proxy_attempts:
-                    delay = min(1.0 * attempt, 3.0)  # Exponential backoff, max 3s
-                    time.sleep(delay)
-            
-            logger.warning("❌ All proxy attempts failed", extra={
-                "event": "proxy_attempts_exhausted",
-                "video_id": video_id,
-                "total_attempts": max_proxy_attempts,
-                "proxy_type": PROXY_CONFIG_TYPE,
-                "request_id": request_id
-            })
-            return None
-        # Direct (no proxy) path - enhanced fallback
+                    return txt
+                attempt_meta.update({"status": "empty"})
+                proxy_attempt_details["attempts"].append(attempt_meta)
+                logger.info("Proxy attempt %d returned no transcript", attempt, extra={
+                    "event": "transcript_step_failure",
+                    "step": 1,
+                    "attempt": attempt,
+                    "method": "youtube-transcript-api_proxy",
+                    "video_id": video_id,
+                    "reason": "No transcript found",
+                    "request_id": request_id
+                })
+            except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
+                attempt_meta.update({"status": "error", "error": str(e)})
+                proxy_attempt_details["attempts"].append(attempt_meta)
+                logger.warning("Proxy attempt %d blocked or failed", attempt, extra={
+                    "event": "transcript_step_failure",
+                    "step": 1,
+                    "attempt": attempt,
+                    "method": "youtube-transcript-api_proxy",
+                    "video_id": video_id,
+                    "reason": str(e),
+                    "request_id": request_id
+                })
+    else:
+        proxy_attempt_details = {"proxy_configured": False}
+
         try:
-            logger.info("🔄 Attempting direct connection (no proxy)", extra={
-                "event": "direct_attempt_start",
-                "video_id": video_id,
-                "request_id": request_id
-            })
-            
             txt = fetch_api_once(
                 video_id,
                 None,
@@ -1634,12 +1420,10 @@ def get_transcript(video_id: str,
                 languages=languages,
                 prefer_original=prefer_original,
                 strict_languages=strict_languages,
-                allow_translate=allow_translate,
-                timeout=PROXY_TIMEOUT
+                allow_translate=allow_translate
             )
-            
             if txt:
-                logger.info("✅ Direct connection succeeded", extra={
+                logger.info("Primary transcript fetch succeeded", extra={
                     "event": "transcript_step_success",
                     "step": 1,
                     "method": "youtube-transcript-api_direct",
@@ -1648,16 +1432,25 @@ def get_transcript(video_id: str,
                     "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
                     "request_id": request_id
                 })
+                log_event(
+                    'info',
+                    'transcript_result',
+                    strategy='youtube-transcript-api_direct',
+                    video_id=video_id,
+                    text_len=len(txt["text"]),
+                    duration_ms=int((time.perf_counter() - t0_workflow) * 1000),
+                    proxy_health=proxy_attempt_details,
+                    request_id=request_id
+                )
                 return txt
-            else:
-                logger.info("⚠️ Direct connection returned no transcript", extra={
-                    "event": "transcript_step_failure",
-                    "step": 1,
-                    "method": "youtube-transcript-api_direct",
-                    "video_id": video_id,
-                    "reason": "No transcript found",
-                    "request_id": request_id
-                })
+            logger.info("Primary transcript fetch failed (no transcript found)", extra={
+                "event": "transcript_step_failure",
+                "step": 1,
+                "method": "youtube-transcript-api_direct",
+                "video_id": video_id,
+                "reason": "No transcript found",
+                "request_id": request_id
+            })
         except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
             logger.warning("Primary transcript fetch blocked or failed (direct)", extra={
                 "event": "transcript_step_failure",
@@ -1667,16 +1460,6 @@ def get_transcript(video_id: str,
                 "reason": str(e),
                 "request_id": request_id
             })
-        except Exception as exc:
-            logger.warning("Primary transcript fetch raised unexpected exception (direct)", extra={
-                "event": "transcript_step_failure",
-                "step": 1,
-                "method": "youtube-transcript-api_direct",
-                "video_id": video_id,
-                "reason": str(exc),
-                "request_id": request_id
-            })
-        return None
 
     # Step 2+: Run remaining fallbacks in parallel (timedtext, alt APIs, yt-dlp no-proxy)
     fallback_attempts = [
@@ -1705,94 +1488,45 @@ def get_transcript(video_id: str,
         ),
     ]
 
-    with ThreadPoolExecutor(max_workers=1 + len(fallback_attempts)) as executor:
-        future_map: dict[Future, tuple[str, str]] = {}
-        pending: set[Future] = set()
-
-        proxy_future = executor.submit(run_primary_attempt)
-        future_map[proxy_future] = ("primary", "proxy" if PROXY_CFG is not None else "direct")
-        pending.add(proxy_future)
-        fallback_started = False
-
-        def launch_fallbacks():
-            nonlocal fallback_started
-            if fallback_started:
-                return
-            fallback_started = True
-            log_event('info', 'transcript_fallbacks_triggered', video_id=video_id, request_id=request_id)
-            for name, fn in fallback_attempts:
-                future = executor.submit(fn)
-                future_map[future] = ("fallback", name)
-                pending.add(future)
-
+    with ThreadPoolExecutor(max_workers=len(fallback_attempts)) as executor:
+        future_map = {executor.submit(fn): {"step": name} for name, fn in fallback_attempts}
         try:
-            primary_result = proxy_future.result(timeout=TRANSCRIPT_FALLBACK_DELAY_SEC)
-            pending.discard(proxy_future)
-            if primary_result:
-                log_event(
-                    'info',
-                    'transcript_result',
-                    strategy='youtube-transcript-api_proxy' if PROXY_CFG is not None else 'youtube-transcript-api_direct',
-                    video_id=video_id,
-                    text_len=len(primary_result["text"]),
-                    duration_ms=int((time.perf_counter() - t0_workflow) * 1000),
-                    proxy_health=proxy_attempt_details,
-                    request_id=request_id
-                )
-                return primary_result
-            launch_fallbacks()
+            for future in as_completed(future_map, timeout=12):
+                info = future_map[future]
+                step_name = info.get("step")
+                try:
+                    txt = future.result()
+                except Exception as exc:
+                    log_event(
+                        'warning',
+                        'transcript_strategy_exception',
+                        strategy=step_name,
+                        video_id=video_id,
+                        error=str(exc),
+                        request_id=request_id,
+                        proxy_health=proxy_attempt_details
+                    )
+                    continue
+                if txt:
+                    log_event(
+                        'info',
+                        'transcript_result',
+                        strategy=step_name,
+                        video_id=video_id,
+                        text_len=len(txt["text"]),
+                        duration_ms=int((time.perf_counter() - t0_workflow) * 1000),
+                        proxy_health=proxy_attempt_details,
+                        request_id=request_id
+                    )
+                    return txt
         except TimeoutError:
             log_event(
                 'warning',
-                'transcript_primary_slow',
+                'transcript_fallback_timeout',
                 video_id=video_id,
                 request_id=request_id,
-                wait_ms=int(TRANSCRIPT_FALLBACK_DELAY_SEC * 1000)
+                steps=[info.get("step") for info in future_map.values()]
             )
-            launch_fallbacks()
-        except Exception as exc:
-            pending.discard(proxy_future)
-            log_event(
-                'warning',
-                'transcript_primary_exception',
-                video_id=video_id,
-                request_id=request_id,
-                error=str(exc)
-            )
-            launch_fallbacks()
-
-        while pending:
-            future = next(as_completed(pending))
-            pending.discard(future)
-            mode, name = future_map.get(future, ("fallback", "unknown"))
-            try:
-                txt = future.result()
-            except Exception as exc:
-                if mode == "primary":
-                    log_event('warning', 'transcript_primary_exception', video_id=video_id, request_id=request_id, error=str(exc))
-                else:
-                    log_event('warning', 'transcript_strategy_exception', strategy=name, video_id=video_id, error=str(exc), request_id=request_id, proxy_health=proxy_attempt_details)
-                if not fallback_started:
-                    launch_fallbacks()
-                continue
-
-            if not txt:
-                if not fallback_started and mode == "primary":
-                    launch_fallbacks()
-                continue
-
-            strategy_label = name if mode == "fallback" else ('youtube-transcript-api_proxy' if PROXY_CFG is not None else 'youtube-transcript-api_direct')
-            log_event(
-                'info',
-                'transcript_result',
-                strategy=strategy_label,
-                video_id=video_id,
-                text_len=len(txt["text"]),
-                duration_ms=int((time.perf_counter() - t0_workflow) * 1000),
-                proxy_health=proxy_attempt_details,
-                request_id=request_id
-            )
-            return txt
 
     # If all fail
     logger.warning("❌ All transcript fetch methods FAILED.", extra={
@@ -1801,7 +1535,7 @@ def get_transcript(video_id: str,
         "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
         "request_id": request_id
     })
-    raise NoTranscriptFound(video_id, languages or [], None)
+    raise NoTranscriptFound
 
 # --- Transcript Fallback Helpers ---
 def _strip_tags(text: str) -> str:
@@ -1822,7 +1556,7 @@ def _piped_captions_direct(video_id: str,
         logger.warning("No Piped hosts available for direct captions for %s", video_id)
         return None
 
-    prefs = [c.strip().lower() for c in (limit_languages(languages) or limit_languages(TRANSCRIPT_LANGS))]
+    prefs = [c.strip().lower() for c in (languages or TRANSCRIPT_LANGS)]
 
     def _fetch_from_host(host: str) -> str | None:
         try:
@@ -1889,7 +1623,7 @@ def _piped_captions(video_id: str,
         logger.warning("No Piped hosts available for fallback captions for %s", video_id)
         return None
 
-    prefs = [c.strip().lower() for c in (limit_languages(languages) or limit_languages(TRANSCRIPT_LANGS))]
+    prefs = [c.strip().lower() for c in (languages or TRANSCRIPT_LANGS)]
 
     def _fetch_from_host(host: str) -> str | None:
         try:
@@ -1964,7 +1698,7 @@ def _invidious_captions(video_id: str,
         logger.warning("No Invidious hosts available for captions for %s", video_id)
         return None
 
-    prefs = [c.strip().lower() for c in (limit_languages(languages) or limit_languages(TRANSCRIPT_LANGS))]
+    prefs = [c.strip().lower() for c in (languages or TRANSCRIPT_LANGS)]
 
     def _fetch_from_host(host: str) -> str | None:
         try:
@@ -2523,8 +2257,6 @@ def get_transcript_endpoint():
             # Default behavior: English-first expansion, keep legacy cache key for compatibility
             languages = expand_preferred_langs(TRANSCRIPT_LANGS, force_en_first=True)
 
-    languages = limit_languages(languages)
-
     # Log the start of transcript fetching
     log_event('info', 'transcript_fetch_workflow_start', video_id=video_id, languages=languages or TRANSCRIPT_LANGS,
               prefer_original=prefer_original, strict_languages=strict_languages, allow_translate=allow_translate,
@@ -2917,46 +2649,6 @@ def health():
     """JSON uptime check"""
     uptime = round(time.time() - app_start_time)
     return jsonify({"status": "ok", "uptime": uptime}), 200
-
-@app.route("/_proxy-health", methods=["GET"])
-def proxy_health():
-    """Proxy connectivity health check"""
-    health_info = {
-        "proxy_configured": PROXY_CFG is not None,
-        "proxy_type": PROXY_CONFIG_TYPE,
-        "proxy_timeout": PROXY_TIMEOUT,
-        "proxy_max_retries": PROXY_MAX_RETRIES,
-        "proxy_rotation_enabled": PROXY_ROTATION_ENABLED,
-        "status": "ok" if PROXY_CFG is not None else "no_proxy"
-    }
-    
-    if PROXY_CFG is not None:
-        try:
-            # Test basic connectivity with a simple video
-            test_video_id = "dQw4w9WgXcQ"  # Rick Roll - should have transcripts
-            start_time = time.perf_counter()
-            
-            # Quick test without full transcript processing
-            from youtube_transcript_api import YouTubeTranscriptApi
-            transcripts = YouTubeTranscriptApi.list_transcripts(test_video_id)
-            available_langs = [t.language_code for t in transcripts]
-            
-            health_info.update({
-                "test_video_id": test_video_id,
-                "test_success": True,
-                "available_languages": available_langs,
-                "test_duration_ms": int((time.perf_counter() - start_time) * 1000)
-            })
-            
-        except Exception as e:
-            health_info.update({
-                "test_video_id": test_video_id,
-                "test_success": False,
-                "test_error": str(e),
-                "test_duration_ms": int((time.perf_counter() - start_time) * 1000)
-            })
-    
-    return jsonify(health_info), 200
 
 def _send_static_multi(filename: str):
     base = pathlib.Path(__file__).resolve().parent
