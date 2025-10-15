@@ -79,6 +79,14 @@ TIMEOUT_OPENAI  = float(os.getenv("TIMEOUT_OPENAI", "20"))
 TIMEOUT_TIMEDTEXT = float(os.getenv("TIMEOUT_TIMEDTEXT", "4"))
 TIMEOUT_YTDLP     = float(os.getenv("TIMEOUT_YTDLP", "15"))
 
+# Budgets (seconds) to avoid iOS/share-extension timeouts
+COMMENTS_TOTAL_BUDGET_S   = float(os.getenv("COMMENTS_TOTAL_BUDGET_S", "8.0"))
+TRANSCRIPT_TOTAL_BUDGET_S = float(os.getenv("TRANSCRIPT_TOTAL_BUDGET_S", "12.0"))
+# How long inflight followers wait for a leader before proceeding
+INFLIGHT_FOLLOWER_WAIT_S  = float(os.getenv("INFLIGHT_FOLLOWER_WAIT_S", "6.0"))
+# Only attempt yt-dlp steps if at least this much time remains
+YTDLP_STEP_BUDGET_S       = float(os.getenv("YTDLP_STEP_BUDGET_S", "4.0"))
+
 # User agents
 USER_AGENTS = [
     # A small, rotated set
@@ -242,6 +250,14 @@ def expand_langs(langs: Optional[List[str]]) -> List[str]:
 def ua_hdr(lang: str = "en") -> Dict[str,str]:
     return {"User-Agent": random.choice(USER_AGENTS), "Accept-Language": f"{lang};q=1.0, en;q=0.8"}
 
+def deadline(seconds: float) -> float:
+    """Return an absolute deadline based on perf_counter()."""
+    return time.perf_counter() + seconds
+
+def time_left(dl: float) -> float:
+    """How many seconds remain until the given deadline (non-negative)."""
+    return max(0.0, dl - time.perf_counter())
+
 # ----------------------- Transcript: Primary + 2 Fallbacks -----------------------
 def transcript_via_api(video_id: str, languages: List[str]) -> Optional[Dict[str, Any]]:
     """Primary: youtube-transcript-api (with proxy if configured)."""
@@ -334,17 +350,19 @@ def transcript_via_timedtext(video_id: str, languages: List[str]) -> Optional[Di
                     return {"text": out, "language": code, "is_generated": True}
     return None
 
-def transcript_via_ytdlp(video_id: str, languages: List[str]) -> Optional[Dict[str,Any]]:
-    """Fallback #2: yt-dlp subtitle extraction (manual→auto)."""
+def transcript_via_ytdlp(video_id: str, languages: List[str], max_seconds: float) -> Optional[Dict[str,Any]]:
+    """Fallback #2: yt-dlp subtitle extraction (manual→auto), bounded by a per-step budget."""
+    if max_seconds < 1.0:
+        return None
+    t0 = time.perf_counter()
     opts = _YDL_BASE.copy()
-    # Try to coerce best subs; do not download video
     opts.update({
         "skip_download": True,
         "writesubtitles": True,
         "writeautomaticsub": True,
         "subtitlesformat": "best[ext=vtt]/best[ext=srv3]/best",
+        "socket_timeout": max(1.0, min(max_seconds, TIMEOUT_YTDLP)),
     })
-    # Headers and proxy
     hdrs = ua_hdr()
     opts["http_headers"] = hdrs
     if _proxy_url():
@@ -352,24 +370,21 @@ def transcript_via_ytdlp(video_id: str, languages: List[str]) -> Optional[Dict[s
     try:
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-        # Prefer manual
         subs = info.get("subtitles") or {}
         autos = info.get("automatic_captions") or {}
         for lang in languages:
-            # exact or base match
             for cand_map in (subs, autos):
-                # try exact lang, then base
                 for key in (lang, lang.split("-")[0]):
                     tracks = cand_map.get(key)
                     if tracks:
-                        # pick first url
                         url = tracks[0].get("url")
                         if not url: continue
-                        r = yt_http.get(url, headers=hdrs, timeout=TIMEOUT_YTDLP, proxies=(requests_proxies() if _proxy_url() else None))
+                        r = yt_http.get(url, headers=hdrs, timeout=min(TIMEOUT_YTDLP, max_seconds), proxies=(requests_proxies() if _proxy_url() else None))
                         if r.status_code == 200 and r.text:
-                            # If VTT/SRV3—strip minimal markup
                             text = " ".join([ln.strip() for ln in r.text.splitlines() if ln and not ln.startswith("WEBVTT")])
                             is_gen = (cand_map is autos)
+                            log_event("info", "transcript_method_success", strategy="yt-dlp_subs",
+                                      duration_ms=int((time.perf_counter()-t0)*1000), text_len=len(text), video_id=video_id)
                             return {"text": text.strip(), "language": key, "is_generated": is_gen}
     except Exception as e:
         log_event("warning", "ytdlp_subs_error", video_id=video_id, error=str(e))
@@ -397,10 +412,15 @@ def comments_via_downloader(video_id: str) -> List[str]:
         log_event("warning", "comment_method_failure", method="youtube-comment-downloader", error=str(e), duration_ms=int((time.perf_counter()-t0)*1000), video_id=video_id)
         return []
 
-def comments_via_ytdlp(video_id: str) -> List[str]:
+def comments_via_ytdlp(video_id: str, max_seconds: float) -> List[str]:
+    """Fallback via yt-dlp, but bounded by a per-step budget."""
+    if max_seconds < 1.0:
+        return []
     t0 = time.perf_counter()
     opts = _YDL_BASE.copy()
     opts["getcomments"] = True
+    # Bound yt-dlp socket timeout to our per-step budget
+    opts["socket_timeout"] = max(1.0, min(max_seconds, TIMEOUT_YTDLP))
     if _proxy_url():
         opts["proxy"] = _proxy_url()
     try:
@@ -438,6 +458,8 @@ def transcript_endpoint():
     languages = expand_langs(langs)
 
     cache_key = f"{video_id}::langs={','.join(languages)}"
+    dl = deadline(TRANSCRIPT_TOTAL_BUDGET_S)
+
     # in-memory cache
     hit = transcript_cache.get(cache_key)
     if hit:
@@ -467,24 +489,33 @@ def transcript_endpoint():
 
     try:
         if not leader:
-            # Wait up to 15s for the leader
-            evt.wait(15)
-            # After wait, try cache again
+            # Followers wait briefly, not 15s
+            evt.wait(INFLIGHT_FOLLOWER_WAIT_S)
             hit = transcript_cache.get(cache_key)
             if hit:
                 log_event("info", "transcript_inflight_follower_hit", video_id=video_id)
                 return jsonify({"video_id": video_id, **hit}), 200
-            # else fall-through (defensive)
-        # Leader fetch: primary + 2 fallbacks
-        methods = [
-            ("youtube-transcript-api", lambda: transcript_via_api(video_id, languages)),
-            ("timedtext",               lambda: transcript_via_timedtext(video_id, languages)),
-            ("yt-dlp_subs",            lambda: transcript_via_ytdlp(video_id, languages)),
-        ]
+            # Continue as non-leader if nothing showed up, but budget still applies
+
+        methods = []
+        # Primary
+        methods.append(("youtube-transcript-api", lambda: transcript_via_api(video_id, languages)))
+        # Fallback #1
+        methods.append(("timedtext", lambda: transcript_via_timedtext(video_id, languages)))
+        # Fallback #2 (only if enough time left)
+        def maybe_ytdlp():
+            rem = time_left(dl)
+            if rem >= YTDLP_STEP_BUDGET_S:
+                return transcript_via_ytdlp(video_id, languages, rem)
+            return None
+        methods.append(("yt-dlp_subs", maybe_ytdlp))
+
         payload = None
         for name, func in methods:
-            payload = func()
+            if time_left(dl) <= 0.3:
+                break
             log_event("info", "transcript_method_attempt", method=name, video_id=video_id)
+            payload = func()
             if payload and payload.get("text"):
                 break
 
@@ -518,6 +549,8 @@ def comments_endpoint():
     if not video_id:
         return jsonify({"error": "Invalid videoId format or URL"}), 400
 
+    dl = deadline(COMMENTS_TOTAL_BUDGET_S)
+
     cache_key = f"{video_id}"
     hit = comments_cache.get(cache_key)
     if hit:
@@ -535,25 +568,39 @@ def comments_endpoint():
             resp.headers["Cache-Control"] = "public, max-age=60"
             return resp, 200
 
-    # Workflow: primary then fallback
+    # Primary (fast)
     t0 = time.perf_counter()
     comments = comments_via_downloader(video_id)
-    if not comments:
-        comments = comments_via_ytdlp(video_id)
-
     if comments:
         comments = comments[:COMMENT_LIMIT]
         comments_cache.set(cache_key, comments)
         with shelve.open(DB_COMMENTS) as db:
             db[cache_key] = comments
-        log_event("info", "comments_result", strategy=("youtube-comment-downloader" if comments else "yt-dlp"),
-                  video_id=video_id, count=len(comments), duration_ms=int((time.perf_counter()-t0)*1000), request_id=g.request_id)
+        log_event("info", "comments_result", strategy="youtube-comment-downloader",
+                  video_id=video_id, count=len(comments),
+                  duration_ms=int((time.perf_counter()-t0)*1000), request_id=g.request_id)
         resp = jsonify({"video_id": video_id, "comments": comments})
         resp.headers["Cache-Control"] = "public, max-age=60"
         return resp, 200
 
-    # Graceful soft-fail: 200 + empty list (client tolerates this)
-    log_event("warning", "comments_result_empty", video_id=video_id, duration_ms=int((time.perf_counter()-t0)*1000), request_id=g.request_id)
+    # Only attempt yt-dlp if there's enough time left
+    rem = time_left(dl)
+    if rem >= YTDLP_STEP_BUDGET_S:
+        comments = comments_via_ytdlp(video_id, rem)
+        if comments:
+            comments = comments[:COMMENT_LIMIT]
+            comments_cache.set(cache_key, comments)
+            with shelve.open(DB_COMMENTS) as db:
+                db[cache_key] = comments
+            log_event("info", "comments_result", strategy="yt-dlp", video_id=video_id,
+                      count=len(comments), duration_ms=int((time.perf_counter()-t0)*1000), request_id=g.request_id)
+            resp = jsonify({"video_id": video_id, "comments": comments})
+            resp.headers["Cache-Control"] = "public, max-age=60"
+            return resp, 200
+
+    # Budget exhausted or no comments → graceful 200 + []
+    log_event("warning", "comments_result_empty", video_id=video_id,
+              duration_ms=int((time.perf_counter()-t0)*1000), request_id=g.request_id)
     resp = jsonify({"video_id": video_id, "comments": []})
     resp.headers["Cache-Control"] = "public, max-age=15"
     return resp, 200
