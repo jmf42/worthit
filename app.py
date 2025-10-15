@@ -11,14 +11,18 @@ import json
 import time
 import uuid
 import shelve
+import html
 import random
 import logging
+import tempfile
 import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from urllib.parse import urlparse
 
 from flask import Flask, request, jsonify, g, make_response
 from flask_cors import CORS
@@ -39,6 +43,11 @@ from yt_dlp import YoutubeDL
 
 APP_NAME = "WorthItService"
 
+CONSENT_COOKIE_VALUE = os.getenv("CONSENT_COOKIE", "YES+cb.20210328-17-p0.en+FX+888")
+YTDL_COOKIE_FILE = os.getenv("YTDL_COOKIE_FILE", "").strip()
+NOT_AVAILABLE_TTL = int(os.getenv("TRANSCRIPT_NOT_AVAILABLE_TTL", "600"))
+NOT_AVAILABLE_SENTINEL = "__NOT_AVAILABLE__"
+
 # ----------------------- Configuration -----------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -55,6 +64,20 @@ PERSIST_DIR = os.getenv("CACHE_DIR", "/tmp/persistent_cache")
 os.makedirs(PERSIST_DIR, exist_ok=True)
 DB_TRANSCRIPTS = os.path.join(PERSIST_DIR, "transcripts.shelve")
 DB_COMMENTS    = os.path.join(PERSIST_DIR, "comments.shelve")
+
+if YTDL_COOKIE_FILE and not os.path.isfile(YTDL_COOKIE_FILE):
+    YTDL_COOKIE_FILE = ""
+
+if not YTDL_COOKIE_FILE:
+    consent_path = Path(PERSIST_DIR) / "consent_cookies.txt"
+    if not consent_path.exists():
+        consent_path.write_text(
+            "# Netscape HTTP Cookie File\n"
+            ".youtube.com\tTRUE\t/\tFALSE\t2145916800\tCONSENT\t"
+            f"{CONSENT_COOKIE_VALUE}\n",
+            encoding="utf-8"
+        )
+    YTDL_COOKIE_FILE = str(consent_path)
 
 # Proxies (Generic or Webshare rotating gateway)
 WS_USER = os.getenv("WEBSHARE_USER")
@@ -101,8 +124,13 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
 ]
 
+ALT_PIPED_HOSTS = [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.adminforge.de",
+    "https://pipedapi.tokhmi.xyz",
+]
+
 # yt-dlp options baseline (safe & quiet)
-YTDL_COOKIE_FILE = os.getenv("YTDL_COOKIE_FILE")  # optional
 _YDL_BASE = {
     "quiet": True, "no_warnings": True, "nocheckcertificate": True,
     "retries": 2, "fragment_retries": 2, "geo_bypass": True,
@@ -154,17 +182,24 @@ def _add_common_headers(resp):
 def _retrying_session(total=2, backoff=0.3) -> requests.Session:
     s = requests.Session()
     retry = Retry(
-        total=total, backoff_factor=backoff,
+        total=total,
+        backoff_factor=backoff,
         status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(['GET','POST'])
+        allowed_methods=frozenset(['GET', 'POST'])
     )
     adapter = HTTPAdapter(max_retries=retry)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
     return s
 
+def _youtube_session() -> requests.Session:
+    s = _retrying_session()
+    s.headers.update({"User-Agent": random.choice(USER_AGENTS), "Accept-Language": "en-US,en;q=0.9"})
+    s.cookies.set("CONSENT", CONSENT_COOKIE_VALUE, domain=".youtube.com")
+    return s
+
 session = _retrying_session()
-yt_http = _retrying_session()
+yt_http = _youtube_session()
 
 def _proxy_url() -> Optional[str]:
     if GEN_HTTPS: return GEN_HTTPS
@@ -255,6 +290,43 @@ def expand_langs(langs: Optional[List[str]]) -> List[str]:
 def ua_hdr(lang: str = "en") -> Dict[str,str]:
     return {"User-Agent": random.choice(USER_AGENTS), "Accept-Language": f"{lang};q=1.0, en;q=0.8"}
 
+def accept_language_value(languages: List[str]) -> str:
+    if not languages:
+        return "en;q=1.0"
+    parts: List[str] = []
+    seen = set()
+    for idx, code in enumerate(languages[:5]):
+        base = code.split("-")[0]
+        if base in seen:
+            continue
+        seen.add(base)
+        q = max(0.1, 1.0 - idx * 0.1)
+        parts.append(f"{base};q={q:.1f}")
+    if "en" not in seen:
+        parts.append("en;q=0.1")
+    return ", ".join(parts)
+
+def _parse_caption_text(raw: str, ext: str = "") -> Optional[str]:
+    if not raw:
+        return None
+    data = raw.strip()
+    if not data:
+        return None
+    ext = (ext or "").lower()
+    if "<text" in data or ext.endswith("srv3"):
+        text = " ".join(html.unescape(chunk) for chunk in re.findall(r">([^<]+)<", data))
+        return text.strip() or None
+    if ext.endswith("vtt") or data.startswith("WEBVTT"):
+        lines = [ln.strip() for ln in data.splitlines() if ln and "-->" not in ln and not ln.startswith("WEBVTT")]
+        text = " ".join(lines).strip()
+        return text or None
+    if ext.endswith("srt") or "-->" in data:
+        lines = [ln.strip() for ln in data.splitlines() if ln and "-->" not in ln and not ln.isdigit()]
+        text = " ".join(lines).strip()
+        return text or None
+    fallback = " ".join(data.split()).strip()
+    return fallback or None
+
 def deadline(seconds: float) -> float:
     """Return an absolute deadline based on perf_counter()."""
     return time.perf_counter() + seconds
@@ -273,8 +345,27 @@ def transcript_via_api(video_id: str, languages: List[str]) -> Optional[Dict[str
     """
     t0 = time.perf_counter()
     proxy_cfg = yta_proxy_cfg()
+    headers = ua_hdr(languages[0] if languages else "en")
+    headers["Accept-Language"] = accept_language_value(languages)
+    client = _retrying_session(total=3, backoff=0.4)
+    client.headers.update(headers)
+    client.cookies.set("CONSENT", CONSENT_COOKIE_VALUE, domain=".youtube.com")
     try:
-        tr = YouTubeTranscriptApi.list_transcripts(video_id, proxies=proxy_cfg) if proxy_cfg else YouTubeTranscriptApi.list_transcripts(video_id)
+        kwargs: Dict[str, Any] = {"http_client": client}
+        if proxy_cfg:
+            kwargs["proxy_config"] = proxy_cfg
+        try:
+            yta = YouTubeTranscriptApi(**kwargs)
+            tr = yta.list_transcripts(video_id)
+        except TypeError:
+            fallback_kwargs: Dict[str, Any] = {"cookies": {"CONSENT": CONSENT_COOKIE_VALUE}}
+            proxy_dict = requests_proxies()
+            if proxy_dict:
+                fallback_kwargs["proxies"] = proxy_dict
+            try:
+                tr = YouTubeTranscriptApi.list_transcripts(video_id, **fallback_kwargs)
+            except TypeError:
+                tr = YouTubeTranscriptApi.list_transcripts(video_id)
 
         # 1) Requested languages first (manual → asr)
         for lang in languages:
@@ -367,9 +458,10 @@ def _timedtext_list(video_id: str, use_proxy: bool) -> List[Tuple[str,str]]:
     except Exception:
         return []
 
-def _timedtext_fetch(video_id: str, code: str, kind_asr: bool, use_proxy: bool) -> Optional[str]:
+def _timedtext_fetch(video_id: str, code: str, kind_asr: bool, use_proxy: bool, target: Optional[str] = None) -> Optional[str]:
     params = {"v": video_id, "fmt": "vtt", "lang": code}
     if kind_asr: params["kind"] = "asr"
+    if target: params["tlang"] = target
     try:
         r = yt_http.get("https://www.youtube.com/api/timedtext", params=params, headers=ua_hdr(code), timeout=TIMEOUT_TIMEDTEXT, proxies=(requests_proxies() if use_proxy else None))
         if r.status_code != 200: return None
@@ -404,6 +496,13 @@ def transcript_via_timedtext(video_id: str, languages: List[str]) -> Optional[Di
                     return {"text": out, "language": code, "is_generated": True}
 
     if not STRICT_LANGUAGES:
+        if ALLOW_TRANSLATE and bases:
+            target = bases[0]
+            for code, kind in tracks:
+                if kind == "manual" and not code.startswith(target):
+                    out = _timedtext_fetch(video_id, code, False, use_proxy=False, target=target) or _timedtext_fetch(video_id, code, False, use_proxy=True, target=target)
+                    if out:
+                        return {"text": out, "language": target, "is_generated": False}
         # 3) Any manual track
         for code, kind in tracks:
             if kind == "manual":
@@ -418,6 +517,63 @@ def transcript_via_timedtext(video_id: str, languages: List[str]) -> Optional[Di
                     return {"text": out, "language": code, "is_generated": True}
     return None
 
+def transcript_via_piped(video_id: str, languages: List[str]) -> Optional[Dict[str, Any]]:
+    """Fallback via lightweight Piped mirrors."""
+    prefs: List[str] = []
+    for code in languages:
+        base = code.split("-")[0].lower()
+        if base and base not in prefs:
+            prefs.append(base)
+    if not prefs:
+        prefs = ["en"]
+    headers = ua_hdr(prefs[0])
+    proxies = requests_proxies()
+
+    def pick_caption(subs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        for base in prefs:
+            base_l = base.lower()
+            for item in subs:
+                lang_fields = [
+                    str(item.get("code", "")),
+                    str(item.get("language", "")),
+                    str(item.get("languageCode", "")),
+                ]
+                lang_fields = [val.lower() for val in lang_fields if val]
+                if any(val == base_l or val.startswith(base_l) for val in lang_fields):
+                    return item
+        return subs[0] if subs else None
+
+    for host in ALT_PIPED_HOSTS:
+        try:
+            meta = session.get(f"{host}/api/v1/captions/{video_id}", headers=headers, timeout=4, proxies=proxies or None)
+            if meta.status_code != 200:
+                continue
+            data = meta.json()
+            subs = data.get("captions") or []
+            chosen = pick_caption(subs)
+            if not chosen:
+                continue
+            url = (chosen.get("url") or "").strip()
+            if not url:
+                continue
+            if url.startswith("//"):
+                url = "https:" + url
+            ext = Path(urlparse(url).path).suffix
+            resp = session.get(url, headers=headers, timeout=4, proxies=proxies or None)
+            if resp.status_code != 200:
+                continue
+            text = _parse_caption_text(resp.text, ext)
+            if text:
+                log_event("info", "transcript_method_success", strategy="piped_api",
+                          video_id=video_id, text_len=len(text), mirror=host)
+                lang_code = chosen.get("languageCode") or chosen.get("code") or prefs[0]
+                is_generated = bool(chosen.get("autoGenerated") or chosen.get("automatic"))
+                return {"text": text, "language": lang_code, "is_generated": is_generated}
+        except Exception as exc:
+            log_event("warning", "piped_transcript_error", video_id=video_id, mirror=host, error=str(exc))
+            continue
+    return None
+
 def transcript_via_ytdlp(video_id: str, languages: List[str], max_seconds: float) -> Optional[Dict[str,Any]]:
     """Fallback #2: yt-dlp subtitle extraction (manual→auto), bounded by a per-step budget."""
     if max_seconds < 1.0:
@@ -428,32 +584,46 @@ def transcript_via_ytdlp(video_id: str, languages: List[str], max_seconds: float
         "skip_download": True,
         "writesubtitles": True,
         "writeautomaticsub": True,
-        "subtitlesformat": "best[ext=vtt]/best[ext=srv3]/best",
+        "subtitlesformat": "best[ext=srv3]/best[ext=vtt]/best[ext=srt]/best",
         "socket_timeout": max(1.0, min(max_seconds, TIMEOUT_YTDLP)),
     })
-    hdrs = ua_hdr()
+    prefs = [code.strip() for code in (languages or []) if code.strip()] or ["en"]
+    sub_langs: List[str] = []
+    for code in prefs:
+        sub_langs.extend([f"{code}.*", code])
+    opts["subtitleslangs"] = list(dict.fromkeys(sub_langs)) or ["en.*", "en"]
+    hdrs = ua_hdr(prefs[0])
+    hdrs["Cookie"] = f"CONSENT={CONSENT_COOKIE_VALUE}"
     opts["http_headers"] = hdrs
     if _proxy_url():
         opts["proxy"] = _proxy_url()
+    if YTDL_COOKIE_FILE:
+        opts["cookiefile"] = YTDL_COOKIE_FILE
     try:
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-        subs = info.get("subtitles") or {}
-        autos = info.get("automatic_captions") or {}
-        for lang in languages:
-            for cand_map in (subs, autos):
-                for key in (lang, lang.split("-")[0]):
-                    tracks = cand_map.get(key)
-                    if tracks:
-                        url = tracks[0].get("url")
-                        if not url: continue
-                        r = yt_http.get(url, headers=hdrs, timeout=min(TIMEOUT_YTDLP, max_seconds), proxies=(requests_proxies() if _proxy_url() else None))
-                        if r.status_code == 200 and r.text:
-                            text = " ".join([ln.strip() for ln in r.text.splitlines() if ln and not ln.startswith("WEBVTT")])
-                            is_gen = (cand_map is autos)
-                            log_event("info", "transcript_method_success", strategy="yt-dlp_subs",
-                                      duration_ms=int((time.perf_counter()-t0)*1000), text_len=len(text), video_id=video_id)
-                            return {"text": text.strip(), "language": key, "is_generated": is_gen}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            opts["outtmpl"] = os.path.join(tmp_dir, "%(id)s.%(ext)s")
+            with YoutubeDL(opts) as ydl:
+                ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
+            path: Optional[Path] = None
+            for ext in ("srv3", "vtt", "srt"):
+                path = next(Path(tmp_dir).glob(f"{video_id}*.{ext}"), None)
+                if path:
+                    break
+            if not path:
+                return None
+            raw = path.read_text(encoding="utf-8", errors="ignore")
+            lang_guess = prefs[0]
+            stem_parts = [part for part in path.stem.split('.') if part]
+            if len(stem_parts) > 1:
+                cand = stem_parts[-1]
+                if 2 <= len(cand) <= 5:
+                    lang_guess = cand
+            text = _parse_caption_text(raw, path.suffix)
+            if not text:
+                return None
+            log_event("info", "transcript_method_success", strategy="yt-dlp_subs",
+                      duration_ms=int((time.perf_counter()-t0)*1000), text_len=len(text), video_id=video_id)
+            return {"text": text, "language": lang_guess, "is_generated": True}
     except Exception as e:
         log_event("warning", "ytdlp_subs_error", video_id=video_id, error=str(e))
     return None
@@ -536,14 +706,26 @@ def transcript_endpoint():
 
     # persistent cache
     with shelve.open(DB_TRANSCRIPTS) as db:
-        if cache_key in db:
-            val = db[cache_key]
-            if val == "__NOT_AVAILABLE__":
+        val = db.get(cache_key)
+        if isinstance(val, dict) and val.get("status") == NOT_AVAILABLE_SENTINEL:
+            ts = float(val.get("ts", 0) or 0)
+            if ts and (time.time() - ts) <= NOT_AVAILABLE_TTL:
                 log_event("info", "transcript_persisted_not_available", video_id=video_id)
                 return make_404_not_available()
+            db.pop(cache_key, None)
+            val = None
+        elif val == NOT_AVAILABLE_SENTINEL:
+            db.pop(cache_key, None)
+            val = None
+        if isinstance(val, dict) and val.get("text"):
             transcript_cache.set(cache_key, val)
             log_event("info", "transcript_persisted_hit", video_id=video_id, text_len=len(val.get("text","")))
             return jsonify({"video_id": video_id, **val}), 200
+        if isinstance(val, str) and val:
+            payload = {"text": val, "language": "unknown", "is_generated": False}
+            transcript_cache.set(cache_key, payload)
+            log_event("info", "transcript_persisted_hit", video_id=video_id, text_len=len(val))
+            return jsonify({"video_id": video_id, **payload}), 200
 
     # single-flight
     evt = None
@@ -570,6 +752,8 @@ def transcript_endpoint():
         methods.append(("youtube-transcript-api", lambda: transcript_via_api(video_id, languages)))
         # Fallback #1
         methods.append(("timedtext", lambda: transcript_via_timedtext(video_id, languages)))
+        # Fallback #1b (mirror APIs)
+        methods.append(("piped_api", lambda: transcript_via_piped(video_id, languages)))
         # Fallback #2 (only if enough time left)
         def maybe_ytdlp():
             rem = time_left(dl)
@@ -590,7 +774,7 @@ def transcript_endpoint():
         if not payload or not payload.get("text"):
             # mark not available for 10 minutes in persistent store
             with shelve.open(DB_TRANSCRIPTS) as db:
-                db[cache_key] = "__NOT_AVAILABLE__"
+                db[cache_key] = {"status": NOT_AVAILABLE_SENTINEL, "ts": time.time()}
             return make_404_not_available()
 
         transcript_cache.set(cache_key, payload)
