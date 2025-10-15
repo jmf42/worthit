@@ -350,6 +350,9 @@ def transcript_via_api(video_id: str, languages: List[str]) -> Optional[Dict[str
     client = _retrying_session(total=3, backoff=0.4)
     client.headers.update(headers)
     client.cookies.set("CONSENT", CONSENT_COOKIE_VALUE, domain=".youtube.com")
+    proxies = requests_proxies()
+    if proxies:
+        client.proxies.update(proxies)
     try:
         kwargs: Dict[str, Any] = {"http_client": client}
         if proxy_cfg:
@@ -359,9 +362,8 @@ def transcript_via_api(video_id: str, languages: List[str]) -> Optional[Dict[str
             tr = yta.list_transcripts(video_id)
         except TypeError:
             fallback_kwargs: Dict[str, Any] = {"cookies": {"CONSENT": CONSENT_COOKIE_VALUE}}
-            proxy_dict = requests_proxies()
-            if proxy_dict:
-                fallback_kwargs["proxies"] = proxy_dict
+            if proxies:
+                fallback_kwargs["proxies"] = proxies
             try:
                 tr = YouTubeTranscriptApi.list_transcripts(video_id, **fallback_kwargs)
             except TypeError:
@@ -436,6 +438,8 @@ def transcript_via_api(video_id: str, languages: List[str]) -> Optional[Dict[str
         log_event("warning", "transcript_api_no_transcript", video_id=video_id)
         return None
     except Exception as e:
+        if "blocked" in str(e).lower():
+            setattr(g, "transcript_blocked", True)
         log_event("warning", "transcript_api_error", video_id=video_id, error=str(e))
         return None
     return None
@@ -517,7 +521,7 @@ def transcript_via_timedtext(video_id: str, languages: List[str]) -> Optional[Di
                     return {"text": out, "language": code, "is_generated": True}
     return None
 
-def transcript_via_piped(video_id: str, languages: List[str]) -> Optional[Dict[str, Any]]:
+def transcript_via_piped(video_id: str, languages: List[str], deadline_ts: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """Fallback via lightweight Piped mirrors."""
     prefs: List[str] = []
     for code in languages:
@@ -544,8 +548,12 @@ def transcript_via_piped(video_id: str, languages: List[str]) -> Optional[Dict[s
         return subs[0] if subs else None
 
     for host in ALT_PIPED_HOSTS:
+        if deadline_ts and time_left(deadline_ts) <= 0.5:
+            break
         try:
-            meta = session.get(f"{host}/api/v1/captions/{video_id}", headers=headers, timeout=4, proxies=proxies or None)
+            base = host if host.endswith('/') else f"{host}/"
+            captions_url = urljoin(base, f"api/v1/captions/{video_id}")
+            meta = session.get(captions_url, headers=headers, timeout=2.5, proxies=proxies or None)
             if meta.status_code != 200:
                 continue
             data = meta.json()
@@ -558,8 +566,10 @@ def transcript_via_piped(video_id: str, languages: List[str]) -> Optional[Dict[s
                 continue
             if url.startswith("//"):
                 url = "https:" + url
+            elif url.startswith("/"):
+                url = urljoin(base, url.lstrip("/"))
             ext = Path(urlparse(url).path).suffix
-            resp = session.get(url, headers=headers, timeout=4, proxies=proxies or None)
+            resp = session.get(url, headers=headers, timeout=2.5, proxies=proxies or None)
             if resp.status_code != 200:
                 continue
             text = _parse_caption_text(resp.text, ext)
@@ -631,6 +641,11 @@ def transcript_via_ytdlp(video_id: str, languages: List[str], max_seconds: float
 def make_404_not_available() -> tuple:
     resp = make_response(jsonify({"error": "Transcript not available"}), 404)
     resp.headers["Cache-Control"] = "public, max-age=600"
+    return resp
+
+def make_503_blocked() -> tuple:
+    resp = make_response(jsonify({"error": "Transcript temporarily unavailable"}), 503)
+    resp.headers["Cache-Control"] = "public, max-age=30"
     return resp
 
 # ----------------------- Comments: Primary + Fallback -----------------------
@@ -752,15 +767,16 @@ def transcript_endpoint():
         methods.append(("youtube-transcript-api", lambda: transcript_via_api(video_id, languages)))
         # Fallback #1
         methods.append(("timedtext", lambda: transcript_via_timedtext(video_id, languages)))
-        # Fallback #1b (mirror APIs)
-        methods.append(("piped_api", lambda: transcript_via_piped(video_id, languages)))
-        # Fallback #2 (only if enough time left)
+
         def maybe_ytdlp():
             rem = time_left(dl)
             if rem >= YTDLP_STEP_BUDGET_S:
                 return transcript_via_ytdlp(video_id, languages, rem)
             return None
+
         methods.append(("yt-dlp_subs", maybe_ytdlp))
+        # Fallback mirrors (only if time left after yt-dlp)
+        methods.append(("piped_api", lambda: transcript_via_piped(video_id, languages, dl)))
 
         payload = None
         for name, func in methods:
@@ -772,7 +788,8 @@ def transcript_endpoint():
                 break
 
         if not payload or not payload.get("text"):
-            # mark not available for 10 minutes in persistent store
+            if getattr(g, "transcript_blocked", False):
+                return make_503_blocked()
             with shelve.open(DB_TRANSCRIPTS) as db:
                 db[cache_key] = {"status": NOT_AVAILABLE_SENTINEL, "ts": time.time()}
             return make_404_not_available()
