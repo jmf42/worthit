@@ -70,6 +70,11 @@ TRANSCRIPT_LANGS = [
     ).split(",") if c.strip()
 ]
 
+# Language behavior (align with old flow: prefer original, not strict, no auto-translate by default)
+STRICT_LANGUAGES = os.getenv("STRICT_LANGUAGES", "false").lower() == "true"   # if true, only return requested languages
+PREFER_ORIGINAL  = os.getenv("PREFER_ORIGINAL", "true").lower() == "true"     # if true, prefer any manual/original transcript
+ALLOW_TRANSLATE  = os.getenv("ALLOW_TRANSLATE", "false").lower() == "true"    # enable API-side translation as a last resort
+
 # CORS: defaults to '*' to avoid breaking, allow explicit lock via ALLOWED_ORIGINS
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 
@@ -260,13 +265,18 @@ def time_left(dl: float) -> float:
 
 # ----------------------- Transcript: Primary + 2 Fallbacks -----------------------
 def transcript_via_api(video_id: str, languages: List[str]) -> Optional[Dict[str, Any]]:
-    """Primary: youtube-transcript-api (with proxy if configured)."""
+    """Primary: youtube-transcript-api (with proxy if configured).
+    Order:
+      1) Requested languages: manual → asr
+      2) If not STRICT: any manual (original) → any asr (original)
+      3) If ALLOW_TRANSLATE: translate an available manual to first requested
+    """
     t0 = time.perf_counter()
     proxy_cfg = yta_proxy_cfg()
     try:
-        # 1) Try requested languages first, prefer original
         tr = YouTubeTranscriptApi.list_transcripts(video_id, proxies=proxy_cfg) if proxy_cfg else YouTubeTranscriptApi.list_transcripts(video_id)
-        # prefer manual in any of the requested languages
+
+        # 1) Requested languages first (manual → asr)
         for lang in languages:
             try:
                 tx = tr.find_manually_created_transcript([lang])
@@ -277,7 +287,6 @@ def transcript_via_api(video_id: str, languages: List[str]) -> Optional[Dict[str
                     return {"text": txt, "language": tx.language_code, "is_generated": False}
             except Exception:
                 pass
-        # 2) ASR in requested languages
         for lang in languages:
             try:
                 tx = tr.find_generated_transcript([lang])
@@ -288,6 +297,50 @@ def transcript_via_api(video_id: str, languages: List[str]) -> Optional[Dict[str
                     return {"text": txt, "language": tx.language_code, "is_generated": True}
             except Exception:
                 pass
+
+        if not STRICT_LANGUAGES:
+            # 2a) Any manual/original (prefer original if configured)
+            if PREFER_ORIGINAL:
+                for tx in tr:
+                    try:
+                        if not getattr(tx, "is_generated", False):
+                            data = tx.fetch()
+                            txt = " ".join([seg.get("text","").replace("\n"," ").strip() for seg in data]).strip()
+                            if txt:
+                                log_event("info", "transcript_method_success", strategy="youtube-transcript-api_manual_any", duration_ms=int((time.perf_counter()-t0)*1000), text_len=len(txt), video_id=video_id)
+                                return {"text": txt, "language": tx.language_code, "is_generated": False}
+                    except Exception:
+                        continue
+            # 2b) Any ASR/original
+            for tx in tr:
+                try:
+                    if getattr(tx, "is_generated", False):
+                        data = tx.fetch()
+                        txt = " ".join([seg.get("text","").replace("\n"," ").strip() for seg in data]).strip()
+                        if txt:
+                            log_event("info", "transcript_method_success", strategy="youtube-transcript-api_asr_any", duration_ms=int((time.perf_counter()-t0)*1000), text_len=len(txt), video_id=video_id)
+                            return {"text": txt, "language": tx.language_code, "is_generated": True}
+                except Exception:
+                    continue
+
+            # 3) Optional: translate available manual to the first requested language
+            if ALLOW_TRANSLATE and languages:
+                target = languages[0]
+                for tx in tr:
+                    try:
+                        if not getattr(tx, "is_generated", False):
+                            # Does this manual transcript advertise translation to 'target'?
+                            trans_langs = getattr(tx, "translation_languages", None) or []
+                            if any((isinstance(tl, dict) and tl.get("language_code") == target) or (isinstance(tl, str) and tl == target) for tl in trans_langs):
+                                txx = tx.translate(target)
+                                data = txx.fetch()
+                                txt = " ".join([seg.get("text","").replace("\n"," ").strip() for seg in data]).strip()
+                                if txt:
+                                    log_event("info", "transcript_method_success", strategy="youtube-transcript-api_manual_translated", duration_ms=int((time.perf_counter()-t0)*1000), text_len=len(txt), video_id=video_id)
+                                    return {"text": txt, "language": target, "is_generated": False}
+                    except Exception:
+                        continue
+
     except (NoTranscriptFound, TranscriptsDisabled):
         log_event("warning", "transcript_api_no_transcript", video_id=video_id)
         return None
@@ -330,21 +383,36 @@ def _timedtext_fetch(video_id: str, code: str, kind_asr: bool, use_proxy: bool) 
         return None
 
 def transcript_via_timedtext(video_id: str, languages: List[str]) -> Optional[Dict[str,Any]]:
-    """Fallback #1: YouTube timedtext (manual → asr, direct → proxy)."""
+    """Fallback #1: YouTube timedtext (manual → asr, direct → proxy), with relaxed language fallback."""
     tracks = _timedtext_list(video_id, use_proxy=False) or _timedtext_list(video_id, use_proxy=True)
     if not tracks: return None
     bases = list(dict.fromkeys([c.split("-")[0] for c in languages]))  # unique order
-    # 1) Manual
+
+    # 1) Requested bases: Manual
     for base in bases:
         for code, kind in tracks:
             if kind == "manual" and code.startswith(base):
                 out = _timedtext_fetch(video_id, code, False, use_proxy=False) or _timedtext_fetch(video_id, code, False, use_proxy=True)
                 if out:
                     return {"text": out, "language": code, "is_generated": False}
-    # 2) ASR
+    # 2) Requested bases: ASR
     for base in bases:
         for code, kind in tracks:
             if kind == "asr" and code.startswith(base):
+                out = _timedtext_fetch(video_id, code, True, use_proxy=False) or _timedtext_fetch(video_id, code, True, use_proxy=True)
+                if out:
+                    return {"text": out, "language": code, "is_generated": True}
+
+    if not STRICT_LANGUAGES:
+        # 3) Any manual track
+        for code, kind in tracks:
+            if kind == "manual":
+                out = _timedtext_fetch(video_id, code, False, use_proxy=False) or _timedtext_fetch(video_id, code, False, use_proxy=True)
+                if out:
+                    return {"text": out, "language": code, "is_generated": False}
+        # 4) Any ASR track
+        for code, kind in tracks:
+            if kind == "asr":
                 out = _timedtext_fetch(video_id, code, True, use_proxy=False) or _timedtext_fetch(video_id, code, True, use_proxy=True)
                 if out:
                     return {"text": out, "language": code, "is_generated": True}
