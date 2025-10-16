@@ -130,6 +130,37 @@ ALT_PIPED_HOSTS = [
     "https://pipedapi.tokhmi.xyz",
 ]
 
+# Proxy helpers ------------------------------------------------
+def _proxy_url() -> Optional[str]:
+    if GEN_HTTPS: return GEN_HTTPS
+    if GEN_HTTP:  return GEN_HTTP
+    if WS_USER and WS_PASS:
+        user = WS_USER if WS_USER.endswith("-rotate") else f"{WS_USER}-rotate"
+        return f"http://{user}:{WS_PASS}@p.webshare.io:80"
+    return None
+
+PROXY_URL = _proxy_url()
+PROXY_DICT = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else {}
+
+def requests_proxies() -> Dict[str, str]:
+    return dict(PROXY_DICT)
+
+def yta_proxy_cfg():
+    """Proxy config for youtube_transcript_api (if available)."""
+    try:
+        if GEN_HTTP or GEN_HTTPS:
+            if GenericProxyConfig:
+                return GenericProxyConfig(http_url=GEN_HTTP or GEN_HTTPS,
+                                          https_url=GEN_HTTPS or GEN_HTTP)
+        if WS_USER and WS_PASS and WebshareProxyConfig:
+            user = WS_USER if WS_USER.endswith("-rotate") else f"{WS_USER}-rotate"
+            return WebshareProxyConfig(proxy_username=user, proxy_password=WS_PASS)
+    except Exception:
+        pass
+    return None
+
+PROXY_CFG: Optional[Any] = None
+
 # yt-dlp options baseline (safe & quiet)
 _YDL_BASE = {
     "quiet": True, "no_warnings": True, "nocheckcertificate": True,
@@ -161,6 +192,8 @@ def log_event(level: str, event: str, **fields):
     msg = json.dumps(rec, ensure_ascii=False)
     getattr(logger, level if level in ("debug","info","warning","error","critical") else "info")(msg)
 
+PROXY_CFG = yta_proxy_cfg()
+
 # ----------------------- Request/Response hooks -----------------------
 @app.before_request
 def _inject_request_id():
@@ -190,6 +223,8 @@ def _retrying_session(total=2, backoff=0.3) -> requests.Session:
     adapter = HTTPAdapter(max_retries=retry)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
+    if PROXY_DICT:
+        s.proxies.update(PROXY_DICT)
     return s
 
 def _youtube_session() -> requests.Session:
@@ -201,30 +236,15 @@ def _youtube_session() -> requests.Session:
 session = _retrying_session()
 yt_http = _youtube_session()
 
-def _proxy_url() -> Optional[str]:
-    if GEN_HTTPS: return GEN_HTTPS
-    if GEN_HTTP:  return GEN_HTTP
-    if WS_USER and WS_PASS:
-        user = WS_USER if WS_USER.endswith("-rotate") else f"{WS_USER}-rotate"
-        return f"http://{user}:{WS_PASS}@p.webshare.io:80"
-    return None
+_yta_session_local = threading.local()
 
-def requests_proxies() -> Dict[str,str]:
-    url = _proxy_url()
-    return {"http": url, "https": url} if url else {}
-
-def yta_proxy_cfg():
-    """Proxy config for youtube_transcript_api (if available)."""
-    try:
-        if GEN_HTTP or GEN_HTTPS:
-            if GenericProxyConfig:
-                return GenericProxyConfig(http_url=GEN_HTTP or GEN_HTTPS, https_url=GEN_HTTPS or GEN_HTTP)
-        if WS_USER and WS_PASS and WebshareProxyConfig:
-            user = WS_USER if WS_USER.endswith("-rotate") else f"{WS_USER}-rotate"
-            return WebshareProxyConfig(proxy_username=user, proxy_password=WS_PASS)
-    except Exception as e:  # pragma: no cover
-        log_event("warning", "proxy_config_error", error=str(e))
-    return None
+def _yta_session() -> requests.Session:
+    sess: Optional[requests.Session] = getattr(_yta_session_local, "session", None)
+    if sess is None:
+        sess = _retrying_session(total=3, backoff=0.4)
+        sess.cookies.set("CONSENT", CONSENT_COOKIE_VALUE, domain=".youtube.com")
+        _yta_session_local.session = sess
+    return sess
 
 # ----------------------- Tiny TTL Cache -----------------------
 class TTLCache:
@@ -344,30 +364,17 @@ def transcript_via_api(video_id: str, languages: List[str]) -> Optional[Dict[str
       3) If ALLOW_TRANSLATE: translate an available manual to first requested
     """
     t0 = time.perf_counter()
-    proxy_cfg = yta_proxy_cfg()
     headers = ua_hdr(languages[0] if languages else "en")
     headers["Accept-Language"] = accept_language_value(languages)
-    client = _retrying_session(total=3, backoff=0.4)
-    client.headers.update(headers)
-    client.cookies.set("CONSENT", CONSENT_COOKIE_VALUE, domain=".youtube.com")
-    proxies = requests_proxies()
-    if proxies:
-        client.proxies.update(proxies)
+    client = _yta_session()
+    client.headers["User-Agent"] = headers["User-Agent"]
+    client.headers["Accept-Language"] = headers["Accept-Language"]
     try:
         kwargs: Dict[str, Any] = {"http_client": client}
-        if proxy_cfg:
-            kwargs["proxy_config"] = proxy_cfg
-        try:
-            yta = YouTubeTranscriptApi(**kwargs)
-            tr = yta.list_transcripts(video_id)
-        except TypeError:
-            fallback_kwargs: Dict[str, Any] = {"cookies": {"CONSENT": CONSENT_COOKIE_VALUE}}
-            if proxies:
-                fallback_kwargs["proxies"] = proxies
-            try:
-                tr = YouTubeTranscriptApi.list_transcripts(video_id, **fallback_kwargs)
-            except TypeError:
-                tr = YouTubeTranscriptApi.list_transcripts(video_id)
+        if PROXY_CFG:
+            kwargs["proxy_config"] = PROXY_CFG
+        yta = YouTubeTranscriptApi(**kwargs)
+        tr = yta.list_transcripts(video_id)
 
         # 1) Requested languages first (manual → asr)
         for lang in languages:
@@ -434,8 +441,8 @@ def transcript_via_api(video_id: str, languages: List[str]) -> Optional[Dict[str
                     except Exception:
                         continue
 
-    except (NoTranscriptFound, TranscriptsDisabled):
-        log_event("warning", "transcript_api_no_transcript", video_id=video_id)
+    except (NoTranscriptFound, TranscriptsDisabled) as exc:
+        log_event("warning", "transcript_api_no_transcript", video_id=video_id, error=str(exc))
         return None
     except Exception as e:
         if "blocked" in str(e).lower():
@@ -589,24 +596,31 @@ def transcript_via_ytdlp(video_id: str, languages: List[str], max_seconds: float
     if max_seconds < 1.0:
         return None
     t0 = time.perf_counter()
-    opts = _YDL_BASE.copy()
-    opts.update({
+    lang_list = languages or TRANSCRIPT_LANGS
+    sub_langs: List[str] = []
+    for code in lang_list:
+        c = code.strip()
+        if not c:
+            continue
+        sub_langs.extend([f"{c}.*", c])
+    opts = {
+        "quiet": True,
         "skip_download": True,
         "writesubtitles": True,
         "writeautomaticsub": True,
-        "subtitlesformat": "best[ext=srv3]/best[ext=vtt]/best[ext=srt]/best",
+        "subtitleslangs": sub_langs or ["en.*", "en"],
+        "subtitlesformat": "best[ext=srv3]/best[ext=vtt]/best[ext=srt]",
         "socket_timeout": max(1.0, min(max_seconds, TIMEOUT_YTDLP)),
-    })
-    prefs = [code.strip() for code in (languages or []) if code.strip()] or ["en"]
-    sub_langs: List[str] = []
-    for code in prefs:
-        sub_langs.extend([f"{code}.*", code])
-    opts["subtitleslangs"] = list(dict.fromkeys(sub_langs)) or ["en.*", "en"]
-    hdrs = ua_hdr(prefs[0])
-    hdrs["Cookie"] = f"CONSENT={CONSENT_COOKIE_VALUE}"
-    opts["http_headers"] = hdrs
-    if _proxy_url():
-        opts["proxy"] = _proxy_url()
+        "nocheckcertificate": True,
+        "extractor_args": {"youtube": ["player_client=ios"]},
+        "http_headers": {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept-Language": "en-US,en;q=0.8",
+            "Cookie": f"CONSENT={CONSENT_COOKIE_VALUE}",
+        },
+    }
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
     if YTDL_COOKIE_FILE:
         opts["cookiefile"] = YTDL_COOKIE_FILE
     try:
@@ -614,26 +628,18 @@ def transcript_via_ytdlp(video_id: str, languages: List[str], max_seconds: float
             opts["outtmpl"] = os.path.join(tmp_dir, "%(id)s.%(ext)s")
             with YoutubeDL(opts) as ydl:
                 ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
-            path: Optional[Path] = None
             for ext in ("srv3", "vtt", "srt"):
-                path = next(Path(tmp_dir).glob(f"{video_id}*.{ext}"), None)
-                if path:
-                    break
-            if not path:
-                return None
-            raw = path.read_text(encoding="utf-8", errors="ignore")
-            lang_guess = prefs[0]
-            stem_parts = [part for part in path.stem.split('.') if part]
-            if len(stem_parts) > 1:
-                cand = stem_parts[-1]
-                if 2 <= len(cand) <= 5:
-                    lang_guess = cand
-            text = _parse_caption_text(raw, path.suffix)
-            if not text:
-                return None
-            log_event("info", "transcript_method_success", strategy="yt-dlp_subs",
-                      duration_ms=int((time.perf_counter()-t0)*1000), text_len=len(text), video_id=video_id)
-            return {"text": text, "language": lang_guess, "is_generated": True}
+                target = next(Path(tmp_dir).glob(f"{video_id}*.{ext}"), None)
+                if not target:
+                    continue
+                raw = target.read_text(encoding="utf-8", errors="ignore")
+                text = _parse_caption_text(raw, ext)
+                if not text:
+                    continue
+                log_event("info", "transcript_method_success", strategy="yt-dlp_subs",
+                          duration_ms=int((time.perf_counter()-t0)*1000), text_len=len(text), video_id=video_id)
+                guess_lang = (languages[0] if languages else "en") or "en"
+                return {"text": text, "language": guess_lang, "is_generated": True}
     except Exception as e:
         log_event("warning", "ytdlp_subs_error", video_id=video_id, error=str(e))
     return None
@@ -641,11 +647,6 @@ def transcript_via_ytdlp(video_id: str, languages: List[str], max_seconds: float
 def make_404_not_available() -> tuple:
     resp = make_response(jsonify({"error": "Transcript not available"}), 404)
     resp.headers["Cache-Control"] = "public, max-age=600"
-    return resp
-
-def make_503_blocked() -> tuple:
-    resp = make_response(jsonify({"error": "Transcript temporarily unavailable"}), 503)
-    resp.headers["Cache-Control"] = "public, max-age=30"
     return resp
 
 # ----------------------- Comments: Primary + Fallback -----------------------
@@ -709,6 +710,8 @@ def transcript_endpoint():
     langs_raw = request.args.get("languages", "") or ""
     langs = [c.strip().lower() for c in langs_raw.split(",") if c.strip()] if langs_raw else None
     languages = expand_langs(langs)
+
+    setattr(g, "transcript_blocked", False)
 
     cache_key = f"{video_id}::langs={','.join(languages)}"
     dl = deadline(TRANSCRIPT_TOTAL_BUDGET_S)
@@ -789,7 +792,7 @@ def transcript_endpoint():
 
         if not payload or not payload.get("text"):
             if getattr(g, "transcript_blocked", False):
-                return make_503_blocked()
+                return make_404_not_available()
             with shelve.open(DB_TRANSCRIPTS) as db:
                 db[cache_key] = {"status": NOT_AVAILABLE_SENTINEL, "ts": time.time()}
             return make_404_not_available()
