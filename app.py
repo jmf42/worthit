@@ -606,6 +606,11 @@ comment_cache = TTLCache(maxsize=COMMENT_CACHE_SIZE, ttl=COMMENT_CACHE_TTL)
 transcript_inflight_lock = threading.Lock()
 transcript_inflight_events: Dict[str, threading.Event] = {}
 
+# In-flight deduplication for comment fetches (keyed by video_id)
+comment_inflight_lock = threading.Lock()
+comment_inflight_events: Dict[str, threading.Event] = {}
+COMMENT_INFLIGHT_WAIT_SECONDS = float(os.getenv("COMMENT_INFLIGHT_WAIT_SECONDS", "15"))
+
 logger.info(f"App initialized. Max workers: {MAX_WORKERS}. Comment limit: {COMMENT_LIMIT}")
 logger.info(f"Transcript Cache: size={TRANSCRIPT_CACHE_SIZE}, ttl={TRANSCRIPT_CACHE_TTL}s")
 logger.info(f"Comment Cache: size={COMMENT_CACHE_SIZE}, ttl={COMMENT_CACHE_TTL}s")
@@ -722,12 +727,22 @@ def _parse_accept_language_header(header_val: str | None) -> list[str]:
 
 # --- yt-dlp Helper ---
 _YDL_OPTS_BASE = {
-    "quiet": True, "skip_download": True, "extract_flat": "discard_in_playlist",
-    "no_warnings": True, "restrict_filenames": True, "nocheckcertificate": True,
-    "ignoreerrors": True, "no_playlist": True, "writeinfojson": False,
-    "writesubtitles": True, "writeautomaticsub": True,
+    "quiet": True,
+    "skip_download": True,
+    "extract_flat": "discard_in_playlist",
+    "no_warnings": True,
+    "restrict_filenames": True,
+    "nocheckcertificate": True,
+    "ignoreerrors": True,
+    "no_playlist": True,
+    "writeinfojson": False,
+    "writesubtitles": True,
+    "writeautomaticsub": True,
     "extractor_args": {"youtube": ["player_client=ios"]},
     "subtitlesformat": "best[ext=srv3]/best[ext=vtt]/best[ext=srt]",
+    "retries": 1,
+    "fragment_retries": 1,
+    "socket_timeout": 10,
     **({"cookiefile": YTDL_COOKIE_FILE} if YTDL_COOKIE_FILE else {}),
 }
 
@@ -1302,6 +1317,49 @@ def _get_or_spawn_transcript(video_id: str) -> str:
     raise NoTranscriptFound(video_id, [], None)
 
 # --- Comment Fetching Logic ---
+class PermanentCommentBlock(Exception):
+    """Raised when YouTube explicitly blocks comment retrieval for a video."""
+
+
+class _YtDlpCaptureLogger:
+    """Minimal logger to capture yt-dlp warnings/errors for diagnostics."""
+
+    def __init__(self):
+        self.messages: list[tuple[str, str]] = []
+
+    def debug(self, _msg):
+        pass
+
+    def info(self, _msg):
+        pass
+
+    def warning(self, msg):
+        self.messages.append(("warning", msg))
+
+    def error(self, msg):
+        self.messages.append(("error", msg))
+
+
+def _detect_comment_permanent_block(messages: list[tuple[str, str]], extra_text: Optional[str] = None) -> tuple[bool, Optional[str]]:
+    """
+    Inspect yt-dlp log messages for known permanent comment blocks (e.g., bot challenges).
+    Returns (is_permanent_block, reason_code).
+    """
+    text = " ".join(msg for _, msg in messages)
+    if extra_text:
+        text = f"{text} {extra_text}"
+    lowered = text.lower()
+    patterns = {
+        "signin_required": [
+            "sign in to confirm you're not a bot",
+            "sign in to confirm you’re not a bot",
+        ],
+    }
+    for reason, needles in patterns.items():
+        if any(needle in lowered for needle in needles):
+            return True, reason
+    return False, None
+
 def _fetch_comments_downloader(video_id: str, use_proxy: bool = False, request_id: str = "") -> list[str]:
     """Fetches comments using youtube-comment-downloader."""
     t0 = time.perf_counter()
@@ -1317,13 +1375,15 @@ def _fetch_comments_downloader(video_id: str, use_proxy: bool = False, request_i
     })
     try:
         proxy_url = _gateway_url() if use_proxy else None
-        downloader_kwargs = {}
+        proxy_dict = get_proxy_dict() if use_proxy else {}
         log_event('debug', 'comment_downloader_proxy_config', extra={
             "video_id": video_id, 
             "proxy_url": proxy_url, 
             "request_id": request_id
         })
-        downloader = YoutubeCommentDownloader(**downloader_kwargs)
+        downloader = YoutubeCommentDownloader()
+        if proxy_dict:
+            downloader.session.proxies.update(proxy_dict)
         comments_generator = downloader.get_comments_from_url(
             f"https://www.youtube.com/watch?v={video_id}",
             sort_by=0,    # 0 for top (popular) comments
@@ -1377,7 +1437,19 @@ def _fetch_comments_yt_dlp(video_id: str, use_proxy: bool = False, request_id: s
     """
     t0 = time.perf_counter()
     log_event('info', 'comment_method_attempt', method='yt-dlp_comments', video_id=video_id, proxy_used=use_proxy, request_id=request_id)
-    info = yt_dlp_extract_info(video_id, extract_comments=True, use_proxy=use_proxy, request_id=request_id)
+    info, meta = yt_dlp_extract_info(video_id, extract_comments=True, use_proxy=use_proxy, request_id=request_id)
+    if meta.get("permanent_block"):
+        log_event(
+            'warning',
+            'comment_method_permanent_block_detected',
+            method='yt-dlp_comments',
+            video_id=video_id,
+            reason=meta.get("reason", "permanent block detected"),
+            proxy_used=use_proxy,
+            request_id=request_id,
+            duration_ms=int((time.perf_counter() - t0) * 1000)
+        )
+        raise PermanentCommentBlock(meta.get("reason", "permanent block"))
     if not info:
         log_event('warning', 'comment_method_failure', method='yt-dlp_comments', video_id=video_id, reason='No info from yt-dlp', duration_ms=int((time.perf_counter() - t0) * 1000), request_id=request_id)
         return []
@@ -1410,9 +1482,26 @@ def _fetch_comments_resilient(video_id: str, request_id: str = "") -> list[str]:
         }
     )
 
+    permanent_block_detected = False
+
     for strategy_name, fetch_func in comment_retrieval_strategies:
         try:
             comments = fetch_func()
+        except PermanentCommentBlock as exc:
+            duration_ms = int((time.perf_counter() - t0_workflow) * 1000)
+            log_event(
+                'warning',
+                'comment_step_permanent_block',
+                extra={
+                    "step": strategy_name,
+                    "video_id": video_id,
+                    "reason": str(exc) or "permanent block detected",
+                    "duration_ms": duration_ms,
+                    "request_id": request_id
+                }
+            )
+            permanent_block_detected = True
+            break
         except Exception as exc:  # pragma: no cover – defensive
             log_event(
                 'warning',
@@ -1464,6 +1553,19 @@ def _fetch_comments_resilient(video_id: str, request_id: str = "") -> list[str]:
             }
         )
 
+    if permanent_block_detected:
+        log_event(
+            'warning',
+            'comments_permanent_block',
+            extra={
+                "video_id": video_id,
+                "strategies_attempted": [strategy[0] for strategy in comment_retrieval_strategies],
+                "duration_ms": int((time.perf_counter() - t0_workflow) * 1000),
+                "request_id": request_id
+            }
+        )
+        return []
+
     log_event(
         'error',
         'all_comment_methods_failed',
@@ -1476,7 +1578,10 @@ def _fetch_comments_resilient(video_id: str, request_id: str = "") -> list[str]:
     )
     return []
 
-def yt_dlp_extract_info(video_id: str, extract_comments: bool = False, use_proxy: bool = False, request_id: str = "") -> dict | None:
+def yt_dlp_extract_info(video_id: str,
+                        extract_comments: bool = False,
+                        use_proxy: bool = False,
+                        request_id: str = "") -> tuple[Optional[dict], dict]:
     t0 = time.perf_counter()
     log_event('info', 'yt_dlp_info_extract_attempt', video_id=video_id, extract_comments=extract_comments, proxy_used=use_proxy, request_id=request_id)
     opts = _YDL_OPTS_BASE.copy()
@@ -1497,17 +1602,26 @@ def yt_dlp_extract_info(video_id: str, extract_comments: bool = False, use_proxy
 
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     log_event('debug', 'yt_dlp_extract_info_details', video_id=video_id, comments_requested=extract_comments, request_id=request_id)
+    capture_logger = _YtDlpCaptureLogger()
+    opts["logger"] = capture_logger
     try:
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
             if info:
                 log_event('info', 'yt_dlp_info_extract_success', video_id=video_id, duration_ms=int((time.perf_counter() - t0) * 1000), request_id=request_id)
-                return info
+                is_blocked, reason = _detect_comment_permanent_block(capture_logger.messages)
+                return info, {"permanent_block": is_blocked, "reason": reason}
             log_event('warning', 'yt_dlp_info_extract_failure', video_id=video_id, reason='No info returned', duration_ms=int((time.perf_counter() - t0) * 1000), request_id=request_id)
-            return None
+            is_blocked, reason = _detect_comment_permanent_block(capture_logger.messages)
+            if is_blocked:
+                log_event('warning', 'yt_dlp_info_permanent_block', video_id=video_id, reason=reason, duration_ms=int((time.perf_counter() - t0) * 1000), request_id=request_id)
+            return None, {"permanent_block": is_blocked, "reason": reason}
     except Exception as e:
         log_event('error', 'yt_dlp_info_extract_error', video_id=video_id, error=str(e), duration_ms=int((time.perf_counter() - t0) * 1000), request_id=request_id, exc_info=LOG_LEVEL == "DEBUG")
-        return None
+        is_blocked, reason = _detect_comment_permanent_block(capture_logger.messages, str(e))
+        if is_blocked:
+            log_event('warning', 'yt_dlp_info_permanent_block', video_id=video_id, reason=reason, duration_ms=int((time.perf_counter() - t0) * 1000), request_id=request_id)
+        return None, {"permanent_block": is_blocked, "reason": reason}
 
 def _fetch_comments_from_ytdlp(video_id: str, use_proxy: bool = False, request_id: str = "") -> list[str] | None:
     """Fetches comments using yt-dlp. Supports auto and user comments."""
@@ -1523,7 +1637,21 @@ def _fetch_comments_from_ytdlp(video_id: str, use_proxy: bool = False, request_i
         "request_id": request_id
     })
 
-    info = yt_dlp_extract_info(video_id, extract_comments=True, use_proxy=use_proxy, request_id=request_id)
+    info, meta = yt_dlp_extract_info(video_id, extract_comments=True, use_proxy=use_proxy, request_id=request_id)
+    if meta.get("permanent_block"):
+        log_event(
+            'warning',
+            'comment_method_permanent_block_detected',
+            extra={
+                "method": "yt-dlp_comments",
+                "video_id": video_id,
+                "reason": meta.get("reason", "permanent block detected"),
+                "proxy_used": use_proxy,
+                "duration_ms": int((time.perf_counter() - t0) * 1000),
+                "request_id": request_id
+            }
+        )
+        raise PermanentCommentBlock(meta.get("reason", "permanent block"))
     if not info:
         log_event('warning', 'comment_method_failure', extra={
             "method": "yt-dlp_comments",
@@ -1781,26 +1909,63 @@ def get_comments_endpoint():
     # Log the start of comment fetching
     log_event('info', 'comments_fetch_workflow_start', video_id=video_id, ip=get_remote_address(), request_id=g.request_id)
 
-    cached = comment_cache.get(video_id)
-    if cached is not None:
-        log_event('info', 'comments_cache_hit', video_id=video_id, count=len(cached), request_id=g.request_id)
-        log_event('info', 'comments_result', strategy='cache_memory', video_id=video_id,
-                  count=len(cached), duration_ms=int((time.perf_counter()-g.request_start_time)*1000),
-                  cache='memory', request_id=g.request_id)
-        return jsonify({"video_id": video_id, "comments": cached}), 200
+    def _try_serve_from_cache():
+        cached_local = comment_cache.get(video_id)
+        if cached_local is not None:
+            log_event('info', 'comments_cache_hit', video_id=video_id, count=len(cached_local), request_id=g.request_id)
+            log_event('info', 'comments_result', strategy='cache_memory', video_id=video_id,
+                      count=len(cached_local), duration_ms=int((time.perf_counter()-g.request_start_time)*1000),
+                      cache='memory', request_id=g.request_id)
+            return jsonify({"video_id": video_id, "comments": cached_local}), 200
+        with shelve.open(PERSISTENT_COMMENT_DB) as db:
+            cached_disk = db.get(video_id)
+            if cached_disk is not None:
+                comment_cache[video_id] = cached_disk
+                log_event('info', 'comments_persisted_hit', video_id=video_id, count=len(cached_disk), request_id=g.request_id)
+                log_event('info', 'comments_result', strategy='cache_disk', video_id=video_id,
+                          count=len(cached_disk), duration_ms=int((time.perf_counter()-g.request_start_time)*1000),
+                          cache='disk', request_id=g.request_id)
+                return jsonify({"video_id": video_id, "comments": cached_disk}), 200
+        return None
 
-    with shelve.open(PERSISTENT_COMMENT_DB) as db:
-        cached = db.get(video_id)
-        if cached is not None:
-            comment_cache[video_id] = cached
-            log_event('info', 'comments_persisted_hit', video_id=video_id, count=len(cached), request_id=g.request_id)
-            log_event('info', 'comments_result', strategy='cache_disk', video_id=video_id,
-                      count=len(cached), duration_ms=int((time.perf_counter()-g.request_start_time)*1000),
-                      cache='disk', request_id=g.request_id)
-            return jsonify({"video_id": video_id, "comments": cached}), 200
+    cached_response = _try_serve_from_cache()
+    if cached_response:
+        return cached_response
+
+    comment_key = video_id
+    leader = False
+    evt: Optional[threading.Event] = None
+    with comment_inflight_lock:
+        evt = comment_inflight_events.get(comment_key)
+        if evt is None:
+            evt = threading.Event()
+            comment_inflight_events[comment_key] = evt
+            leader = True
+
+    if not leader and evt is not None:
+        log_event('info', 'comments_inflight_wait', video_id=video_id, request_id=g.request_id)
+        if evt.wait(timeout=COMMENT_INFLIGHT_WAIT_SECONDS):
+            cached_response = _try_serve_from_cache()
+            if cached_response:
+                log_event('info', 'comments_cache_hit_after_wait', video_id=video_id, request_id=g.request_id)
+                return cached_response
+            log_event('warning', 'comments_inflight_cache_miss_after_wait', video_id=video_id, request_id=g.request_id)
+            leader = True
+        else:
+            log_event('warning', 'comments_inflight_promote_to_fetch', video_id=video_id, request_id=g.request_id)
+            leader = True
+
+    if not leader:
+        # Safety net: if we still are not leader (should not happen), retry acquiring leadership.
+        with comment_inflight_lock:
+            evt = comment_inflight_events.get(comment_key)
+            if evt is None:
+                evt = threading.Event()
+                comment_inflight_events[comment_key] = evt
+        leader = True
 
     try:
-        comments = _fetch_comments_resilient(video_id) # This calls the internal _fetch_comments_resilient function
+        comments = _fetch_comments_resilient(video_id, request_id=g.request_id)
         comment_cache[video_id] = comments
         with shelve.open(PERSISTENT_COMMENT_DB) as db:
             db[video_id] = comments
@@ -1809,10 +1974,22 @@ def get_comments_endpoint():
                   count=len(comments), duration_ms=int((time.perf_counter()-g.request_start_time)*1000),
                   cache='miss', request_id=g.request_id)
         return jsonify({"video_id": video_id, "comments": comments}), 200
+    except PermanentCommentBlock as exc:
+        log_event('warning', 'comments_permanent_block_bubbled', video_id=video_id, reason=str(exc) or "permanent block", request_id=g.request_id, duration_ms=int((time.perf_counter()-g.request_start_time)*1000))
+        comment_cache[video_id] = []
+        with shelve.open(PERSISTENT_COMMENT_DB) as db:
+            db[video_id] = []
+        return jsonify({"video_id": video_id, "comments": [], "warning": "YouTube is temporarily blocking comments for this video."}), 200
     except Exception as e:
         log_event('warning', 'comments_fetch_failed_with_exception', video_id=video_id, error=str(e), duration_ms=int((time.perf_counter()-g.request_start_time)*1000), request_id=g.request_id)
-        # On technical failure, return 200 OK with empty comments and a warning message.
         return jsonify({"video_id": video_id, "comments": [], "warning": "Comments could not be fetched due to a technical issue."}), 200
+    finally:
+        if leader and evt is not None:
+            evt.set()
+            with comment_inflight_lock:
+                current_evt = comment_inflight_events.get(comment_key)
+                if current_evt is evt:
+                    comment_inflight_events.pop(comment_key, None)
 
 @app.route("/openai/responses", methods=["POST"])
 @limiter.limit("200/hour;50/minute") # Limits for OpenAI proxy
