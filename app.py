@@ -32,6 +32,7 @@ import requests
 import threading
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from urllib.parse import urlparse
 
 from yt_dlp import YoutubeDL
 
@@ -138,7 +139,7 @@ _thread_local_ytt_session = threading.local()
 
 def _build_ytt_session() -> requests.Session:
     session = requests.Session()
-    retry_total = int(os.getenv("YTT_SESSION_RETRY_TOTAL", "3"))
+    retry_total = int(os.getenv("YTT_SESSION_RETRY_TOTAL", "0"))
     backoff = float(os.getenv("YTT_SESSION_BACKOFF", "0.5"))
     pool_connections = int(os.getenv("YTT_SESSION_POOL_CONNECTIONS", "20"))
     pool_maxsize = int(os.getenv("YTT_SESSION_POOL_MAXSIZE", "20"))
@@ -155,6 +156,9 @@ def _build_ytt_session() -> requests.Session:
         "Accept-Language": "en-US,en;q=0.9",
         "Cookie": CONSENT_COOKIE_HEADER,
     })
+    request_timeout = float(os.getenv("YTT_SESSION_REQUEST_TIMEOUT", str(TRANSCRIPT_PROXY_ATTEMPT_TIMEOUT)))
+    base_request = session.request
+    session.request = functools.partial(base_request, timeout=request_timeout)
     return session
 
 def get_thread_local_ytt_session(user_agent: str, accept_language: str) -> requests.Session:
@@ -749,32 +753,125 @@ _YDL_OPTS_BASE = {
 WS_USER = os.getenv("WEBSHARE_USER")
 WS_PASS = os.getenv("WEBSHARE_PASS")
 
-# Generic/DecoDo/Smartproxy style URLs
+DECODO_USER = os.getenv("DECODO_PROXY_USER")
+DECODO_PASS = os.getenv("DECODO_PROXY_PASS")
+DECODO_HOST = os.getenv("DECODO_PROXY_HOST", "gate.decodo.com")
+DECODO_PORT = os.getenv("DECODO_PROXY_PORT", "7000")
+
+# Generic proxy URLs (legacy env support)
 GEN_HTTP = os.getenv("PROXY_HTTP_URL") or os.getenv("HTTP_PROXY")
 GEN_HTTPS = os.getenv("PROXY_HTTPS_URL") or os.getenv("HTTPS_PROXY")
 
-PROXY_CFG = None
+TRANSCRIPT_PROXY_ATTEMPT_TIMEOUT = float(os.getenv("TRANSCRIPT_PROXY_ATTEMPT_TIMEOUT", "2.0"))
+TRANSCRIPT_PROXY_ATTEMPTS_PER_PROVIDER = int(os.getenv("TRANSCRIPT_PROXY_ATTEMPTS_PER_PROVIDER", "2"))
+TRANSCRIPT_PROXY_FAILURE_THRESHOLD = int(os.getenv("TRANSCRIPT_PROXY_FAILURE_THRESHOLD", "2"))
+TRANSCRIPT_PROXY_COOLDOWN_SECONDS = float(os.getenv("TRANSCRIPT_PROXY_COOLDOWN_SECONDS", "300"))
+
+
+class TranscriptProxyProvider:
+    def __init__(self, name: str, proxy_config: Optional[Any], display: str):
+        self.name = name
+        self.proxy_config = proxy_config
+        self.display = display
+        self._failure_count = 0
+        self._cooldown_until = 0.0
+        self._lock = threading.Lock()
+
+    def is_available(self) -> bool:
+        with self._lock:
+            return time.time() >= self._cooldown_until
+
+    def cooldown_remaining(self) -> float:
+        with self._lock:
+            return max(0.0, self._cooldown_until - time.time())
+
+    @property
+    def cooldown_until(self) -> float:
+        with self._lock:
+            return self._cooldown_until
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failure_count = 0
+            self._cooldown_until = 0.0
+
+    def record_failure(self) -> bool:
+        """Returns True when provider enters cooldown."""
+        enters_cooldown = False
+        with self._lock:
+            self._failure_count += 1
+            if self._failure_count >= TRANSCRIPT_PROXY_FAILURE_THRESHOLD:
+                self._cooldown_until = time.time() + TRANSCRIPT_PROXY_COOLDOWN_SECONDS
+                self._failure_count = 0
+                enters_cooldown = True
+        return enters_cooldown
+
+
+TRANSCRIPT_PROXY_PROVIDERS: list[TranscriptProxyProvider] = []
+
+PROXY_CFG = None  # Back-compat (first provider, if any)
+
 if GEN_HTTP or GEN_HTTPS:
     try:
         from youtube_transcript_api.proxies import GenericProxyConfig
-        PROXY_CFG = GenericProxyConfig(
+        generic_proxy_cfg = GenericProxyConfig(
             http_url=GEN_HTTP or GEN_HTTPS,
             https_url=GEN_HTTPS or GEN_HTTP,
         )
         logger.info("Using GenericProxyConfig (http=%s, https=%s)", bool(GEN_HTTP), bool(GEN_HTTPS))
+        generic_display = ""
+        display_target = GEN_HTTP or GEN_HTTPS or ""
+        if display_target:
+            parsed = urlparse(display_target)
+            host = parsed.hostname or display_target
+            port = parsed.port
+            generic_display = f"{host}:{port}" if host and port else (host or display_target)
+        TRANSCRIPT_PROXY_PROVIDERS.append(TranscriptProxyProvider("generic", generic_proxy_cfg, generic_display))
     except Exception as e:
         logger.warning("Failed to create GenericProxyConfig: %s", e)
-elif WS_USER and WS_PASS:
+
+if WS_USER and WS_PASS:
     if not WS_USER.endswith("-rotate"):
         WS_USER = f"{WS_USER}-rotate"
-    from youtube_transcript_api.proxies import WebshareProxyConfig
-    PROXY_CFG = WebshareProxyConfig(
-        proxy_username=WS_USER,
-        proxy_password=WS_PASS
-    )
-    logger.info("Using Webshare rotating residential proxies (username=%s)", WS_USER)
+    try:
+        from youtube_transcript_api.proxies import WebshareProxyConfig
+        webshare_cfg = WebshareProxyConfig(
+            proxy_username=WS_USER,
+            proxy_password=WS_PASS
+        )
+        TRANSCRIPT_PROXY_PROVIDERS.append(TranscriptProxyProvider("webshare", webshare_cfg, "p.webshare.io:80"))
+        logger.info("Configured Webshare rotating residential proxies (username=%s)", WS_USER)
+    except Exception as e:
+        logger.warning("Failed to configure Webshare proxy: %s", e)
+
+if DECODO_USER and DECODO_PASS:
+    try:
+        from youtube_transcript_api.proxies import GenericProxyConfig
+        decodo_url = f"http://{DECODO_USER}:{DECODO_PASS}@{DECODO_HOST}:{DECODO_PORT}"
+        decodo_cfg = GenericProxyConfig(
+            http_url=decodo_url,
+            https_url=decodo_url,
+        )
+        TRANSCRIPT_PROXY_PROVIDERS.append(TranscriptProxyProvider("decodo", decodo_cfg, f"{DECODO_HOST}:{DECODO_PORT}"))
+        logger.info("Configured Decodo proxy endpoint (%s:%s)", DECODO_HOST, DECODO_PORT)
+    except Exception as e:
+        logger.warning("Failed to configure Decodo proxy: %s", e)
+
+if TRANSCRIPT_PROXY_PROVIDERS:
+    PROXY_CFG = TRANSCRIPT_PROXY_PROVIDERS[0].proxy_config
 else:
     logger.info("No proxy credentials – transcript requests will go direct")
+
+
+def _select_transcript_proxy_providers() -> list[TranscriptProxyProvider]:
+    """Return providers in the order they should be tried."""
+    if not TRANSCRIPT_PROXY_PROVIDERS:
+        return []
+    available = [p for p in TRANSCRIPT_PROXY_PROVIDERS if p.is_available()]
+    if available:
+        return available
+    # All providers cooling down – try the one that will recover soonest
+    return sorted(TRANSCRIPT_PROXY_PROVIDERS, key=lambda provider: provider.cooldown_until)
 
 # ---------------------------------------------------------------------------
 # Helper – build a single rotating Webshare gateway URL
@@ -803,7 +900,7 @@ def get_proxy_dict() -> dict:
 # Primary fetch via youtube-transcript-api (v1.x compliant)
 def fetch_api_once(video_id: str,
                    proxy_cfg,
-                   timeout: int = 10,
+                   timeout: float = 10.0,
                    languages: Optional[List[str]] = None,
                    request_id: str = "",
                    prefer_original: bool = True,
@@ -1092,39 +1189,73 @@ def get_transcript(video_id: str,
         "request_id": request_id
     })
 
-    proxy_attempt_details: dict | None = None
+    proxy_attempt_details: dict[str, Any] = {
+        "proxy_configured": bool(TRANSCRIPT_PROXY_PROVIDERS),
+        "providers": []
+    }
 
-    # Step 1: Attempt youtube-transcript-api through configured proxy first
-    if PROXY_CFG is not None:
-        proxy_url = _gateway_url()
-        proxy_attempt_details = {
-            "proxy_configured": True,
-            "proxy_url": proxy_url,
-            "attempts": []
-        }
-        if proxy_url is None:
-            log_event('warning', 'proxy_url_missing', video_id=video_id, request_id=request_id)
+    provider_sequence = _select_transcript_proxy_providers()
+    if provider_sequence:
+        for idx, provider in enumerate(provider_sequence):
+            provider_log: dict[str, Any] = {
+                "provider": provider.name,
+                "display": provider.display,
+                "attempts": []
+            }
+            available = provider.is_available()
+            if not available:
+                provider_log["cooldown_remaining_s"] = round(provider.cooldown_remaining(), 2)
+                if idx > 0:
+                    provider_log["skipped_due_to_cooldown"] = True
+                    proxy_attempt_details["providers"].append(provider_log)
+                    continue
+                else:
+                    provider_log["cooldown_break"] = True
 
-        max_proxy_attempts = 2
-        for attempt in range(1, max_proxy_attempts + 1):
-            attempt_meta = {"attempt": attempt}
-            try:
-                txt = fetch_api_once(
-                    video_id,
-                    PROXY_CFG,
-                    languages=languages,
-                    request_id=request_id,
-                    prefer_original=prefer_original,
-                    strict_languages=strict_languages,
-                    allow_translate=allow_translate
-                )
+            for attempt in range(1, TRANSCRIPT_PROXY_ATTEMPTS_PER_PROVIDER + 1):
+                attempt_info: dict[str, Any] = {"attempt": attempt}
+                start_attempt = time.perf_counter()
+                txt: Optional[Dict[str, Any]] = None
+                try:
+                    txt = fetch_api_once(
+                        video_id,
+                        provider.proxy_config,
+                        timeout=TRANSCRIPT_PROXY_ATTEMPT_TIMEOUT,
+                        languages=languages,
+                        request_id=request_id,
+                        prefer_original=prefer_original,
+                        strict_languages=strict_languages,
+                        allow_translate=allow_translate
+                    )
+                except Exception as exc:
+                    duration_ms = int((time.perf_counter() - start_attempt) * 1000)
+                    attempt_info.update({
+                        "status": "exception",
+                        "error": str(exc),
+                        "duration_ms": duration_ms
+                    })
+                    provider_log["attempts"].append(attempt_info)
+                    entered_cooldown = provider.record_failure()
+                    if entered_cooldown:
+                        provider_log["cooldown_started"] = True
+                        provider_log["cooldown_until_s"] = round(provider.cooldown_remaining(), 2)
+                    continue
+
+                duration_ms = int((time.perf_counter() - start_attempt) * 1000)
                 if txt:
-                    attempt_meta.update({"status": "success", "text_len": len(txt["text"])})
-                    proxy_attempt_details["attempts"].append(attempt_meta)
+                    attempt_info.update({
+                        "status": "success",
+                        "duration_ms": duration_ms,
+                        "text_len": len(txt["text"])
+                    })
+                    provider_log["attempts"].append(attempt_info)
+                    provider.record_success()
+                    proxy_attempt_details["providers"].append(provider_log)
                     logger.info("Primary transcript fetch succeeded via proxy", extra={
                         "event": "transcript_step_success",
                         "step": 1,
                         "attempt": attempt,
+                        "provider": provider.name,
                         "method": "youtube-transcript-api_proxy",
                         "video_id": video_id,
                         "text_len": len(txt["text"]),
@@ -1134,7 +1265,7 @@ def get_transcript(video_id: str,
                     log_event(
                         'info',
                         'transcript_result',
-                        strategy='youtube-transcript-api_proxy',
+                        strategy=f'youtube-transcript-api_proxy_{provider.name}',
                         video_id=video_id,
                         text_len=len(txt["text"]),
                         duration_ms=int((time.perf_counter() - t0_workflow) * 1000),
@@ -1143,36 +1274,26 @@ def get_transcript(video_id: str,
                         attempt=attempt
                     )
                     return txt
-                attempt_meta.update({"status": "empty"})
-                proxy_attempt_details["attempts"].append(attempt_meta)
-                logger.info("Proxy attempt %d returned no transcript", attempt, extra={
-                    "event": "transcript_step_failure",
-                    "step": 1,
-                    "attempt": attempt,
-                    "method": "youtube-transcript-api_proxy",
-                    "video_id": video_id,
-                    "reason": "No transcript found",
-                    "request_id": request_id
-                })
-            except (RequestBlocked, CouldNotRetrieveTranscript, VideoUnavailable, AgeRestricted, TranscriptsDisabled) as e:
-                attempt_meta.update({"status": "error", "error": str(e)})
-                proxy_attempt_details["attempts"].append(attempt_meta)
-                logger.warning("Proxy attempt %d blocked or failed", attempt, extra={
-                    "event": "transcript_step_failure",
-                    "step": 1,
-                    "attempt": attempt,
-                    "method": "youtube-transcript-api_proxy",
-                    "video_id": video_id,
-                    "reason": str(e),
-                    "request_id": request_id
-                })
-    else:
-        proxy_attempt_details = {"proxy_configured": False}
 
+                attempt_info.update({
+                    "status": "empty",
+                    "duration_ms": duration_ms
+                })
+                provider_log["attempts"].append(attempt_info)
+                entered_cooldown = provider.record_failure()
+                if entered_cooldown:
+                    provider_log["cooldown_started"] = True
+                    provider_log["cooldown_until_s"] = round(provider.cooldown_remaining(), 2)
+
+            proxy_attempt_details["providers"].append(provider_log)
+
+    else:
+        # No proxy providers configured – attempt direct fetch once
         try:
             txt = fetch_api_once(
                 video_id,
                 None,
+                timeout=TRANSCRIPT_PROXY_ATTEMPT_TIMEOUT,
                 request_id=request_id,
                 languages=languages,
                 prefer_original=prefer_original,
@@ -2204,6 +2325,18 @@ def terms():
 @app.route("/support")
 def support():
     return _send_static_multi("support.html")
+
+@app.route("/robots.txt")
+def robots_txt():
+    """Return a minimal robots.txt to keep crawlers quiet."""
+    lines = [
+        "User-agent: *",
+        "Disallow: /"
+    ]
+    resp = make_response("\n".join(lines) + "\n", 200)
+    resp.headers["Content-Type"] = "text/plain; charset=utf-8"
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
 
 @app.route('/favicon.ico')
 def favicon():
