@@ -4,37 +4,33 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>WorthIt.AI — Signal. Not noise.</title>
-    <meta name="description" content="WorthIt.AI turns any YouTube link into instant highlights, a Worth-It Score, and the real crowd read so you can skip the rabbit hole." />
-    <meta property="og:title" content="WorthIt.AI — Signal. Not noise." />
-    <meta property="og:description" content="Summaries, Worth-It Score, comment intelligence, and Ask Anything. Get clarity before you watch." />
-    <meta property="og:type" content="website" />
-    <meta property="og:image" content="https://worthit.tuliai.com/static/assets/worthit-logo.png" />
-    <meta name="theme-color" content="#05060f" />
+    <meta name="description" content="WorthIt.AI turns any YouTube link into instant highlights, a Worth-It Score, and the crowd pulse so you can skip the rabbit hole." />
+    <meta name="theme-color" content="#06070f" />
     <link rel="apple-touch-icon" href="/static/assets/worthit-logo.png" />
     <style>
       :root {
-        --bg0: #05060f;
-        --bg1: #101321;
-        --grad-a: #7c3aed;
-        --grad-b: #22d3ee;
-        --text: #f5f6ff;
-        --muted: #99a0ba;
-        --card: rgba(14, 17, 32, 0.88);
-        --stroke: rgba(255, 255, 255, 0.08);
+        --bg0: #04050d;
+        --bg1: #0c1124;
+        --text: #f7f8ff;
+        --muted: #a2aac4;
+        --accent-a: #7c3aed;
+        --accent-b: #22d3ee;
+        --card: rgba(15, 18, 36, 0.9);
+        --border: rgba(255, 255, 255, 0.08);
         --radius-lg: 28px;
         --radius-md: 18px;
         --radius-sm: 12px;
       }
 
-      * { box-sizing: border-box; }
+      *, *::before, *::after { box-sizing: border-box; }
 
       body {
         margin: 0;
         font-family: "SF Pro Display", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
         color: var(--text);
         background:
-          radial-gradient(1200px 820px at 80% -10%, rgba(34, 211, 238, 0.14), transparent 60%),
-          radial-gradient(900px 580px at -20% 12%, rgba(124, 58, 237, 0.18), transparent 60%),
+          radial-gradient(1200px 860px at 78% -10%, rgba(34, 211, 238, 0.16), transparent 70%),
+          radial-gradient(1000px 700px at -15% 6%, rgba(124, 58, 237, 0.18), transparent 68%),
           linear-gradient(180deg, var(--bg0), var(--bg1));
         overflow-x: hidden;
         -webkit-font-smoothing: antialiased;
@@ -53,6 +49,7 @@
         align-items: center;
         justify-content: space-between;
         gap: 16px;
+        margin-bottom: clamp(22px, 4vw, 36px);
       }
 
       .brand {
@@ -67,11 +64,11 @@
         width: 34px;
         height: 34px;
         border-radius: 10px;
-        box-shadow: 0 18px 36px rgba(124, 58, 237, 0.35);
+        box-shadow: 0 18px 36px rgba(124, 58, 237, 0.36);
       }
 
       .brand span {
-        background: linear-gradient(90deg, var(--grad-a), var(--grad-b));
+        background: linear-gradient(90deg, var(--accent-a), var(--accent-b));
         -webkit-background-clip: text;
         background-clip: text;
         color: transparent;
@@ -98,28 +95,21 @@
       }
 
       .nav-cta {
-        background: linear-gradient(90deg, var(--grad-a), var(--grad-b));
+        background: linear-gradient(100deg, var(--accent-a), var(--accent-b));
         color: #05060f;
         font-weight: 600;
-        box-shadow: 0 14px 30px rgba(124, 58, 237, 0.28);
+        box-shadow: 0 16px 34px rgba(124, 58, 237, 0.28);
       }
 
       .hero {
         display: grid;
-        grid-template-columns: minmax(0, 1fr) minmax(0, 0.9fr);
-        gap: clamp(20px, 5vw, 38px);
+        grid-template-columns: minmax(0, 1fr) minmax(0, 0.95fr);
+        gap: clamp(22px, 5vw, 42px);
         align-items: center;
-        margin: clamp(22px, 5vw, 46px) 0 40px;
       }
 
       @media (max-width: 980px) {
         .hero { grid-template-columns: 1fr; }
-      }
-
-      .hero-copy {
-        display: flex;
-        flex-direction: column;
-        gap: 18px;
       }
 
       .eyebrow {
@@ -129,7 +119,7 @@
         padding: 6px 12px;
         border-radius: 999px;
         border: 1px solid rgba(255, 255, 255, 0.08);
-        background: rgba(255, 255, 255, 0.03);
+        background: rgba(255, 255, 255, 0.04);
         font-size: 14px;
         color: var(--muted);
       }
@@ -138,36 +128,37 @@
         width: 6px;
         height: 6px;
         border-radius: 999px;
-        background: var(--grad-b);
+        background: var(--accent-b);
         box-shadow: 0 0 12px rgba(34, 211, 238, 0.8);
       }
 
       h1 {
-        margin: 0;
-        font-size: clamp(32px, 5vw, 60px);
-        line-height: 1.02;
+        margin: 16px 0 10px;
+        font-size: clamp(32px, 5.4vw, 64px);
+        line-height: 1.03;
         letter-spacing: -0.02em;
       }
 
       h1 .accent {
-        background: linear-gradient(90deg, var(--grad-a), var(--grad-b));
+        background: linear-gradient(90deg, var(--accent-a), var(--accent-b));
         -webkit-background-clip: text;
         background-clip: text;
         color: transparent;
-        text-shadow: 0 8px 44px rgba(124, 58, 237, 0.25);
+        text-shadow: 0 10px 44px rgba(124, 58, 237, 0.28);
       }
 
       .subtitle {
-        margin: 0;
+        margin: 0 0 18px;
+        max-width: 48ch;
         color: var(--muted);
         font-size: clamp(16px, 2.2vw, 19px);
-        max-width: 48ch;
       }
 
       .chip-row {
         display: flex;
         flex-wrap: wrap;
         gap: 8px;
+        margin-bottom: 18px;
       }
 
       .chip {
@@ -184,6 +175,7 @@
         display: flex;
         flex-wrap: wrap;
         gap: 14px;
+        margin-bottom: 18px;
       }
 
       .btn {
@@ -199,7 +191,7 @@
       }
 
       .btn-primary {
-        background: linear-gradient(90deg, var(--grad-a), var(--grad-b));
+        background: linear-gradient(100deg, var(--accent-a), var(--accent-b));
         color: #05060f;
         box-shadow: 0 20px 40px rgba(124, 58, 237, 0.28);
       }
@@ -207,15 +199,15 @@
       .btn-primary:hover { transform: translateY(-2px); }
 
       .btn-ghost {
-        background: rgba(255, 255, 255, 0.03);
+        background: rgba(255, 255, 255, 0.04);
         color: var(--text);
-        border-color: rgba(255, 255, 255, 0.06);
+        border-color: rgba(255, 255, 255, 0.08);
       }
 
       .meta-row {
         display: flex;
         align-items: center;
-        gap: 16px;
+        gap: 14px;
         flex-wrap: wrap;
         color: var(--muted);
         font-size: 13px;
@@ -224,27 +216,26 @@
       .meta-row img { height: 42px; border-radius: 8px; }
 
       .device-wrap {
-        display: flex;
-        flex-direction: column;
-        gap: 16px;
-        align-items: center;
+        display: grid;
+        justify-items: center;
+        gap: 18px;
       }
 
-      .device {
+      .phone {
         position: relative;
-        width: min(430px, 94vw);
+        width: min(430px, 95vw);
         aspect-ratio: 9 / 19.5;
         border-radius: 44px;
-        background: radial-gradient(circle at 20% 20%, rgba(124, 58, 237, 0.32), transparent 70%), #090a12;
+        background: radial-gradient(circle at 20% 20%, rgba(124, 58, 237, 0.28), transparent 70%), #080910;
         border: 1px solid rgba(255, 255, 255, 0.08);
-        box-shadow: 0 40px 90px rgba(5, 6, 15, 0.7), 0 0 0 10px rgba(124, 58, 237, 0.12);
+        box-shadow: 0 40px 90px rgba(5, 6, 15, 0.7), 0 0 0 11px rgba(124, 58, 237, 0.12);
         overflow: hidden;
         transform-style: preserve-3d;
-        transform: rotateY(-14deg) rotateX(4deg);
-        transition: transform 0.6s ease;
+        transform: rotateY(-16deg) rotateX(6deg);
+        transition: transform 0.6s ease, filter 0.6s ease;
       }
 
-      .device::before {
+      .phone::before {
         content: "";
         position: absolute;
         inset: -2px;
@@ -259,245 +250,94 @@
 
       .notch {
         position: absolute;
-        top: 10px;
+        top: 14px;
         left: 50%;
         transform: translateX(-50%);
         width: 36%;
         height: 20px;
-        background: #0a0b10;
         border-radius: 0 0 18px 18px;
-        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: rgba(10, 11, 18, 0.88);
+        border: 1px solid rgba(255, 255, 255, 0.1);
         border-top: none;
         box-shadow: inset 0 -4px 6px rgba(0, 0, 0, 0.45);
-        z-index: 4;
+        z-index: 3;
+      }
+
+      .screen-stack {
+        position: absolute;
+        inset: 14px;
+        border-radius: 36px;
+        overflow: hidden;
+        background: #05060f;
       }
 
       .screen {
         position: absolute;
-        inset: 12px;
-        border-radius: 38px;
-        overflow: hidden;
-        background: #05060f;
-        display: grid;
-        place-items: stretch;
-      }
-
-      .screen-inner {
-        position: relative;
-        display: grid;
-        grid-template-rows: auto 1fr;
-        height: 100%;
-        color: #f8f9ff;
-        font-size: 13px;
-      }
-
-      .screen-state {
-        position: absolute;
         inset: 0;
-        padding: 18px 18px 26px;
-        display: flex;
-        flex-direction: column;
-        gap: 14px;
         opacity: 0;
-        pointer-events: none;
-        transform: translateY(10px);
-        transition: opacity 0.28s ease, transform 0.28s ease;
+        transform: translateY(12px) scale(1.01);
+        transition: opacity 0.3s ease, transform 0.3s ease;
       }
 
-      .screen-state.active {
+      .screen img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+      }
+
+      .screen.active {
         opacity: 1;
-        transform: translateY(0);
-        pointer-events: auto;
+        transform: translateY(0) scale(1);
       }
 
-      .status-bar {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        font-size: 12px;
-        color: rgba(255, 255, 255, 0.72);
-      }
-
-      .status-bar::after {
-        content: "";
-        width: 54px;
-        height: 6px;
-        border-radius: 999px;
-        background: rgba(255, 255, 255, 0.2);
-      }
-
-      .top-nav {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        font-weight: 600;
-        color: rgba(255, 255, 255, 0.88);
-      }
-
-      .top-nav span {
+      .phone-controls {
         display: inline-flex;
-        align-items: center;
-        gap: 6px;
-      }
-
-      .brand-mark {
-        font-weight: 700;
-        letter-spacing: 0.01em;
-        color: rgba(255, 255, 255, 0.88);
-      }
-
-      .badge-icon {
-        width: 16px;
-        height: 16px;
-        border-radius: 6px;
-        background: linear-gradient(120deg, rgba(124, 58, 237, 0.6), rgba(34, 211, 238, 0.6));
-      }
-
-      .video-card {
-        position: relative;
-        padding: 12px;
-        border-radius: 18px;
-        background: linear-gradient(140deg, rgba(18, 18, 24, 0.96), rgba(41, 24, 53, 0.75));
-        border: 1px solid rgba(146, 98, 255, 0.5);
-        box-shadow: 0 14px 32px rgba(15, 8, 36, 0.6);
-      }
-
-      .video-card h2 {
-        margin: 0;
-        font-size: 18px;
-        line-height: 1.25;
-      }
-
-      .score-ring {
-        align-self: center;
-        margin: 6px 0 4px;
-        width: 102px;
-        height: 102px;
-        border-radius: 999px;
-        display: grid;
-        place-items: center;
-        background:
-          radial-gradient(circle at center, rgba(0, 0, 0, 0.5) 62%, transparent 63%),
-          conic-gradient(#19d37b 0 230deg, rgba(255, 255, 255, 0.08) 230deg 360deg);
-        box-shadow: 0 0 32px rgba(34, 211, 238, 0.2);
-      }
-
-      .score-ring strong { font-size: 22px; }
-      .score-ring span { font-size: 11px; color: rgba(255, 255, 255, 0.6); }
-
-      .action-card {
-        padding: 16px;
-        border-radius: 18px;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        background: linear-gradient(120deg, rgba(40, 30, 68, 0.7), rgba(26, 34, 66, 0.65));
-        border: 1px solid rgba(124, 58, 237, 0.35);
-      }
-
-      .action-card .copy {
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
-      }
-
-      .action-card strong { font-size: 15px; }
-      .action-card small { color: rgba(255, 255, 255, 0.62); }
-
-      .action-card.ask {
-        background: linear-gradient(120deg, rgba(31, 29, 58, 0.7), rgba(43, 21, 60, 0.6));
-        border: 1px solid rgba(82, 108, 255, 0.45);
-      }
-
-      .pill-icon {
-        width: 36px;
-        height: 36px;
-        border-radius: 12px;
-        display: grid;
-        place-items: center;
-        background: rgba(255, 255, 255, 0.12);
-      }
-
-      .essentials-summary,
-      .chat-card {
-        padding: 16px;
-        border-radius: 18px;
-        background: rgba(18, 20, 32, 0.9);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
-      }
-
-      .essentials-summary h3,
-      .chat-card h3 {
-        margin: 0 0 6px;
-        font-size: 15px;
-      }
-
-      .bullet-list {
-        margin: 0;
-        padding-left: 18px;
-        color: rgba(255, 255, 255, 0.8);
-        line-height: 1.45;
-      }
-
-      .chat-bubble {
-        margin-top: 10px;
-        padding: 14px;
-        border-radius: 16px;
-        background: linear-gradient(180deg, rgba(27, 27, 39, 0.95), rgba(21, 22, 34, 0.9));
-        border: 1px solid rgba(255, 255, 255, 0.06);
-        line-height: 1.5;
-        color: rgba(255, 255, 255, 0.86);
-      }
-
-      .device-controls {
-        display: flex;
         gap: 10px;
-        background: rgba(10, 12, 24, 0.6);
-        border-radius: 14px;
-        border: 1px solid rgba(255, 255, 255, 0.06);
         padding: 6px;
-        backdrop-filter: blur(12px);
+        border-radius: 16px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: rgba(10, 12, 24, 0.65);
+        backdrop-filter: blur(16px);
       }
 
-      .control {
-        flex: 1;
-        padding: 8px 10px;
-        border-radius: 10px;
+      .phone-controls button {
         border: none;
         background: transparent;
-        color: rgba(255, 255, 255, 0.58);
+        color: rgba(255, 255, 255, 0.6);
         font-weight: 600;
         letter-spacing: 0.01em;
+        padding: 10px 14px;
+        border-radius: 12px;
         cursor: pointer;
         transition: background 0.2s ease, color 0.2s ease;
       }
 
-      .control.active {
-        background: linear-gradient(90deg, rgba(124, 58, 237, 0.28), rgba(34, 211, 238, 0.28));
+      .phone-controls button.active {
+        background: linear-gradient(100deg, rgba(124, 58, 237, 0.3), rgba(34, 211, 238, 0.3));
         color: #fff;
       }
 
-      section.features {
-        margin-top: 54px;
+      section:not(.hero) {
+        margin-top: clamp(54px, 8vw, 84px);
       }
 
       .section-title {
-        margin-bottom: 26px;
         display: grid;
         gap: 10px;
+        margin-bottom: 26px;
       }
 
       .section-title p {
         margin: 0;
         color: var(--muted);
-        max-width: 52ch;
+        max-width: 54ch;
       }
 
       .feature-grid {
         display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
         gap: 16px;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
       }
 
       @media (max-width: 960px) {
@@ -509,11 +349,11 @@
       }
 
       .feature-card {
-        padding: 18px;
+        padding: 20px;
         border-radius: var(--radius-md);
         background: var(--card);
-        border: 1px solid var(--stroke);
-        box-shadow: 0 18px 34px rgba(5, 6, 15, 0.55);
+        border: 1px solid var(--border);
+        box-shadow: 0 22px 40px rgba(6, 8, 20, 0.55);
         display: grid;
         gap: 8px;
       }
@@ -521,14 +361,10 @@
       .feature-card h3 { margin: 0; font-size: 18px; }
       .feature-card p { margin: 0; color: var(--muted); }
 
-      .how {
-        margin-top: 52px;
-      }
-
       .how-grid {
         display: grid;
+        gap: 16px;
         grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 14px;
       }
 
       @media (max-width: 900px) {
@@ -553,11 +389,10 @@
         display: grid;
         place-items: center;
         font-weight: 600;
-        color: var(--grad-b);
+        color: var(--accent-b);
       }
 
       .details {
-        margin-top: 52px;
         display: grid;
         gap: 16px;
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -570,20 +405,20 @@
       .detail-card {
         padding: 22px;
         border-radius: var(--radius-md);
-        background: rgba(15, 18, 34, 0.9);
+        background: rgba(12, 15, 28, 0.86);
         border: 1px solid rgba(255, 255, 255, 0.08);
-        box-shadow: 0 20px 40px rgba(5, 6, 15, 0.55);
+        box-shadow: 0 24px 44px rgba(6, 8, 18, 0.55);
       }
 
       .detail-card h3 { margin: 0 0 10px; }
-      .detail-card ul { margin: 0; padding-left: 18px; color: var(--muted); line-height: 1.55; }
+      .detail-card ul { margin: 0; padding-left: 18px; color: var(--muted); line-height: 1.6; }
 
       .cta-strip {
-        margin: 60px 0 48px;
+        margin: clamp(50px, 8vw, 80px) 0 clamp(44px, 6vw, 70px);
         padding: 26px;
         border-radius: var(--radius-lg);
         border: 1px solid rgba(255, 255, 255, 0.12);
-        background: linear-gradient(130deg, rgba(124, 58, 237, 0.16), rgba(34, 211, 238, 0.16));
+        background: linear-gradient(110deg, rgba(124, 58, 237, 0.16), rgba(34, 211, 238, 0.18));
         display: flex;
         flex-wrap: wrap;
         gap: 18px;
@@ -600,19 +435,18 @@
         gap: 16px;
         align-items: center;
         justify-content: space-between;
-        padding: 30px 0 46px;
         border-top: 1px solid rgba(255, 255, 255, 0.06);
+        padding: 28px 0 42px;
         color: var(--muted);
         font-size: 13px;
       }
 
-      footer nav {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 16px;
-      }
-
+      footer nav { display: flex; gap: 16px; flex-wrap: wrap; }
       footer nav a:hover { color: var(--text); }
+
+      @media (prefers-reduced-motion: reduce) {
+        .phone, .screen, .btn, nav a, .hero, .feature-card, .step, .detail-card { transition: none !important; }
+      }
     </style>
   </head>
   <body>
@@ -631,19 +465,19 @@
       </header>
 
       <section class="hero">
-        <div class="hero-copy">
-          <div class="eyebrow"><span></span>Five free analyses every day</div>
+        <div>
+          <div class="eyebrow"><span></span>Five free analyses daily</div>
           <h1><span class="accent">Signal.</span> Not noise.</h1>
-          <p class="subtitle">WorthIt.AI boils any YouTube link down to highlights, a Worth-It Score, and what real viewers are saying before you press play.</p>
+          <p class="subtitle">WorthIt.AI compresses any YouTube link into highlights, a Worth-It Score, and the crowd pulse before you decide to watch.</p>
           <div class="chip-row">
-            <div class="chip">Highlights &amp; gems</div>
+            <div class="chip">Transcript-grounded highlights</div>
             <div class="chip">Worth-It Score</div>
             <div class="chip">Comment sentiment</div>
-            <div class="chip">Ask Anything</div>
+            <div class="chip">Ask Anything chat</div>
           </div>
           <div class="cta-row">
             <a class="btn btn-primary" href="https://apps.apple.com/us/app/worthit-ai-video-summaries/id6749246821" target="_blank" rel="noopener noreferrer">Download on the App Store</a>
-            <a class="btn btn-ghost" href="#tour">See the flow</a>
+            <a class="btn btn-ghost" href="#tour">Take a quick tour</a>
           </div>
           <div class="meta-row">
             <img src="https://tools.applemediaservices.com/api/badges/download-on-the-app-store/black/en-us?size=120x40&amp;releaseDate=1317600000" alt="Download on the App Store" />
@@ -652,172 +486,99 @@
         </div>
 
         <div class="device-wrap">
-          <div class="device" id="device">
+          <div class="phone" id="phone">
             <div class="notch" aria-hidden="true"></div>
-            <div class="screen">
-              <div class="screen-state active" data-state="overview">
-                <div class="status-bar">
-                  <span>00:36</span>
-                  <span></span>
-                </div>
-                <div class="top-nav">
-                  <span>&larr; Back</span>
-                  <span class="brand-mark"><span class="badge-icon"></span>WorthIt.AI</span>
-                </div>
-                <div class="video-card">
-                  <h2>AI is worse than climate change!</h2>
-                </div>
-                <div class="score-ring" aria-label="Worth-It Score 64%">
-                  <div>
-                    <strong>64%</strong><br />
-                    <span>Worth-It Score</span>
-                  </div>
-                </div>
-                <div class="action-card">
-                  <div class="copy">
-                    <strong>Essentials</strong>
-                    <small>Get key points quickly</small>
-                  </div>
-                  <div class="pill-icon">✦</div>
-                </div>
-                <div class="action-card ask">
-                  <div class="copy">
-                    <strong>Ask Anything</strong>
-                    <small>Interact with the content</small>
-                  </div>
-                  <div class="pill-icon">💬</div>
-                </div>
+            <div class="screen-stack">
+              <div class="screen active" data-screen="overview">
+                <img src="/static/assets/screen-overview.png" alt="WorthIt overview screen" loading="lazy" />
               </div>
-
-              <div class="screen-state" data-state="essentials">
-                <div class="status-bar">
-                  <span>00:36</span>
-                  <span></span>
-                </div>
-                <div class="top-nav">
-                  <span>&larr; Back</span>
-                  <span class="brand-mark"><span class="badge-icon"></span>WorthIt.AI</span>
-                </div>
-                <div class="essentials-summary">
-                  <h3>Summary</h3>
-                  <p>The episode confronts AI existential risk and questions whether intelligence could outpace humans. It argues the real threat is the pace of small daily stressors and how they compound.</p>
-                </div>
-                <div class="essentials-summary">
-                  <h3>Highlights</h3>
-                  <ul class="bullet-list">
-                    <li>AI could reshape life within a decade; fear and misinformation demand proactive action.</li>
-                    <li>Obsessions and constant hustle damage focus—trim commitments to regain clarity.</li>
-                  </ul>
-                </div>
-                <div class="essentials-summary">
-                  <h3>Key takeaways</h3>
-                  <ul class="bullet-list">
-                    <li>Intelligence is a decision loop, not just silicon or carbon.</li>
-                    <li>Progress comes from trial, feedback, and iteration like a student–teacher loop.</li>
-                    <li>Regulate early—there is a point where AI risk becomes irreversible.</li>
-                  </ul>
-                </div>
+              <div class="screen" data-screen="essentials">
+                <img src="/static/assets/screen-essentials.png" alt="WorthIt essentials screen" loading="lazy" />
               </div>
-
-              <div class="screen-state" data-state="ask">
-                <div class="status-bar">
-                  <span>00:36</span>
-                  <span></span>
-                </div>
-                <div class="top-nav">
-                  <span>&larr; Back</span>
-                  <span class="brand-mark"><span class="badge-icon"></span>WorthIt.AI</span>
-                </div>
-                <div class="chat-card">
-                  <h3>Hi! What would you like to know?</h3>
-                  <div class="chat-bubble">
-                    <strong>What are AI risks now?</strong>
-                  </div>
-                  <div class="chat-bubble">
-                    The speaker frames AI risk as urgent—loss of control, misinformation, and the point of no return if we fail to act. Helpful next steps include setting safety standards, investing in robust testing, and keeping policy, ethics, and public understanding in lockstep.
-                  </div>
-                </div>
+              <div class="screen" data-screen="ask">
+                <img src="/static/assets/screen-ask.png" alt="WorthIt Ask Anything screen" loading="lazy" />
               </div>
             </div>
           </div>
-          <div class="device-controls" role="tablist" aria-label="Preview screens">
-            <button class="control active" data-target="overview" type="button">Overview</button>
-            <button class="control" data-target="essentials" type="button">Essentials</button>
-            <button class="control" data-target="ask" type="button">Ask Anything</button>
+          <div class="phone-controls" role="tablist" aria-label="Preview WorthIt screens">
+            <button type="button" class="active" data-target="overview">Overview</button>
+            <button type="button" data-target="essentials">Essentials</button>
+            <button type="button" data-target="ask">Ask Anything</button>
           </div>
         </div>
       </section>
 
-      <section class="features" id="tour">
+      <section id="tour">
         <div class="section-title">
           <h2>Everything you need before you hit play</h2>
           <p>WorthIt mirrors the native iOS experience—fast, focused, and grounded in what was actually said.</p>
         </div>
         <div class="feature-grid">
           <article class="feature-card">
-            <h3>Transcript-grounded highlights</h3>
-            <p>No hallucinations. We stay anchored to the video transcript and compress it in seconds.</p>
-          </article>
-          <article class="feature-card">
-            <h3>Comment intelligence</h3>
-            <p>View sentiment swings, standout themes, and representative viewer quotes without scrolling.</p>
+            <h3>Highlights in seconds</h3>
+            <p>Summaries stay anchored to the real transcript so you catch the signal, not speculation.</p>
           </article>
           <article class="feature-card">
             <h3>Worth-It Score</h3>
-            <p>A transparent blend of depth, clarity, and crowd reaction that tells you if it deserves your time.</p>
+            <p>A transparent blend of depth, clarity, and community reaction that tells you if it’s worth your time.</p>
+          </article>
+          <article class="feature-card">
+            <h3>Comment intelligence</h3>
+            <p>Surface sentiment swings, standout themes, and representative quotes without sifting through the feed.</p>
           </article>
         </div>
       </section>
 
-      <section class="how">
+      <section>
         <div class="section-title">
           <h2>Three taps to clarity</h2>
-          <p>WorthIt plugs into the iOS share sheet so every analysis feels native.</p>
         </div>
         <div class="how-grid">
           <div class="step">
             <span>1</span>
-            <h3>Share a YouTube link</h3>
-            <p>From the YouTube app, tap Share → WorthIt.AI.</p>
+            <h3>Share a link</h3>
+            <p>From YouTube, tap Share → WorthIt.AI. Works anywhere the share sheet lives.</p>
           </div>
           <div class="step">
             <span>2</span>
             <h3>We do the work</h3>
-            <p>WorthIt collects the transcript and public comments, then runs our AI stack.</p>
+            <p>WorthIt pulls the transcript and public comments, then runs our AI stack in seconds.</p>
           </div>
           <div class="step">
             <span>3</span>
             <h3>Decide fast</h3>
-            <p>Review highlights, Worth-It Score, and follow up with Ask Anything.</p>
+            <p>Glance at the Worth-It Score, skim highlights, or dive deeper with Ask Anything.</p>
           </div>
         </div>
       </section>
 
-      <section class="details">
-        <div class="detail-card">
-          <h3>Built for focus</h3>
-          <ul>
-            <li>Dark, high-contrast UI that mirrors the native app.</li>
-            <li>Handles quick explainers or multi-hour deep dives.</li>
-            <li>Recent analyses stay cached for quick return visits.</li>
-            <li>Works best when captions and public comments are available.</li>
-          </ul>
-        </div>
-        <div class="detail-card">
-          <h3>Privacy-first</h3>
-          <ul>
-            <li>No accounts or trackers—just share the link.</li>
-            <li>Five free analyses every day; upgrade only if you need more.</li>
-            <li>Support: <a href="mailto:worthit.tuliai@gmail.com">worthit.tuliai@gmail.com</a></li>
-            <li>Terms, privacy, and help live on worthit.tuliai.com.</li>
-          </ul>
+      <section>
+        <div class="details">
+          <div class="detail-card">
+            <h3>Built for focus</h3>
+            <ul>
+              <li>Dark, high-contrast UI that mirrors the native app.</li>
+              <li>Handles quick explainers or multi-hour deep dives.</li>
+              <li>Recent analyses stay cached so you can revisit instantly.</li>
+              <li>Works best when captions and public comments are available.</li>
+            </ul>
+          </div>
+          <div class="detail-card">
+            <h3>Privacy first</h3>
+            <ul>
+              <li>No accounts, trackers, or personal data—just your share link.</li>
+              <li>Five free analyses every day; upgrade only if you need more.</li>
+              <li>Support: <a href="mailto:worthit.tuliai@gmail.com">worthit.tuliai@gmail.com</a></li>
+              <li>Terms, privacy, and help live at worthit.tuliai.com.</li>
+            </ul>
+          </div>
         </div>
       </section>
 
       <div class="cta-strip">
         <div>
           <p>Ready to skip the rabbit hole?</p>
-          <span>Join viewers already stealing minutes back from endless videos.</span>
+          <span>Join WorthIt viewers already stealing minutes back from endless videos.</span>
         </div>
         <a class="btn btn-primary" href="https://apps.apple.com/us/app/worthit-ai-video-summaries/id6749246821" target="_blank" rel="noopener noreferrer">Get WorthIt.AI free</a>
       </div>
@@ -833,35 +594,40 @@
       </footer>
     </div>
     <script>
-      const yearEl = document.getElementById("year");
-      if (yearEl) yearEl.textContent = new Date().getFullYear();
+      document.getElementById('year').textContent = new Date().getFullYear();
 
-      const states = document.querySelectorAll('.screen-state');
-      const controls = document.querySelectorAll('.control');
-      const device = document.getElementById('device');
+      const phone = document.getElementById('phone');
+      const screens = document.querySelectorAll('.screen');
+      const controls = document.querySelectorAll('.phone-controls button');
 
-      controls.forEach(btn => {
+      controls.forEach((btn) => {
         btn.addEventListener('click', () => {
           const target = btn.dataset.target;
-          controls.forEach(c => c.classList.toggle('active', c === btn));
-          states.forEach(state => {
-            state.classList.toggle('active', state.dataset.state === target);
+          controls.forEach(control => control.classList.toggle('active', control === btn));
+          screens.forEach(screen => {
+            screen.classList.toggle('active', screen.dataset.screen === target);
           });
         });
       });
 
-      device.addEventListener('pointermove', (event) => {
-        const rect = device.getBoundingClientRect();
-        const x = (event.clientX - rect.left) / rect.width - 0.5;
-        const y = (event.clientY - rect.top) / rect.height - 0.5;
-        const rotateY = -14 + x * 12;
-        const rotateX = 4 - y * 8;
-        device.style.transform = `rotateY(${rotateY}deg) rotateX(${rotateX}deg)`;
-      });
+      const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-      device.addEventListener('pointerleave', () => {
-        device.style.transform = 'rotateY(-14deg) rotateX(4deg)';
-      });
+      function resetTilt() {
+        phone.style.transform = 'rotateY(-16deg) rotateX(6deg)';
+      }
+
+      if (!prefersReducedMotion) {
+        phone.addEventListener('pointermove', (event) => {
+          const rect = phone.getBoundingClientRect();
+          const x = (event.clientX - rect.left) / rect.width - 0.5;
+          const y = (event.clientY - rect.top) / rect.height - 0.5;
+          const rotateY = -16 + x * 18;
+          const rotateX = 6 - y * 14;
+          phone.style.transform = `rotateY(${rotateY}deg) rotateX(${rotateX}deg)`;
+        });
+
+        phone.addEventListener('pointerleave', resetTilt);
+      }
     </script>
   </body>
 </html>
