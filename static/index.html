@@ -26,7 +26,7 @@
 
       body {
         margin: 0;
-        font-family: "SF Pro Display", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
+        font-family: "Inter", "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
         color: var(--text);
         background:
           radial-gradient(1200px 860px at 78% -10%, rgba(34, 211, 238, 0.16), transparent 70%),
@@ -61,17 +61,21 @@
       }
 
       .brand img {
-        width: 34px;
-        height: 34px;
+        width: 32px;
+        height: 32px;
         border-radius: 10px;
         box-shadow: 0 18px 36px rgba(124, 58, 237, 0.36);
+        border: 1px solid rgba(255, 255, 255, 0.18);
       }
 
       .brand span {
-        background: linear-gradient(90deg, var(--accent-a), var(--accent-b));
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        background: linear-gradient(120deg, rgba(140, 92, 255, 0.95), rgba(56, 208, 255, 0.95));
         -webkit-background-clip: text;
         background-clip: text;
         color: transparent;
+        text-shadow: 0 12px 40px rgba(84, 143, 255, 0.35);
       }
 
       nav {
@@ -258,29 +262,10 @@
         font-size: 13px;
       }
 
-      .appstore-btn {
-        display: inline-flex;
-        align-items: center;
-        gap: 10px;
-        padding: 10px 18px;
-        border-radius: 16px;
-        background: rgba(255, 255, 255, 0.08);
-        border: 1px solid rgba(255, 255, 255, 0.18);
-        color: var(--text);
-        font-weight: 600;
-        letter-spacing: 0.01em;
-        transition: transform 0.25s ease, box-shadow 0.25s ease, background 0.25s ease;
-      }
-
-      .appstore-btn:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 18px 32px rgba(7, 10, 22, 0.4);
-        background: rgba(255, 255, 255, 0.12);
-      }
-
-      .appstore-btn svg {
-        width: 22px;
-        height: 22px;
+      .appstore-badge {
+        height: 44px;
+        width: auto;
+        filter: drop-shadow(0 12px 24px rgba(8, 10, 24, 0.45));
       }
 
       .device-wrap {
@@ -291,31 +276,16 @@
 
       .phone {
         position: relative;
-        width: min(380px, 92vw);
+        width: min(360px, 90vw);
         aspect-ratio: 9 / 19.5;
         border-radius: 44px;
-        background: radial-gradient(circle at 15% 15%, rgba(124, 58, 237, 0.22), transparent 72%), #090a14;
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        box-shadow: 0 28px 80px rgba(5, 6, 15, 0.65), 0 0 0 8px rgba(124, 58, 237, 0.14);
+        background: linear-gradient(160deg, rgba(21, 22, 35, 0.9), rgba(12, 14, 26, 0.96));
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        box-shadow: 0 36px 80px rgba(5, 6, 18, 0.7), 0 0 0 8px rgba(124, 58, 237, 0.15);
         overflow: hidden;
         transform-style: preserve-3d;
-        transform: rotateY(-16deg) rotateX(6deg);
+        transform: rotateY(-12deg) rotateX(4deg);
         transition: transform 0.4s ease, filter 0.4s ease;
-      }
-
-      .phone::after {
-        content: "";
-        position: absolute;
-        inset: -40% -30% auto -30%;
-        height: 60%;
-        background: radial-gradient(circle, rgba(124, 58, 237, 0.32), transparent 65%);
-        opacity: 0;
-        transition: opacity 0.4s ease;
-        pointer-events: none;
-      }
-
-      .phone.hover-active::after {
-        opacity: 1;
       }
 
       .phone::before {
@@ -324,7 +294,7 @@
         inset: -2px;
         border-radius: 46px;
         padding: 2px;
-        background: linear-gradient(140deg, rgba(124, 58, 237, 0.55), rgba(34, 211, 238, 0.45), rgba(124, 58, 237, 0.55));
+        background: linear-gradient(140deg, rgba(124, 58, 237, 0.6), rgba(34, 211, 238, 0.5), rgba(124, 58, 237, 0.6));
         -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
         -webkit-mask-composite: xor;
         mask-composite: exclude;
@@ -348,26 +318,27 @@
 
       .screen-stack {
         position: absolute;
-        inset: 14px;
+        inset: 12px;
         border-radius: 36px;
         overflow: hidden;
-        background: radial-gradient(circle at top, rgba(124, 58, 237, 0.12), transparent 70%), #05060f;
+        background: radial-gradient(circle at 20% 20%, rgba(124, 58, 237, 0.18), transparent 75%), #04060e;
       }
 
       .screen-stack img {
         width: 100%;
         height: 100%;
         object-fit: cover;
+        object-position: top center;
         display: block;
         opacity: 1;
         transform: scale(1);
-        transition: opacity 0.3s ease, transform 0.3s ease;
+        transition: opacity 0.4s ease, transform 0.4s ease;
       }
 
       .action-buttons {
         display: grid;
         gap: 12px;
-        width: min(380px, 92vw);
+        width: min(360px, 90vw);
       }
 
       .action-card {
@@ -378,7 +349,7 @@
         padding: 16px 18px;
         border-radius: 18px;
         border: 1px solid rgba(255, 255, 255, 0.1);
-        background: linear-gradient(130deg, rgba(124, 58, 237, 0.16), rgba(34, 211, 238, 0.16));
+        background: linear-gradient(140deg, rgba(124, 58, 237, 0.18), rgba(34, 211, 238, 0.18));
         color: #fff;
         cursor: pointer;
         transition: transform 0.2s ease, box-shadow 0.2s ease, border 0.2s ease;
@@ -405,32 +376,32 @@
 
       .action-card small {
         font-size: 12px;
-        color: rgba(255, 255, 255, 0.7);
+        color: rgba(255, 255, 255, 0.72);
       }
 
       .action-card .chevron {
         font-size: 22px;
         font-weight: 600;
-        color: rgba(255, 255, 255, 0.68);
+        color: rgba(255, 255, 255, 0.7);
       }
 
       .action-card.essential {
-        background: linear-gradient(130deg, rgba(255, 186, 88, 0.24), rgba(110, 235, 199, 0.18));
+        background: linear-gradient(140deg, rgba(255, 186, 96, 0.28), rgba(110, 235, 199, 0.2));
       }
 
       .action-card.ask {
-        background: linear-gradient(130deg, rgba(104, 138, 255, 0.26), rgba(168, 98, 255, 0.2));
+        background: linear-gradient(140deg, rgba(110, 136, 255, 0.28), rgba(170, 102, 255, 0.2));
       }
 
       .action-card:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 20px 38px rgba(6, 10, 28, 0.45);
+        transform: translateY(-3px);
+        box-shadow: 0 26px 48px rgba(6, 10, 28, 0.45);
         border-color: rgba(255, 255, 255, 0.2);
       }
 
       .action-card.active {
-        border-color: rgba(34, 211, 238, 0.45);
-        box-shadow: 0 24px 46px rgba(34, 211, 238, 0.32);
+        border-color: rgba(34, 211, 238, 0.55);
+        box-shadow: 0 30px 56px rgba(34, 211, 238, 0.32);
       }
 
       section:not(.hero) {
@@ -543,11 +514,8 @@
             <a class="btn btn-secondary" href="#tour">See the features</a>
           </div>
           <div class="meta-row">
-            <a class="appstore-btn" href="https://apps.apple.com/us/app/worthit-ai-video-summaries/id6749246821" target="_blank" rel="noopener noreferrer" aria-label="Download WorthIt.AI on the App Store">
-              <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M18.81 13.76c-.03-3.13 2.56-4.62 2.67-4.69-1.46-2.15-3.73-2.44-4.54-2.47-1.93-.2-3.77 1.14-4.74 1.14-.99 0-2.49-1.11-4.09-1.08-2.1.03-4.04 1.23-5.12 3.12-2.18 3.76-.56 9.32 1.56 12.38 1.04 1.49 2.27 3.17 3.88 3.11 1.57-.06 2.16-1 4.05-1s2.41.99 4.06.97c1.68-.03 2.74-1.52 3.77-3.03 1.18-1.71 1.66-3.36 1.68-3.44-.03-.01-3.18-1.22-3.2-4.01zM15.75 4.33c.86-1.04 1.44-2.49 1.28-3.94-1.24.05-2.74.83-3.63 1.87-.8.92-1.5 2.4-1.31 3.81 1.38.11 2.8-.7 3.66-1.74z" fill="currentColor" />
-              </svg>
-              App Store
+            <a href="https://apps.apple.com/us/app/worthit-ai-video-summaries/id6749246821" target="_blank" rel="noopener noreferrer">
+              <img class="appstore-badge" src="https://tools.applemediaservices.com/api/badges/download-on-the-app-store/black/en-us?size=120x40&releaseDate=1317600000" alt="Download on the App Store" />
             </a>
             <span>No account • Share sheet ready • Privacy-first</span>
           </div>
