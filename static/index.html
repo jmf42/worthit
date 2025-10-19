@@ -81,28 +81,42 @@
       }
 
       nav a {
-        padding: 8px 14px;
+        padding: 8px 16px;
         border-radius: var(--radius-sm);
         color: var(--muted);
-        border: 1px solid transparent;
-        transition: background 0.2s ease, border 0.2s ease, color 0.2s ease;
+        border: 1px solid rgba(255, 255, 255, 0.04);
+        background: rgba(255, 255, 255, 0.02);
+        transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease, color 0.2s ease;
       }
 
       nav a:hover {
         background: rgba(255, 255, 255, 0.06);
-        border-color: rgba(255, 255, 255, 0.08);
         color: var(--text);
+        transform: translateY(-1px);
+        box-shadow: 0 8px 16px rgba(6, 8, 20, 0.35);
       }
 
       .nav-cta {
-        background: linear-gradient(90deg, var(--accent-a), var(--accent-b));
+        border: none;
+        background: linear-gradient(135deg, #8d3eed, #1dc6ff);
         color: #05060f;
         font-weight: 600;
-        box-shadow: 0 18px 36px rgba(124, 58, 237, 0.32);
+        box-shadow: 0 20px 44px rgba(49, 136, 255, 0.35);
+        position: relative;
+        overflow: hidden;
       }
 
-      .nav-cta:hover {
-        transform: translateY(-1px);
+      .nav-cta::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(90deg, rgba(255, 255, 255, 0.25) 0%, rgba(255, 255, 255, 0) 60%);
+        opacity: 0;
+        transition: opacity 0.2s ease;
+      }
+
+      .nav-cta:hover::after {
+        opacity: 1;
       }
 
       .hero {
@@ -190,36 +204,49 @@
         padding: 12px 18px;
         border-radius: 14px;
         font-weight: 600;
-        border: 1px solid transparent;
-        transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        position: relative;
+        overflow: hidden;
+        transition: transform 0.25s ease, box-shadow 0.25s ease, background 0.25s ease, border 0.25s ease;
+      }
+
+      .btn::after {
+        content: "";
+        position: absolute;
+        inset: -40% auto auto -40%;
+        width: 140%;
+        height: 140%;
+        background: radial-gradient(circle, rgba(255, 255, 255, 0.25), transparent 60%);
+        transform: translateX(-60%);
+        transition: transform 0.4s ease;
+        pointer-events: none;
+      }
+
+      .btn:hover::after {
+        transform: translateX(10%);
       }
 
       .btn-primary {
-        background: linear-gradient(90deg, var(--accent-a), var(--accent-b));
+        background: linear-gradient(135deg, #8a44ff, #26d1f6);
         color: #05060f;
-        box-shadow: 0 20px 40px rgba(124, 58, 237, 0.28);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        box-shadow: 0 24px 52px rgba(43, 136, 255, 0.32);
       }
 
-      .btn-primary:hover { transform: translateY(-2px); }
-
-      .btn-ghost {
-        background: rgba(255, 255, 255, 0.04);
-        color: var(--text);
-        border-color: rgba(255, 255, 255, 0.08);
-      }
-
-      .btn-ghost:hover {
-        background: rgba(255, 255, 255, 0.08);
+      .btn-primary:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 28px 60px rgba(43, 136, 255, 0.38);
       }
 
       .btn-secondary {
-        background: linear-gradient(90deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.02));
+        background: linear-gradient(135deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.02));
         color: var(--text);
-        border-color: rgba(255, 255, 255, 0.08);
       }
 
       .btn-secondary:hover {
-        background: linear-gradient(90deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.04));
+        transform: translateY(-2px);
+        box-shadow: 0 18px 36px rgba(6, 8, 18, 0.35);
+        border-color: rgba(255, 255, 255, 0.14);
       }
 
       .meta-row {
@@ -235,19 +262,20 @@
         display: inline-flex;
         align-items: center;
         gap: 10px;
-        padding: 10px 16px;
-        border-radius: 14px;
-        background: rgba(255, 255, 255, 0.06);
-        border: 1px solid rgba(255, 255, 255, 0.1);
+        padding: 10px 18px;
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.18);
         color: var(--text);
         font-weight: 600;
         letter-spacing: 0.01em;
-        transition: background 0.2s ease, transform 0.2s ease;
+        transition: transform 0.25s ease, box-shadow 0.25s ease, background 0.25s ease;
       }
 
       .appstore-btn:hover {
-        background: rgba(255, 255, 255, 0.1);
-        transform: translateY(-1px);
+        transform: translateY(-2px);
+        box-shadow: 0 18px 32px rgba(7, 10, 22, 0.4);
+        background: rgba(255, 255, 255, 0.12);
       }
 
       .appstore-btn svg {
@@ -263,12 +291,12 @@
 
       .phone {
         position: relative;
-        width: min(430px, 95vw);
+        width: min(380px, 92vw);
         aspect-ratio: 9 / 19.5;
         border-radius: 44px;
-        background: radial-gradient(circle at 20% 20%, rgba(124, 58, 237, 0.28), transparent 70%), #080910;
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        box-shadow: 0 40px 90px rgba(5, 6, 15, 0.7), 0 0 0 11px rgba(124, 58, 237, 0.12);
+        background: radial-gradient(circle at 15% 15%, rgba(124, 58, 237, 0.22), transparent 72%), #090a14;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        box-shadow: 0 28px 80px rgba(5, 6, 15, 0.65), 0 0 0 8px rgba(124, 58, 237, 0.14);
         overflow: hidden;
         transform-style: preserve-3d;
         transform: rotateY(-16deg) rotateX(6deg);
@@ -333,13 +361,13 @@
         display: block;
         opacity: 1;
         transform: scale(1);
-        transition: opacity 0.25s ease, transform 0.25s ease;
+        transition: opacity 0.3s ease, transform 0.3s ease;
       }
 
       .action-buttons {
         display: grid;
         gap: 12px;
-        width: min(430px, 95vw);
+        width: min(380px, 92vw);
       }
 
       .action-card {
@@ -349,8 +377,8 @@
         gap: 12px;
         padding: 16px 18px;
         border-radius: 18px;
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        background: linear-gradient(110deg, rgba(124, 58, 237, 0.22), rgba(34, 211, 238, 0.22));
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: linear-gradient(130deg, rgba(124, 58, 237, 0.16), rgba(34, 211, 238, 0.16));
         color: #fff;
         cursor: pointer;
         transition: transform 0.2s ease, box-shadow 0.2s ease, border 0.2s ease;
@@ -362,7 +390,7 @@
         border-radius: 12px;
         display: grid;
         place-items: center;
-        background: rgba(255, 255, 255, 0.14);
+        background: rgba(255, 255, 255, 0.16);
         font-size: 16px;
       }
 
@@ -377,34 +405,32 @@
 
       .action-card small {
         font-size: 12px;
-        color: rgba(255, 255, 255, 0.72);
+        color: rgba(255, 255, 255, 0.7);
       }
 
       .action-card .chevron {
         font-size: 22px;
         font-weight: 600;
-        color: rgba(255, 255, 255, 0.7);
+        color: rgba(255, 255, 255, 0.68);
       }
 
       .action-card.essential {
-        background: linear-gradient(120deg, rgba(255, 171, 78, 0.26), rgba(82, 245, 191, 0.2));
-        border: 1px solid rgba(255, 200, 129, 0.4);
+        background: linear-gradient(130deg, rgba(255, 186, 88, 0.24), rgba(110, 235, 199, 0.18));
       }
 
       .action-card.ask {
-        background: linear-gradient(120deg, rgba(84, 115, 255, 0.26), rgba(170, 102, 255, 0.22));
-        border: 1px solid rgba(132, 138, 255, 0.45);
+        background: linear-gradient(130deg, rgba(104, 138, 255, 0.26), rgba(168, 98, 255, 0.2));
       }
 
       .action-card:hover {
         transform: translateY(-2px);
-        box-shadow: 0 18px 34px rgba(8, 12, 36, 0.4);
-        border-color: rgba(255, 255, 255, 0.18);
+        box-shadow: 0 20px 38px rgba(6, 10, 28, 0.45);
+        border-color: rgba(255, 255, 255, 0.2);
       }
 
       .action-card.active {
-        border-color: rgba(34, 211, 238, 0.5);
-        box-shadow: 0 22px 44px rgba(34, 211, 238, 0.28);
+        border-color: rgba(34, 211, 238, 0.45);
+        box-shadow: 0 24px 46px rgba(34, 211, 238, 0.32);
       }
 
       section:not(.hero) {
@@ -507,10 +533,10 @@
           <h1><span class="accent">Signal.</span> Not noise.</h1>
           <p class="subtitle">WorthIt.AI compresses any YouTube link into highlights, a Worth-It Score, and the crowd pulse before you decide to watch.</p>
           <div class="chip-row">
-            <div class="chip">Transcript-grounded highlights</div>
+            <div class="chip">Highlights</div>
             <div class="chip">Worth-It Score</div>
-            <div class="chip">Comment sentiment</div>
-            <div class="chip">Ask Anything chat</div>
+            <div class="chip">Comment intel</div>
+            <div class="chip">Ask Anything</div>
           </div>
           <div class="cta-row">
             <a class="btn btn-primary" href="https://apps.apple.com/us/app/worthit-ai-video-summaries/id6749246821" target="_blank" rel="noopener noreferrer">Download on the App Store</a>
@@ -642,23 +668,42 @@
 
       const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
+      const baseRotX = 6;
+      const baseRotY = -16;
+      let currentRotX = baseRotX;
+      let currentRotY = baseRotY;
+      let targetRotX = baseRotX;
+      let targetRotY = baseRotY;
+      let tiltFrame;
+
+      function applyTransform() {
+        currentRotX += (targetRotX - currentRotX) * 0.08;
+        currentRotY += (targetRotY - currentRotY) * 0.08;
+        phone.style.transform = `rotateY(${currentRotY}deg) rotateX(${currentRotX}deg)`;
+        tiltFrame = requestAnimationFrame(applyTransform);
+      }
+
       function resetTilt() {
         phone.classList.remove('hover-active');
-        phone.style.transform = 'rotateY(-16deg) rotateX(6deg)';
+        targetRotX = baseRotX;
+        targetRotY = baseRotY;
       }
 
       if (!prefersReducedMotion) {
+        applyTransform();
+
         phone.addEventListener('pointermove', (event) => {
           const rect = phone.getBoundingClientRect();
           const x = (event.clientX - rect.left) / rect.width - 0.5;
           const y = (event.clientY - rect.top) / rect.height - 0.5;
-          const rotateY = -16 + x * 22;
-          const rotateX = 6 - y * 16;
+          targetRotY = baseRotY + x * 16;
+          targetRotX = baseRotX - y * 12;
           phone.classList.add('hover-active');
-          phone.style.transform = `rotateY(${rotateY}deg) rotateX(${rotateX}deg)`;
         });
 
         phone.addEventListener('pointerleave', resetTilt);
+      } else {
+        phone.style.transform = `rotateY(${baseRotY}deg) rotateX(${baseRotX}deg)`;
       }
     </script>
   </body>
