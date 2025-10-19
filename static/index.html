@@ -6,7 +6,7 @@
     <title>WorthIt.AI — Signal. Not noise.</title>
     <meta name="description" content="WorthIt.AI turns any YouTube link into instant highlights, a Worth-It Score, and the crowd pulse so you can skip the rabbit hole." />
     <meta name="theme-color" content="#06070f" />
-    <link rel="apple-touch-icon" href="assets/worthit-logo.png" />
+    <link rel="apple-touch-icon" href="static/assets/worthit-logo.png" />
     <style>
       :root {
         --bg0: #04050d;
@@ -499,7 +499,7 @@
     <div class="container">
       <header>
         <a class="brand" href="https://worthit.tuliai.com/">
-          <img src="assets/worthit-logo.png" alt="WorthIt.AI logo" />
+          <img src="/static/assets/worthit-logo.png" alt="WorthIt.AI logo" />
           <span>WorthIt.AI</span>
         </a>
         <nav>
@@ -537,7 +537,7 @@
           <div class="phone" id="phone">
             <div class="notch" aria-hidden="true"></div>
             <div class="screen-stack">
-              <img id="phone-screen" src="assets/screen-overview.png" alt="WorthIt overview screen" loading="lazy" />
+              <img id="phone-screen" src="static/assets/screen-overview.png" alt="WorthIt overview screen" loading="lazy" />
             </div>
           </div>
           <div class="action-buttons" aria-label="Interact with WorthIt features">
@@ -608,9 +608,9 @@
       const actionCards = document.querySelectorAll('.action-card');
 
       const screenSources = {
-        overview: 'assets/screen-overview.png',
-        essentials: 'assets/screen-essentials.png',
-        ask: 'assets/screen-ask.png'
+        overview: 'static/assets/screen-overview.png',
+        essentials: 'static/assets/screen-essentials.png',
+        ask: 'static/assets/screen-ask.png'
       };
 
       let currentScreen = 'overview';
