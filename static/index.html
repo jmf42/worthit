@@ -6,7 +6,7 @@
     <title>WorthIt.AI — Signal. Not noise.</title>
     <meta name="description" content="WorthIt.AI turns any YouTube link into instant highlights, a Worth-It Score, and the crowd pulse so you can skip the rabbit hole." />
     <meta name="theme-color" content="#06070f" />
-    <link rel="apple-touch-icon" href="/static/assets/worthit-logo.png" />
+    <link rel="apple-touch-icon" href="assets/worthit-logo.png" />
     <style>
       :root {
         --bg0: #04050d;
@@ -232,7 +232,22 @@
         overflow: hidden;
         transform-style: preserve-3d;
         transform: rotateY(-16deg) rotateX(6deg);
-        transition: transform 0.6s ease, filter 0.6s ease;
+        transition: transform 0.4s ease, filter 0.4s ease;
+      }
+
+      .phone::after {
+        content: "";
+        position: absolute;
+        inset: -40% -30% auto -30%;
+        height: 60%;
+        background: radial-gradient(circle, rgba(124, 58, 237, 0.32), transparent 65%);
+        opacity: 0;
+        transition: opacity 0.4s ease;
+        pointer-events: none;
+      }
+
+      .phone.hover-active::after {
+        opacity: 1;
       }
 
       .phone::before {
@@ -291,31 +306,36 @@
         transform: translateY(0) scale(1);
       }
 
-      .phone-controls {
+      .screen-toggle {
+        position: absolute;
+        left: 50%;
+        bottom: 22px;
+        transform: translateX(-50%);
         display: inline-flex;
-        gap: 10px;
+        gap: 6px;
         padding: 6px;
-        border-radius: 16px;
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        background: rgba(10, 12, 24, 0.65);
-        backdrop-filter: blur(16px);
+        border-radius: 14px;
+        background: rgba(9, 12, 24, 0.58);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        backdrop-filter: blur(14px);
       }
 
-      .phone-controls button {
+      .screen-toggle button {
         border: none;
         background: transparent;
-        color: rgba(255, 255, 255, 0.6);
+        color: rgba(255, 255, 255, 0.58);
         font-weight: 600;
         letter-spacing: 0.01em;
-        padding: 10px 14px;
-        border-radius: 12px;
+        padding: 8px 12px;
+        border-radius: 10px;
         cursor: pointer;
         transition: background 0.2s ease, color 0.2s ease;
       }
 
-      .phone-controls button.active {
-        background: linear-gradient(100deg, rgba(124, 58, 237, 0.3), rgba(34, 211, 238, 0.3));
+      .screen-toggle button.active {
+        background: linear-gradient(100deg, rgba(124, 58, 237, 0.32), rgba(34, 211, 238, 0.32));
         color: #fff;
+        box-shadow: 0 8px 20px rgba(34, 211, 238, 0.18);
       }
 
       section:not(.hero) {
@@ -453,7 +473,7 @@
     <div class="container">
       <header>
         <a class="brand" href="https://worthit.tuliai.com/">
-          <img src="/static/assets/worthit-logo.png" alt="WorthIt.AI logo" />
+          <img src="assets/worthit-logo.png" alt="WorthIt.AI logo" />
           <span>WorthIt.AI</span>
         </a>
         <nav>
@@ -490,22 +510,22 @@
             <div class="notch" aria-hidden="true"></div>
             <div class="screen-stack">
               <div class="screen active" data-screen="overview">
-                <img src="/static/assets/screen-overview.png" alt="WorthIt overview screen" loading="lazy" />
-              </div>
-              <div class="screen" data-screen="essentials">
-                <img src="/static/assets/screen-essentials.png" alt="WorthIt essentials screen" loading="lazy" />
-              </div>
-              <div class="screen" data-screen="ask">
-                <img src="/static/assets/screen-ask.png" alt="WorthIt Ask Anything screen" loading="lazy" />
-              </div>
-            </div>
+            <img src="assets/screen-overview.png" alt="WorthIt overview screen" loading="lazy" />
           </div>
-          <div class="phone-controls" role="tablist" aria-label="Preview WorthIt screens">
+          <div class="screen" data-screen="essentials">
+            <img src="assets/screen-essentials.png" alt="WorthIt essentials screen" loading="lazy" />
+          </div>
+          <div class="screen" data-screen="ask">
+            <img src="assets/screen-ask.png" alt="WorthIt Ask Anything screen" loading="lazy" />
+          </div>
+          <div class="screen-toggle" role="tablist" aria-label="Preview WorthIt screens">
             <button type="button" class="active" data-target="overview">Overview</button>
             <button type="button" data-target="essentials">Essentials</button>
             <button type="button" data-target="ask">Ask Anything</button>
           </div>
         </div>
+      </div>
+    </div>
       </section>
 
       <section id="tour">
@@ -598,7 +618,7 @@
 
       const phone = document.getElementById('phone');
       const screens = document.querySelectorAll('.screen');
-      const controls = document.querySelectorAll('.phone-controls button');
+      const controls = document.querySelectorAll('.screen-toggle button');
 
       controls.forEach((btn) => {
         btn.addEventListener('click', () => {
@@ -613,6 +633,7 @@
       const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
       function resetTilt() {
+        phone.classList.remove('hover-active');
         phone.style.transform = 'rotateY(-16deg) rotateX(6deg)';
       }
 
@@ -621,8 +642,9 @@
           const rect = phone.getBoundingClientRect();
           const x = (event.clientX - rect.left) / rect.width - 0.5;
           const y = (event.clientY - rect.top) / rect.height - 0.5;
-          const rotateY = -16 + x * 18;
-          const rotateX = 6 - y * 14;
+          const rotateY = -16 + x * 22;
+          const rotateX = 6 - y * 16;
+          phone.classList.add('hover-active');
           phone.style.transform = `rotateY(${rotateY}deg) rotateX(${rotateX}deg)`;
         });
 
