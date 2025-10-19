@@ -1,220 +1,195 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>WorthIt.AI — Support</title>
-  <meta name="description" content="Find answers, FAQs, and contact details for WorthIt.AI." />
-  <style>
-    :root {
-      --bg: #04060f;
-      --surface: rgba(15, 18, 43, 0.92);
-      --surface-soft: rgba(20, 24, 52, 0.72);
-      --border: rgba(132, 146, 255, 0.16);
-      --text: #f7f8ff;
-      --muted: rgba(230, 232, 255, 0.68);
-      --accent-a: #6ea8fe;
-      --accent-b: #b16cff;
-      --accent-c: #86f7ff;
-      --radius-lg: 28px;
-      --radius-md: 18px;
-      --radius-sm: 12px;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "SF Pro Text", -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, system-ui, sans-serif;
-      background: radial-gradient(circle at top left, rgba(110, 168, 254, 0.16), transparent 45%),
-                  radial-gradient(circle at 15% 110%, rgba(177, 108, 255, 0.18), transparent 55%),
-                  linear-gradient(180deg, var(--bg) 0%, #06081a 100%);
-      color: var(--text);
-      -webkit-font-smoothing: antialiased;
-    }
-    header {
-      position: sticky;
-      top: 0;
-      z-index: 20;
-      backdrop-filter: blur(16px);
-      background: linear-gradient(180deg, rgba(4, 6, 15, 0.85) 0%, rgba(4, 6, 15, 0.18) 100%);
-      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-    }
-    .nav {
-      max-width: 1080px;
-      margin: 0 auto;
-      padding: 18px 22px;
-      display: flex;
-      align-items: center;
-      gap: 18px;
-    }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      font-weight: 700;
-      letter-spacing: 0.01em;
-    }
-    .brand img {
-      width: 32px;
-      height: 32px;
-      border-radius: 10px;
-      box-shadow: 0 14px 32px rgba(110, 168, 254, 0.35);
-    }
-    .nav-links { margin-left: auto; display: flex; gap: 12px; }
-    .nav-links a {
-      color: var(--muted);
-      padding: 8px 14px;
-      border-radius: var(--radius-sm);
-      text-decoration: none;
-    }
-    .nav-links a:hover { background: rgba(255, 255, 255, 0.08); color: var(--text); }
-    main { max-width: 1080px; margin: 0 auto; padding: 64px 22px 48px; }
-    .hero-card {
-      background: linear-gradient(140deg, rgba(15, 22, 48, 0.92), rgba(15, 19, 45, 0.68));
-      border-radius: var(--radius-lg);
-      border: 1px solid var(--border);
-      padding: 42px;
-      box-shadow: 0 36px 72px rgba(8, 11, 28, 0.55);
-      margin-bottom: 32px;
-    }
-    .hero-card h1 { margin: 0 0 12px; font-size: clamp(32px, 4vw, 46px); }
-    .hero-card p { margin: 0; color: var(--muted); font-size: 18px; max-width: 620px; }
-    .grid { display: grid; gap: 18px; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 32px; }
-    @media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }
-    .card {
-      background: var(--surface);
-      border-radius: var(--radius-md);
-      border: 1px solid var(--border);
-      padding: 26px;
-      box-shadow: 0 26px 52px rgba(8, 11, 28, 0.42);
-    }
-    .card h2 { margin: 0 0 12px; font-size: 22px; }
-    .card h3 { margin: 20px 0 8px; font-size: 17px; }
-    .card p { margin: 0 0 12px; color: var(--muted); line-height: 1.6; }
-    .card ul, .card ol { margin: 0 0 14px 20px; color: var(--muted); line-height: 1.6; }
-    .card li { margin-bottom: 6px; }
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 6px 12px;
-      border-radius: 999px;
-      background: rgba(134, 247, 255, 0.12);
-      border: 1px solid rgba(134, 247, 255, 0.32);
-      color: var(--accent-c);
-      font-weight: 600;
-      margin-bottom: 18px;
-    }
-    .contact-card {
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-      background: var(--surface);
-      border-radius: var(--radius-md);
-      border: 1px solid rgba(110, 168, 254, 0.25);
-      padding: 26px;
-      box-shadow: 0 30px 60px rgba(8, 11, 28, 0.5);
-      margin-bottom: 32px;
-    }
-    .contact-card a { color: var(--accent-a); }
-    .contact-card a:hover { text-decoration: underline; }
-    footer {
-      padding: 36px 22px 56px;
-      color: var(--muted);
-      border-top: 1px solid rgba(255, 255, 255, 0.05);
-      display: flex;
-      flex-wrap: wrap;
-      gap: 16px;
-      justify-content: space-between;
-    }
-    .footer-links { display: flex; gap: 18px; flex-wrap: wrap; }
-    .footer-links a { color: var(--muted); }
-    .footer-links a:hover { color: var(--text); }
-  </style>
-</head>
-<body>
-  <header>
-    <nav class="nav">
-      <a class="brand" href="/">
-        <img src="/static/assets/worthit-logo.png" alt="WorthIt.AI logo" />
-        <span>WorthIt.AI</span>
-      </a>
-      <div class="nav-links">
-        <a href="/support">Support</a>
-        <a href="/privacy">Privacy</a>
-        <a href="/terms">Terms</a>
-        <a href="https://apps.apple.com/us/app/worthit-ai-video-summaries/id6749246821" target="_blank" rel="noopener noreferrer">App Store</a>
-      </div>
-    </nav>
-  </header>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>WorthIt.AI — Support</title>
+    <meta name="description" content="Need help with WorthIt.AI? Start with quick guides, troubleshooting tips, and contact details." />
+    <style>
+      :root {
+        --bg0: #04050d;
+        --bg1: #0c1124;
+        --text: #f7f8ff;
+        --muted: #a2aac4;
+        --accent-a: #7c3aed;
+        --accent-b: #22d3ee;
+        --card: rgba(15, 18, 36, 0.9);
+        --border: rgba(255, 255, 255, 0.1);
+        --radius-lg: 28px;
+        --radius-md: 18px;
+        --radius-sm: 12px;
+      }
+      *, *::before, *::after { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Inter", "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(1200px 860px at 78% -10%, rgba(34, 211, 238, 0.16), transparent 70%),
+          radial-gradient(1000px 700px at -15% 6%, rgba(124, 58, 237, 0.18), transparent 68%),
+          linear-gradient(180deg, var(--bg0), var(--bg1));
+        -webkit-font-smoothing: antialiased;
+      }
+      a { color: inherit; text-decoration: none; }
+      .container { max-width: 1080px; margin: 0 auto; padding: clamp(18px, 4vw, 36px); }
+      header { margin-bottom: clamp(24px, 6vw, 48px); }
+      .nav { display: flex; align-items: center; gap: 14px; }
+      .brand { display: inline-flex; align-items: center; gap: 12px; font-weight: 700; letter-spacing: 0.04em; }
+      .brand img { width: 32px; height: 32px; border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.18); box-shadow: 0 18px 36px rgba(124, 58, 237, 0.36); }
+      .brand span { background: linear-gradient(120deg, rgba(140, 92, 255, 0.95), rgba(56, 208, 255, 0.95)); -webkit-background-clip: text; background-clip: text; color: transparent; text-shadow: 0 12px 40px rgba(84, 143, 255, 0.35); }
+      nav { margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; }
+      nav a { padding: 8px 16px; border-radius: var(--radius-sm); background: rgba(255, 255, 255, 0.03); color: var(--muted); transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease, color 0.2s ease; }
+      nav a:hover { background: rgba(255, 255, 255, 0.08); color: var(--text); transform: translateY(-1px); box-shadow: 0 10px 18px rgba(6, 8, 20, 0.38); }
 
-  <main>
-    <section class="hero-card">
-      <div class="badge">Help Center</div>
-      <h1>Your WorthIt.AI control room</h1>
-      <p>Need a hand using the app or the share extension? Start with the quick guide below or email our team anytime.</p>
-    </section>
+      .hero-card {
+        background: linear-gradient(140deg, rgba(15, 18, 36, 0.95), rgba(12, 16, 32, 0.82));
+        border-radius: var(--radius-lg);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        box-shadow: 0 34px 72px rgba(6, 8, 24, 0.6);
+        padding: clamp(30px, 5vw, 48px);
+        margin-bottom: clamp(28px, 5vw, 48px);
+      }
+      .hero-card .badge { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; background: rgba(124, 58, 237, 0.18); border: 1px solid rgba(124, 58, 237, 0.38); color: rgba(190, 208, 255, 0.9); font-weight: 600; margin-bottom: 14px; }
+      .hero-card h1 { margin: 0 0 12px; font-size: clamp(34px, 5vw, 54px); letter-spacing: -0.02em; }
+      .hero-card p { margin: 0; max-width: 56ch; color: var(--muted); font-size: 18px; line-height: 1.6; }
 
-    <section class="grid">
-      <article class="card">
-        <h2>How to use WorthIt.AI</h2>
-        <ol>
-          <li>Open the video in YouTube and tap <strong>Share</strong>.</li>
-          <li>Choose <strong>WorthIt.AI</strong> from the share sheet.</li>
-          <li>We fetch the transcript, real comments, and run our AI analysis.</li>
-          <li>Read the summary, check the credibility signal, and ask follow-up questions.</li>
-        </ol>
-        <p>Tip: Pin WorthIt.AI to your share favorites for faster access.</p>
-      </article>
-      <article class="card">
-        <h2>Fast answers</h2>
-        <h3>Why can analysis fail?</h3>
-        <p>Most issues come from missing captions, age restrictions, or disabled comments. Try another video to confirm.</p>
-        <h3>What if results are slow?</h3>
-        <p>Long-form videos and thousands of comments take longer. Keep the app open; we notify you as soon as results land.</p>
-        <h3>Is the score trustworthy?</h3>
-        <p>The credibility signal blends transcript depth, sentiment, and historical patterns. Use it as a compass along with your judgment.</p>
-      </article>
-    </section>
+      .grid { display: grid; gap: 18px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
 
-    <section class="grid">
-      <article class="card">
-        <h2>Troubleshooting checklist</h2>
-        <ul>
-          <li>Confirm your device is online (Wi-Fi or cellular).</li>
-          <li>Update to the latest WorthIt.AI version from the App Store.</li>
-          <li>Make sure the video has captions or auto captions enabled.</li>
-          <li>Restart the WorthIt.AI app if the share extension stalls.</li>
-          <li>Try sharing directly from the YouTube app, not the browser.</li>
-        </ul>
-      </article>
-      <article class="card">
-        <h2>Need more depth?</h2>
-        <p>We can walk through specific videos, product ideas, or bug reports.</p>
-        <ul>
-          <li>Send the video URL and what you expected to see.</li>
-          <li>Include your device model and iOS version for technical issues.</li>
-          <li>Add screenshots if the UI looks off or cards are missing.</li>
-        </ul>
-      </article>
-    </section>
+      .card {
+        background: var(--card);
+        border-radius: var(--radius-md);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: 0 24px 52px rgba(6, 8, 24, 0.45);
+        padding: clamp(20px, 3vw, 32px);
+        display: grid;
+        gap: 14px;
+      }
+      .card h2 { margin: 0; font-size: 22px; }
+      .card h3 { margin: 10px 0 4px; font-size: 17px; }
+      .card p, .card li { color: var(--muted); line-height: 1.65; }
+      .card ul, .card ol { margin: 0 0 0 18px; padding: 0; display: grid; gap: 8px; }
 
-    <section class="contact-card">
-      <h2>Talk to us</h2>
-      <p>Email <a href="mailto:worthit.tuliai@gmail.com">worthit.tuliai@gmail.com</a> — we reply within 24 hours.</p>
-      <p>WorthIt.AI by TuliAI · Version 1.0 · iPhone + iPad support</p>
-      <p>Prefer self-serve? Review the <a href="/privacy">Privacy Policy</a> or <a href="/terms">Terms of Use</a>.</p>
-    </section>
-  </main>
+      .contact-panel {
+        margin-top: clamp(32px, 6vw, 48px);
+        background: linear-gradient(120deg, rgba(124, 58, 237, 0.18), rgba(34, 211, 238, 0.18));
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: var(--radius-md);
+        box-shadow: 0 28px 56px rgba(6, 8, 24, 0.48);
+        padding: clamp(22px, 4vw, 34px);
+        display: grid;
+        gap: 12px;
+      }
+      .contact-panel a { color: #63d9ff; }
+      .contact-panel a:hover { text-decoration: underline; }
 
-  <footer>
-    <div>© 2025 WorthIt.AI — Built by TuliAI</div>
-    <div class="footer-links">
-      <a href="/">Home</a>
-      <a href="/support">Support</a>
-      <a href="/privacy">Privacy</a>
-      <a href="/terms">Terms</a>
-      <a href="mailto:worthit.tuliai@gmail.com">Contact</a>
+      footer {
+        margin-top: clamp(40px, 7vw, 60px);
+        padding: clamp(24px, 4vw, 36px) 0;
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        justify-content: space-between;
+        color: var(--muted);
+      }
+      footer nav { display: flex; flex-wrap: wrap; gap: 12px; }
+      footer nav a { color: var(--muted); }
+      footer nav a:hover { color: var(--text); }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <div class="nav">
+          <a class="brand" href="/">
+            <img src="assets/worthit-logo.png" alt="WorthIt.AI logo" />
+            <span>WorthIt.AI</span>
+          </a>
+          <nav>
+            <a href="/">Home</a>
+            <a href="/privacy">Privacy</a>
+            <a href="/terms">Terms</a>
+            <a href="https://apps.apple.com/us/app/worthit-ai-video-summaries/id6749246821" target="_blank" rel="noopener noreferrer">Get the app</a>
+          </nav>
+        </div>
+      </header>
+
+      <main>
+        <section class="hero-card">
+          <div class="badge">Help Center</div>
+          <h1>Support that saves minutes</h1>
+          <p>WorthIt.AI should feel effortless. Start with the quick guides below or reach out—most questions resolve in minutes.</p>
+        </section>
+
+        <section class="grid" style="margin-bottom: clamp(28px, 5vw, 40px);">
+          <article class="card">
+            <h2>Get started fast</h2>
+            <ol>
+              <li>Open any YouTube video and tap <strong>Share</strong>.</li>
+              <li>Select <strong>WorthIt.AI</strong> in the share sheet.</li>
+              <li>Wait a few seconds while we pull the transcript and comments.</li>
+              <li>Skim the highlights, Worth-It Score, and ask follow-up questions.</li>
+            </ol>
+            <p>Pro tip: add WorthIt.AI to your share favorites so it’s always one tap away.</p>
+          </article>
+          <article class="card">
+            <h2>Quick answers</h2>
+            <div>
+              <h3>Analysis failed?</h3>
+              <p>Private, age-restricted, or caption-less videos are the usual culprits. Try another link to confirm.</p>
+            </div>
+            <div>
+              <h3>Slow results?</h3>
+              <p>Multi-hour videos or thousands of comments take a little longer. Keep the app open—we’ll notify you.</p>
+            </div>
+            <div>
+              <h3>Score accuracy?</h3>
+              <p>The Worth-It Score blends transcript depth, sentiment, and crowd patterns. Treat it as a compass alongside your judgment.</p>
+            </div>
+          </article>
+        </section>
+
+        <section class="grid">
+          <article class="card">
+            <h2>Troubleshooting checklist</h2>
+            <ul>
+              <li>Confirm your connection (Wi‑Fi or cellular).</li>
+              <li>Update to the latest WorthIt.AI release from the App Store.</li>
+              <li>Check that captions or auto captions exist for the video.</li>
+              <li>Relaunch WorthIt.AI if the share extension stalls.</li>
+              <li>Share directly from the YouTube app rather than Safari/Chrome.</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h2>Still need help?</h2>
+            <p>We love detailed reports—here’s what helps us fix issues quickly:</p>
+            <ul>
+              <li>The YouTube link and what you expected to see.</li>
+              <li>Your device model + iOS version.</li>
+              <li>Screenshots if cards or scores look off.</li>
+            </ul>
+          </article>
+        </section>
+
+        <section class="contact-panel">
+          <h2>Contact our team</h2>
+          <p>Email <a href="mailto:worthit.tuliai@gmail.com">worthit.tuliai@gmail.com</a> — most replies land within 24 hours.</p>
+          <p>For urgent issues, mention “Priority” in the subject line so we can jump in fast.</p>
+        </section>
+      </main>
+
+      <footer>
+        <div>© <span id="year"></span> WorthIt.AI — Built by TuliAI</div>
+        <nav>
+          <a href="/">Home</a>
+          <a href="/support">Support</a>
+          <a href="/privacy">Privacy</a>
+          <a href="/terms">Terms</a>
+          <a href="mailto:worthit.tuliai@gmail.com">Contact</a>
+        </nav>
+      </footer>
     </div>
-  </footer>
-</body>
+    <script>document.getElementById('year').textContent = new Date().getFullYear();</script>
+  </body>
 </html>

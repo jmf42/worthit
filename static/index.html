@@ -208,7 +208,7 @@
         padding: 12px 18px;
         border-radius: 14px;
         font-weight: 600;
-        border: 1px solid rgba(255, 255, 255, 0.08);
+        border: none;
         position: relative;
         overflow: hidden;
         transition: transform 0.25s ease, box-shadow 0.25s ease, background 0.25s ease, border 0.25s ease;
@@ -233,7 +233,6 @@
       .btn-primary {
         background: linear-gradient(135deg, #8a44ff, #26d1f6);
         color: #05060f;
-        border: 1px solid rgba(255, 255, 255, 0.12);
         box-shadow: 0 24px 52px rgba(43, 136, 255, 0.32);
       }
 
@@ -250,7 +249,6 @@
       .btn-secondary:hover {
         transform: translateY(-2px);
         box-shadow: 0 18px 36px rgba(6, 8, 18, 0.35);
-        border-color: rgba(255, 255, 255, 0.14);
       }
 
       .meta-row {
@@ -276,16 +274,20 @@
 
       .phone {
         position: relative;
-        width: min(360px, 90vw);
+        width: min(420px, 92vw);
         aspect-ratio: 9 / 19.5;
         border-radius: 44px;
-        background: linear-gradient(160deg, rgba(21, 22, 35, 0.9), rgba(12, 14, 26, 0.96));
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        box-shadow: 0 36px 80px rgba(5, 6, 18, 0.7), 0 0 0 8px rgba(124, 58, 237, 0.15);
+        background: linear-gradient(180deg, #0f0f17, #10121f);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        box-shadow: 0 34px 90px rgba(5, 6, 18, 0.68), 0 0 0 8px rgba(124, 58, 237, 0.14);
         overflow: hidden;
         transform-style: preserve-3d;
-        transform: rotateY(-12deg) rotateX(4deg);
+        transform: rotateY(-12deg) rotateX(2deg);
         transition: transform 0.4s ease, filter 0.4s ease;
+      }
+
+      .phone:hover {
+        transform: rotateY(-8deg) rotateX(0deg) translateY(-3px);
       }
 
       .phone::before {
@@ -294,10 +296,21 @@
         inset: -2px;
         border-radius: 46px;
         padding: 2px;
-        background: linear-gradient(140deg, rgba(124, 58, 237, 0.6), rgba(34, 211, 238, 0.5), rgba(124, 58, 237, 0.6));
+        background: linear-gradient(150deg, rgba(124, 58, 237, 0.6), rgba(34, 211, 238, 0.5), rgba(124, 58, 237, 0.6));
         -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
         -webkit-mask-composite: xor;
         mask-composite: exclude;
+        pointer-events: none;
+      }
+
+      .phone::after {
+        content: "";
+        position: absolute;
+        inset: -40% -25% auto -25%;
+        height: 60%;
+        background: radial-gradient(circle, rgba(124, 58, 237, 0.26), transparent 70%);
+        opacity: 0;
+        transition: opacity 0.4s ease;
         pointer-events: none;
       }
 
@@ -318,10 +331,10 @@
 
       .screen-stack {
         position: absolute;
-        inset: 12px;
+        inset: 8px;
         border-radius: 36px;
         overflow: hidden;
-        background: radial-gradient(circle at 20% 20%, rgba(124, 58, 237, 0.18), transparent 75%), #04060e;
+        background: linear-gradient(180deg, rgba(10, 12, 24, 0.95), rgba(8, 9, 18, 0.98));
       }
 
       .screen-stack img {
@@ -338,7 +351,7 @@
       .action-buttons {
         display: grid;
         gap: 12px;
-        width: min(360px, 90vw);
+        width: min(420px, 92vw);
       }
 
       .action-card {
@@ -348,11 +361,12 @@
         gap: 12px;
         padding: 16px 18px;
         border-radius: 18px;
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        background: linear-gradient(140deg, rgba(124, 58, 237, 0.18), rgba(34, 211, 238, 0.18));
+        border: none;
+        background: linear-gradient(140deg, rgba(124, 58, 237, 0.22), rgba(34, 211, 238, 0.18));
         color: #fff;
         cursor: pointer;
-        transition: transform 0.2s ease, box-shadow 0.2s ease, border 0.2s ease;
+        box-shadow: 0 24px 48px rgba(6, 10, 28, 0.46);
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
       }
 
       .action-card .icon {
@@ -386,22 +400,20 @@
       }
 
       .action-card.essential {
-        background: linear-gradient(140deg, rgba(255, 186, 96, 0.28), rgba(110, 235, 199, 0.2));
+        background: linear-gradient(140deg, rgba(255, 186, 96, 0.32), rgba(110, 235, 199, 0.22));
       }
 
       .action-card.ask {
-        background: linear-gradient(140deg, rgba(110, 136, 255, 0.28), rgba(170, 102, 255, 0.2));
+        background: linear-gradient(140deg, rgba(110, 136, 255, 0.32), rgba(170, 102, 255, 0.22));
       }
 
       .action-card:hover {
         transform: translateY(-3px);
-        box-shadow: 0 26px 48px rgba(6, 10, 28, 0.45);
-        border-color: rgba(255, 255, 255, 0.2);
+        box-shadow: 0 34px 60px rgba(6, 10, 28, 0.52);
       }
 
       .action-card.active {
-        border-color: rgba(34, 211, 238, 0.55);
-        box-shadow: 0 30px 56px rgba(34, 211, 238, 0.32);
+        box-shadow: 0 38px 66px rgba(34, 211, 238, 0.32);
       }
 
       section:not(.hero) {
@@ -636,8 +648,8 @@
 
       const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-      const baseRotX = 6;
-      const baseRotY = -16;
+      const baseRotX = 2;
+      const baseRotY = -12;
       let currentRotX = baseRotX;
       let currentRotY = baseRotY;
       let targetRotX = baseRotX;
@@ -664,8 +676,8 @@
           const rect = phone.getBoundingClientRect();
           const x = (event.clientX - rect.left) / rect.width - 0.5;
           const y = (event.clientY - rect.top) / rect.height - 0.5;
-          targetRotY = baseRotY + x * 16;
-          targetRotX = baseRotX - y * 12;
+          targetRotY = baseRotY + x * 12;
+          targetRotX = baseRotX - y * 10;
           phone.classList.add('hover-active');
         });
 
@@ -676,3 +688,6 @@
     </script>
   </body>
 </html>
+      .phone.hover-active::after {
+        opacity: 1;
+      }
