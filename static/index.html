@@ -267,9 +267,11 @@
       }
 
       .device-wrap {
-        display: grid;
-        justify-items: center;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
         gap: 18px;
+        perspective: 1200px;
       }
 
       .phone {
@@ -277,17 +279,13 @@
         width: min(420px, 92vw);
         aspect-ratio: 9 / 19.5;
         border-radius: 44px;
-        background: linear-gradient(180deg, #0f0f17, #10121f);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        box-shadow: 0 34px 90px rgba(5, 6, 18, 0.68), 0 0 0 8px rgba(124, 58, 237, 0.14);
+        background: linear-gradient(180deg, #0f0f14, #0f1018);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: 0 30px 80px rgba(0, 0, 0, 0.65), 0 0 0 8px rgba(124, 58, 237, 0.12);
         overflow: hidden;
         transform-style: preserve-3d;
         transform: rotateY(-12deg) rotateX(2deg);
-        transition: transform 0.4s ease, filter 0.4s ease;
-      }
-
-      .phone:hover {
-        transform: rotateY(-8deg) rotateX(0deg) translateY(-3px);
+        transition: transform 0.4s ease;
       }
 
       .phone::before {
@@ -296,21 +294,10 @@
         inset: -2px;
         border-radius: 46px;
         padding: 2px;
-        background: linear-gradient(150deg, rgba(124, 58, 237, 0.6), rgba(34, 211, 238, 0.5), rgba(124, 58, 237, 0.6));
+        background: linear-gradient(140deg, rgba(124, 58, 237, 0.55), rgba(34, 211, 238, 0.45), rgba(124, 58, 237, 0.55));
         -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
         -webkit-mask-composite: xor;
         mask-composite: exclude;
-        pointer-events: none;
-      }
-
-      .phone::after {
-        content: "";
-        position: absolute;
-        inset: -40% -25% auto -25%;
-        height: 60%;
-        background: radial-gradient(circle, rgba(124, 58, 237, 0.26), transparent 70%);
-        opacity: 0;
-        transition: opacity 0.4s ease;
         pointer-events: none;
       }
 
@@ -334,7 +321,7 @@
         inset: 8px;
         border-radius: 36px;
         overflow: hidden;
-        background: linear-gradient(180deg, rgba(10, 12, 24, 0.95), rgba(8, 9, 18, 0.98));
+        background: #000;
       }
 
       .screen-stack img {
@@ -400,20 +387,20 @@
       }
 
       .action-card.essential {
-        background: linear-gradient(140deg, rgba(255, 186, 96, 0.32), rgba(110, 235, 199, 0.22));
+        background: linear-gradient(140deg, rgba(255, 186, 96, 0.3), rgba(110, 235, 199, 0.2));
       }
 
       .action-card.ask {
-        background: linear-gradient(140deg, rgba(110, 136, 255, 0.32), rgba(170, 102, 255, 0.22));
+        background: linear-gradient(140deg, rgba(110, 136, 255, 0.3), rgba(170, 102, 255, 0.2));
       }
 
       .action-card:hover {
         transform: translateY(-3px);
-        box-shadow: 0 34px 60px rgba(6, 10, 28, 0.52);
+        box-shadow: 0 32px 58px rgba(6, 10, 28, 0.5);
       }
 
       .action-card.active {
-        box-shadow: 0 38px 66px rgba(34, 211, 238, 0.32);
+        box-shadow: 0 36px 64px rgba(34, 211, 238, 0.32);
       }
 
       section:not(.hero) {
@@ -648,42 +635,8 @@
 
       const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-      const baseRotX = 2;
-      const baseRotY = -12;
-      let currentRotX = baseRotX;
-      let currentRotY = baseRotY;
-      let targetRotX = baseRotX;
-      let targetRotY = baseRotY;
-      let tiltFrame;
-
-      function applyTransform() {
-        currentRotX += (targetRotX - currentRotX) * 0.08;
-        currentRotY += (targetRotY - currentRotY) * 0.08;
-        phone.style.transform = `rotateY(${currentRotY}deg) rotateX(${currentRotX}deg)`;
-        tiltFrame = requestAnimationFrame(applyTransform);
-      }
-
-      function resetTilt() {
-        phone.classList.remove('hover-active');
-        targetRotX = baseRotX;
-        targetRotY = baseRotY;
-      }
-
-      if (!prefersReducedMotion) {
-        applyTransform();
-
-        phone.addEventListener('pointermove', (event) => {
-          const rect = phone.getBoundingClientRect();
-          const x = (event.clientX - rect.left) / rect.width - 0.5;
-          const y = (event.clientY - rect.top) / rect.height - 0.5;
-          targetRotY = baseRotY + x * 12;
-          targetRotX = baseRotX - y * 10;
-          phone.classList.add('hover-active');
-        });
-
-        phone.addEventListener('pointerleave', resetTilt);
-      } else {
-        phone.style.transform = `rotateY(${baseRotY}deg) rotateX(${baseRotX}deg)`;
+      if (prefersReducedMotion) {
+        phone.style.transform = 'rotateY(-12deg) rotateX(2deg)';
       }
     </script>
   </body>
