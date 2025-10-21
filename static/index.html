@@ -301,6 +301,21 @@
         pointer-events: none;
       }
 
+      .phone::after {
+        content: "";
+        position: absolute;
+        inset: -35% -25% auto -25%;
+        height: 58%;
+        background: radial-gradient(circle, rgba(124, 58, 237, 0.26), transparent 70%);
+        opacity: 0;
+        transition: opacity 0.4s ease;
+        pointer-events: none;
+      }
+
+      .phone:hover::after {
+        opacity: 1;
+      }
+
       .notch {
         position: absolute;
         top: 14px;
@@ -479,6 +494,83 @@
 
       @media (prefers-reduced-motion: reduce) {
         .phone, .btn, nav a, .hero, .feature-card, .action-card { transition: none !important; }
+      }
+
+      @media (max-width: 900px) {
+        header {
+          flex-direction: column;
+          align-items: flex-start;
+          gap: 20px;
+        }
+
+        nav {
+          width: 100%;
+          justify-content: flex-start;
+        }
+      }
+
+      @media (max-width: 640px) {
+        header {
+          align-items: center;
+        }
+
+        nav {
+          justify-content: center;
+          gap: 10px;
+        }
+
+        nav a {
+          width: 100%;
+          text-align: center;
+        }
+
+        .hero {
+          grid-template-columns: 1fr;
+          text-align: center;
+          gap: 28px;
+        }
+
+        .chip-row,
+        .meta-row {
+          justify-content: center;
+        }
+
+        .cta-row {
+          flex-direction: column;
+          align-items: stretch;
+        }
+
+        .cta-row .btn {
+          width: 100%;
+        }
+
+        .device-wrap {
+          gap: 20px;
+        }
+
+        .phone {
+          width: min(320px, 88vw);
+        }
+
+        .action-buttons {
+          width: min(320px, 88vw);
+        }
+
+        .cta-strip {
+          flex-direction: column;
+          align-items: flex-start;
+          gap: 12px;
+        }
+
+        footer {
+          flex-direction: column;
+          align-items: flex-start;
+          gap: 12px;
+        }
+
+        footer nav {
+          justify-content: flex-start;
+        }
       }
     </style>
   </head>
